@@ -37,6 +37,8 @@ import monitor;
 import webhook;
 import intune;
 import socketio;
+import hydration;
+import ondemandglue;
 
 // Native stack trace support for fatal signal diagnostics.
 // On OpenBSD this is provided by libexecinfo; on Linux this is provided by glibc.
@@ -129,6 +131,13 @@ ItemDatabase itemDB;
 ClientSideFiltering selectiveSync;
 Monitor filesystemMonitor;
 OneDriveSocketIo oneDriveSocketIo;
+// Files On-Demand ('on_demand') objects. Created and used on the main thread only;
+// the FUSE layer receives them through its constructor.
+HydrationService onDemandHydrationService;
+OnDemandChangeQueue onDemandChangeQueue;
+bool onDemandMountActive = false;
+// On-demand local changes drained from onDemandChangeQueue, waiting to be applied
+OnDemandLocalChange[] pendingOnDemandChanges;
 
 // Class variables
 // Flag for performing a synchronised shutdown
@@ -1283,7 +1292,8 @@ int main(string[] cliArgs) {
 			
 			// Initialise the local filesystem monitor class using inotify to monitor for local filesystem changes
 			// If we are in a --download-only method of operation, we do not enable local filesystem monitoring
-			if (!appConfig.getValueBool("download_only")) {
+			// In on-demand mode the FUSE layer is the only writer of the backing directory and reports its changes, so inotify is not used
+			if (!appConfig.getValueBool("download_only") && !appConfig.getValueBool("on_demand")) {
 				// Not using --download-only
 				try {
 					addLogEntry("Initialising local filesystem monitoring using inotify ...");
@@ -1292,6 +1302,13 @@ int main(string[] cliArgs) {
 				} catch (MonitorException e) {	
 					// monitor class initialisation failed
 					addLogEntry("ERROR: " ~ e.msg);
+					return EXIT_FAILURE;
+				}
+			}
+			
+			// Start the Files On-Demand mount of 'sync_dir' over the backing directory
+			if (appConfig.getValueBool("on_demand")) {
+				if (!startOnDemand()) {
 					return EXIT_FAILURE;
 				}
 			}
@@ -1305,6 +1322,9 @@ int main(string[] cliArgs) {
 			if (appConfig.getValueBool("download_only")) {
 				localMonitorStatus = "not used (--download-only)";
 				guiLocalMonitorStatus = "inotify disabled";
+			} else if (appConfig.getValueBool("on_demand")) {
+				localMonitorStatus = "enabled (on-demand mount " ~ appConfig.onDemandMountPoint ~ ")";
+				guiLocalMonitorStatus = "on-demand mount enabled";
 			} else {
 				localMonitorStatus = "enabled (inotify)";
 				guiLocalMonitorStatus = "inotify enabled";
@@ -1701,7 +1721,7 @@ int main(string[] cliArgs) {
 						!webhookEnabled && appConfig.curlSupportsWebSockets &&
 						!appConfig.getValueBool("disable_websocket_support");
 					
-					if (filesystemMonitor.initialised || webhookEnabled || oneDriveSocketIo !is null || websocketSupportActiveOrRetryable) {
+					if (filesystemMonitor.initialised || onDemandMountActive || webhookEnabled || oneDriveSocketIo !is null || websocketSupportActiveOrRetryable) {
 
 						if (filesystemMonitor.initialised) {
 							// If local monitor is on and is waiting (previous event was not from webhook)
@@ -1763,7 +1783,7 @@ int main(string[] cliArgs) {
 						int res = 1;
 						bool onlineSignal = false;
 						bool shutdownDetectedDuringWait = false;
-						bool monitorMessageProducerActive = filesystemMonitor.initialised || webhookEnabled || oneDriveSocketIo !is null;
+						bool monitorMessageProducerActive = filesystemMonitor.initialised || onDemandMountActive || webhookEnabled || oneDriveSocketIo !is null;
 
 						if (monitorMessageProducerActive) {
 							shutdownDetectedDuringWait = waitForMonitorEventsInterruptibly(sleepTime, appConfig.getValueBool("upload_only"), res, onlineSignal);
@@ -2164,6 +2184,8 @@ void captureInotifyEvents(string invocationSource) {
 // Apply the current observation batch after revalidating each operation through SyncEngine.
 void applyPendingLocalChanges(string invocationSource) {
 	LocalChange[] pendingChanges = filesystemMonitor.takePendingChanges();
+	// On-demand: local changes reported by the FUSE layer use the same processing as inotify observations
+	pendingChanges ~= takePendingOnDemandChanges();
 	if (debugLogging) {
 		addLogEntry("Applying pending local observations: source=" ~ invocationSource ~ ", count=" ~ to!string(pendingChanges.length), ["debug"]);
 	}
@@ -2221,7 +2243,7 @@ void applyPendingLocalChanges(string invocationSource) {
 				break;
 
 			case LocalChangeType.moved:
-				if (!exists(change.dst)) {
+				if (!exists(change.dst) && !isOnDemandOnlineOnlyPath(change.src)) {
 					if (debugLogging) {addLogEntry("Skipping stale local move observation because the destination no longer exists: " ~ change.src ~ " -> " ~ change.dst, ["debug"]);}
 					break;
 				}
@@ -2267,6 +2289,96 @@ void captureAndApplyInotifyEvents(string invocationSource) {
 // semantics as every other monitor trigger. There is no queue-wide discard mode.
 void completeRemoteApplyInotifyEvents(string invocationSource) {
 	captureAndApplyInotifyEvents(invocationSource);
+}
+
+// Start the Files On-Demand mount of the configured 'sync_dir' over the on-demand backing directory
+bool startOnDemand() {
+	string mountPoint = buildNormalizedPath(absolutePath(appConfig.onDemandMountPoint));
+	string backingDir = buildNormalizedPath(absolutePath(appConfig.runtimeSyncDirectory));
+
+	// The mount would hide a backing directory inside it, and a mountpoint inside the backing directory would recurse
+	if ((mountPoint == backingDir) || startsWith(backingDir, mountPoint ~ "/") || startsWith(mountPoint, backingDir ~ "/")) {
+		addLogEntry("ERROR: The on-demand backing directory (" ~ backingDir ~ ") and 'sync_dir' (" ~ mountPoint ~ ") must not contain each other", ["info", "notify"]);
+		return false;
+	}
+
+	try {
+		if (!exists(mountPoint)) {
+			mkdirRecurse(mountPoint);
+			mountPoint.setAttributes(appConfig.returnRequiredDirectoryPermissions());
+		} else if (!isDir(mountPoint)) {
+			addLogEntry("ERROR: The configured 'sync_dir' is not a directory and cannot be used as the on-demand mountpoint: " ~ mountPoint, ["info", "notify"]);
+			return false;
+		} else if (!dirEntries(mountPoint, SpanMode.shallow, false).empty) {
+			addLogEntry("WARNING: The on-demand mountpoint is not empty; its existing content is hidden while mounted: " ~ mountPoint);
+		}
+	} catch (FileException e) {
+		addLogEntry("ERROR: Unable to prepare the on-demand mountpoint " ~ mountPoint ~ ": " ~ e.msg, ["info", "notify"]);
+		return false;
+	}
+
+	onDemandChangeQueue = new OnDemandChangeQueue();
+	onDemandHydrationService = new HydrationService(appConfig, itemDB, backingDir);
+
+	addLogEntry("Starting Files On-Demand mount of " ~ mountPoint ~ " (backing directory: " ~ backingDir ~ ") ...");
+	if (!startOnDemandMount(itemDB, onDemandHydrationService, onDemandChangeQueue, thisTid, mountPoint, backingDir, appConfig.defaultDriveId, appConfig.defaultRootId)) {
+		addLogEntry("ERROR: Unable to start the Files On-Demand mount of " ~ mountPoint, ["info", "notify"]);
+		onDemandHydrationService.shutdown();
+		onDemandHydrationService = null;
+		onDemandChangeQueue = null;
+		return false;
+	}
+	onDemandMountActive = true;
+	addLogEntry("Files On-Demand mount is active: " ~ mountPoint);
+	return true;
+}
+
+// Move local changes reported by the FUSE layer into the main-thread pending list
+void drainOnDemandChangeQueue() {
+	if (onDemandChangeQueue is null) return;
+	pendingOnDemandChanges ~= onDemandChangeQueue.drain();
+}
+
+// Convert the pending on-demand local changes to the representation used for inotify observations
+LocalChange[] takePendingOnDemandChanges() {
+	drainOnDemandChangeQueue();
+	LocalChange[] result;
+	foreach (change; pendingOnDemandChanges) {
+		string path = normaliseOnDemandChangePath(change.path);
+		final switch (change.kind) {
+			case OnDemandChangeKind.changed:
+				result ~= LocalChange(LocalChangeType.changed, false, path, null);
+				break;
+			case OnDemandChangeKind.createDir:
+				result ~= LocalChange(LocalChangeType.createDir, false, path, null);
+				break;
+			case OnDemandChangeKind.deleted:
+				result ~= LocalChange(LocalChangeType.deleted, false, path, null);
+				break;
+			case OnDemandChangeKind.moved:
+				result ~= LocalChange(LocalChangeType.moved, false, normaliseOnDemandChangePath(change.oldPath), path);
+				break;
+		}
+	}
+	pendingOnDemandChanges = null;
+	if (debugLogging && result.length > 0) {addLogEntry("On-demand: local changes reported by the mount: " ~ to!string(result.length), ["debug"]);}
+	return result;
+}
+
+// On-demand change paths are "./a/b", relative to the backing directory (the working directory)
+string normaliseOnDemandChangePath(string path) {
+	if (path.empty || (path == ".") || startsWith(path, "./")) return path;
+	if (startsWith(path, "/")) return "." ~ path;
+	return "./" ~ path;
+}
+
+// Is 'path' an online-only file in on-demand mode? Such a file has no local bytes, so a move of it
+// is valid even though nothing exists at the destination in the backing directory.
+bool isOnDemandOnlineOnlyPath(string path) {
+	if (!onDemandMountActive) return false;
+	Item item;
+	if (!itemDB.selectByPath(path, appConfig.defaultDriveId, item)) return false;
+	return (item.type == ItemType.file) && (item.hydration == hydrationOnlineOnly);
 }
 
 // Display the sync outcome
@@ -2734,11 +2846,18 @@ bool waitForMonitorEventsInterruptibly(Duration totalWait, bool uploadOnly, ref 
 		bool workerMessageReceived = false;
 		bool onlineSignalReceived = false;
 
+		bool onDemandWakeReceived = false;
+
 		if (uploadOnly) {
-			receiveTimeout(waitSlice, (int msg) {
-				workerStatus = msg;
-				workerMessageReceived = true;
-			});
+			receiveTimeout(waitSlice,
+				(int msg) {
+					workerStatus = msg;
+					workerMessageReceived = true;
+				},
+				(OnDemandWake _) {
+					onDemandWakeReceived = true;
+				}
+			);
 		} else {
 			receiveTimeout(waitSlice,
 				(int msg) {
@@ -2748,11 +2867,20 @@ bool waitForMonitorEventsInterruptibly(Duration totalWait, bool uploadOnly, ref 
 				(ulong _) {
 					onlineSignal = true;
 					onlineSignalReceived = true;
+				},
+				(OnDemandWake _) {
+					onDemandWakeReceived = true;
 				}
 			);
 		}
 
-		if (workerMessageReceived || onlineSignalReceived) {
+		if (onDemandWakeReceived) {
+			// Coalesce any further queued wake-ups; one drain covers them all
+			while (receiveTimeout(dur!"seconds"(-1), (OnDemandWake _) {})) {}
+			drainOnDemandChangeQueue();
+		}
+
+		if (workerMessageReceived || onlineSignalReceived || onDemandWakeReceived) {
 			return false;
 		}
 		remaining -= waitSlice;
@@ -2809,6 +2937,10 @@ void performSynchronisedExitProcess(string scopeCaller = null) {
 
 			// Shutdown any local filesystem monitoring
 			shutdownFilesystemMonitor();
+
+			// Shutdown Files On-Demand: release hydration waiters, then stop the mount so no FUSE
+			// thread uses the sync engine or database after this point
+			shutdownOnDemand();
 
 			// Shutdown the sync engine
 			shutdownSyncEngine();
@@ -2875,6 +3007,21 @@ void shutdownFilesystemMonitor() {
         filesystemMonitor = null;
 		if (debugLogging) {addLogEntry("Shutdown of Filesystem Monitoring instance is complete", ["debug"]);}
     }
+}
+
+void shutdownOnDemand() {
+	if (onDemandHydrationService !is null) {
+		if (debugLogging) {addLogEntry("Shutting down on-demand hydration service", ["debug"]);}
+		onDemandHydrationService.shutdown();
+	}
+	if (onDemandMountActive) {
+		if (debugLogging) {addLogEntry("Stopping on-demand mount", ["debug"]);}
+		stopOnDemandMount();
+		onDemandMountActive = false;
+		if (debugLogging) {addLogEntry("On-demand mount stopped", ["debug"]);}
+	}
+	onDemandHydrationService = null;
+	onDemandChangeQueue = null;
 }
 
 void shutdownSelectiveSync() {

@@ -543,7 +543,7 @@ final class HydrationService {
 		currentItem.sha256Hash = onlineDbItem.sha256Hash;
 		currentItem.size = onlineDbItem.size;
 		bool pinned = (currentItem.hydration == hydrationPinned) || isPinnedOrHasPinnedAncestor(itemDB, driveId, id);
-		currentItem.hydration = pinned ? hydrationPinned : hydrationHydrated;
+		setItemHydration(currentItem, pinned ? hydrationPinned : hydrationHydrated);
 		itemDB.update(currentItem);
 
 		addLogEntry("On-demand: hydrating " ~ backingPath ~ " ... done");

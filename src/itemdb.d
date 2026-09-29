@@ -47,9 +47,18 @@ struct Item {
 	string   relocDriveId;
 	string   relocParentId;
 	// On-demand hydration state: "O" online-only, "H" hydrated, "P" pinned.
-	// null means hydrated (non-on-demand behaviour). A null value never overwrites
-	// a stored state on insert/update/upsert; only an explicit value changes it.
+	// null means hydrated (non-on-demand behaviour).
 	string   hydration;
+	// insert/update/upsert write 'hydration' only when this is set; otherwise the stored
+	// state is kept. This stops a stale copy of an item from overwriting a state change
+	// made concurrently by the on-demand layer. Not stored.
+	bool     writeHydration;
+}
+
+// Set the hydration state of an item so that the next insert/update/upsert stores it
+void setItemHydration(ref Item item, string state) {
+	item.hydration = state;
+	item.writeHydration = true;
 }
 
 // Construct an Item DB struct from a JSON driveItem
@@ -841,7 +850,8 @@ final class ItemDatabase {
 			bind(17, size);
 			bind(18, relocDriveId);
 			bind(19, relocParentId);
-			bind(20, hydration);
+			// NULL keeps the stored value (COALESCE in the statements)
+			bind(20, writeHydration ? hydration : null);
 		}
 	}
 
