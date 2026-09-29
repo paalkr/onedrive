@@ -1,11 +1,13 @@
 /*
  * Test stub of the engine's src/hydration.d (see ondemand/CONTRACT.md).
- * Same public API; "downloads" copy from a local fake remote directory.
- * Not part of the onedrive build.
+ * Same public API as the classes and types the FUSE layer uses;
+ * "downloads" copy from a local fake remote directory. Not part of the
+ * onedrive build.
  *
- * The real module keeps the hydration state in the item table. This branch
- * has no hydration column yet, so the stub keeps it in memory, keyed by
- * driveId/id, and tests seed it with setStateForTest().
+ * Like the real module the state lives in the item table's hydration
+ * column and the backing path comes from ItemDatabase.computePath(), so a
+ * download lands where the database (not the mount) says the item is.
+ * setStateForTest() seeds the state and the fake remote file of an item.
  */
 module hydration;
 
@@ -14,10 +16,8 @@ import core.sync.mutex;
 import core.thread : Thread;
 import core.time : dur;
 import errno = core.stdc.errno;
-import std.conv : to;
-import std.datetime : SysTime;
 import std.file;
-import std.path : buildPath, dirName;
+import std.path : buildNormalizedPath, buildPath, dirName;
 import std.stdio : stderr;
 
 import config;
@@ -83,8 +83,7 @@ final class HydrationService
 	private string backingDir;
 	private Mutex lock;
 	private Condition done;
-	private HydrationState[string] states;
-	private string[string] paths;          // key -> "a/b" relative path
+	private string[string] remotePaths;    // key -> "a/b" in fakeRemoteDir
 	private bool[string] inFlight;
 	private bool stopping;
 	private uint[string] downloads;
@@ -102,12 +101,22 @@ final class HydrationService
 		return driveId ~ "/" ~ id;
 	}
 
-	void setStateForTest(string driveId, string id, string relPath, HydrationState state)
+	private static string dbValue(HydrationState state)
+	{
+		final switch (state)
+		{
+			case HydrationState.onlineOnly: return "O";
+			case HydrationState.hydrated: return "H";
+			case HydrationState.pinned: return "P";
+		}
+	}
+
+	void setStateForTest(string driveId, string id, string remotePath, HydrationState state)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
-		states[key(driveId, id)] = state;
-		paths[key(driveId, id)] = relPath;
+		itemDB.setHydration(driveId, id, dbValue(state));
+		remotePaths[key(driveId, id)] = remotePath;
 	}
 
 	uint downloadCount(string driveId, string id)
@@ -117,11 +126,43 @@ final class HydrationService
 		return downloads.get(key(driveId, id), 0);
 	}
 
+	private HydrationState stateLocked(string driveId, string id)
+	{
+		Item item;
+		if (!itemDB.selectById(driveId, id, item))
+			throw new HydrationError(errno.ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		if (item.hydration == "O") return HydrationState.onlineOnly;
+		if (item.hydration == "P") return HydrationState.pinned;
+		return HydrationState.hydrated;
+	}
+
+	private string targetOf(string driveId, string id)
+	{
+		return buildNormalizedPath(buildPath(backingDir, itemDB.computePath(driveId, id)));
+	}
+
 	HydrationState stateOf(string driveId, string id)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
-		return states.get(key(driveId, id), HydrationState.hydrated);
+		return stateLocked(driveId, id);
+	}
+
+	/* Creates the empty backing file of an online-only item instead of
+	   downloading it (O_TRUNC). False if the item is not online-only. */
+	bool createEmpty(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		if (key(driveId, id) in inFlight || stateLocked(driveId, id) != HydrationState.onlineOnly)
+			return false;
+		string target = targetOf(driveId, id);
+		if (exists(target))
+			return false;
+		std.file.write(target, "");
+		itemDB.setHydration(driveId, id, "H");
+		stderr.writeln("STUB createEmpty ", itemDB.computePath(driveId, id));
+		return true;
 	}
 
 	void hydrate(string driveId, string id)
@@ -133,10 +174,10 @@ final class HydrationService
 			done.wait();
 		if (stopping)
 			throw new HydrationError(errno.EIO, "hydration service stopped");
-		if (states.get(k, HydrationState.hydrated) != HydrationState.onlineOnly)
+		if (stateLocked(driveId, id) != HydrationState.onlineOnly)
 			return;
-		auto rel = k in paths;
-		if (rel is null)
+		auto remote = k in remotePaths;
+		if (remote is null)
 			throw new HydrationError(errno.ENOENT, "unknown item " ~ k);
 
 		inFlight[k] = true;
@@ -145,42 +186,43 @@ final class HydrationService
 			inFlight.remove(k);
 			done.notifyAll();
 		}
-		string target = buildPath(backingDir, *rel);
+		string rel = itemDB.computePath(driveId, id);
+		string target = targetOf(driveId, id);
+		string source = buildPath(fakeRemoteDir, *remote);
 		lock.unlock();
 		bool relocked = false;
 		scope(exit) if (!relocked) lock.lock();
 
-		stderr.writeln("STUB download ", *rel);
+		stderr.writeln("STUB download ", *remote, " to ", rel);
 		if (downloadDelayMsecs)
 			Thread.sleep(dur!"msecs"(downloadDelayMsecs));
-		string source = buildPath(fakeRemoteDir, *rel);
 		if (!exists(source))
-			throw new HydrationError(errno.ENOENT, "gone online: " ~ *rel);
+			throw new HydrationError(errno.ENOENT, "gone online: " ~ *remote);
 		/* Download next to the backing dir, not inside it, then rename */
 		string tmp = buildPath(dirName(backingDir), "hydrate-tmp-" ~ id);
 		copy(source, tmp);
 		Item item;
 		if (itemDB.selectById(driveId, id, item))
 			setTimes(tmp, item.mtime, item.mtime);
+		mkdirRecurse(dirName(target));
 		rename(tmp, target);
 
 		lock.lock();
 		relocked = true;
 		downloads[k] = downloads.get(k, 0) + 1;
-		states[k] = HydrationState.hydrated;
+		itemDB.setHydration(driveId, id, "H");
 	}
 
 	bool dehydrate(string driveId, string id)
 	{
-		auto k = key(driveId, id);
 		lock.lock();
 		scope(exit) lock.unlock();
-		if (states.get(k, HydrationState.hydrated) != HydrationState.hydrated || k !in paths)
+		if (stateLocked(driveId, id) != HydrationState.hydrated)
 			return false;
-		string target = buildPath(backingDir, paths[k]);
+		string target = targetOf(driveId, id);
 		if (exists(target))
 			remove(target);
-		states[k] = HydrationState.onlineOnly;
+		itemDB.setHydration(driveId, id, "O");
 		return true;
 	}
 
@@ -189,16 +231,15 @@ final class HydrationService
 		hydrate(driveId, id);
 		lock.lock();
 		scope(exit) lock.unlock();
-		states[key(driveId, id)] = HydrationState.pinned;
+		itemDB.setHydration(driveId, id, "P");
 	}
 
 	void unpin(string driveId, string id)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
-		auto k = key(driveId, id);
-		if (states.get(k, HydrationState.hydrated) == HydrationState.pinned)
-			states[k] = HydrationState.hydrated;
+		if (stateLocked(driveId, id) == HydrationState.pinned)
+			itemDB.setHydration(driveId, id, "H");
 	}
 
 	void shutdown()
