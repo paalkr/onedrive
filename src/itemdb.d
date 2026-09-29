@@ -9,6 +9,7 @@ import std.string;
 import std.stdio;
 import std.algorithm.searching;
 import core.stdc.stdlib;
+import core.sync.mutex;
 import std.json;
 import std.conv;
 
@@ -212,10 +213,16 @@ final class ItemDatabase {
 	string deleteItemByIdStmt;
 	bool databaseInitialised = false;
 	private Object databaseLock;
+	// On-demand: held by the owning thread from beginTransaction() to commit/rollback, so that
+	// writers on other threads (HydrationService) never write into an open engine transaction
+	private Mutex transactionMutex;
+	private bool transactionMutexHeld = false;
+	private bool serialiseTransactions = false;
 	
 	this(string filename) {
 		// Initialise the database monitor used to serialise all database access
 		databaseLock = new Object();
+		transactionMutex = new Mutex();
 		
 		db = Database(filename);
 		int dbVersion;
@@ -1338,6 +1345,18 @@ final class ItemDatabase {
 	// semantics this is the dominant cost of processing a large /delta response.
 	// https://github.com/abraunegg/onedrive/issues/3788
 	void beginTransaction() {
+		// On-demand: take the transaction mutex for the lifetime of the transaction
+		if (serialiseTransactions) transactionMutex.lock();
+		bool transactionBegun = false;
+		scope(exit) {
+			if (serialiseTransactions) {
+				if (transactionBegun && !transactionMutexHeld) {
+					transactionMutexHeld = true;
+				} else {
+					transactionMutex.unlock();
+				}
+			}
+		}
 		synchronized(databaseLock) {
 			// SQLite does not support nesting transactions, so do not begin another if one is
 			// already in progress
@@ -1349,6 +1368,7 @@ final class ItemDatabase {
 			try {
 				if (debugLogging) {addLogEntry("Beginning a database transaction", ["debug"]);}
 				db.exec("BEGIN TRANSACTION;");
+				transactionBegun = true;
 			} catch (SqliteException exception) {
 				// If the transaction cannot be started, the database remains in autocommit mode.
 				// Each change is then still written as it was previously, just less efficiently,
@@ -1364,6 +1384,7 @@ final class ItemDatabase {
 	// transaction was begun
 	// https://github.com/abraunegg/onedrive/issues/3788
 	void commitTransaction() {
+		scope(exit) releaseTransactionMutex();
 		synchronized(databaseLock) {
 			// If no transaction is open there is nothing to commit
 			if (!db.inTransaction()) {
@@ -1387,6 +1408,7 @@ final class ItemDatabase {
 	// /delta response is requested, as the delta link is not advanced until processing completes.
 	// https://github.com/abraunegg/onedrive/issues/3788
 	void rollbackTransaction() {
+		scope(exit) releaseTransactionMutex();
 		synchronized(databaseLock) {
 			// If no transaction is open there is nothing to roll back
 			if (!db.inTransaction()) {
@@ -1402,6 +1424,42 @@ final class ItemDatabase {
 				addLogEntry("ERROR: Unable to roll back the database transaction: " ~ exception.msg);
 				addLogEntry();
 			}
+		}
+	}
+
+	// On-demand: serialise transactions against writers on other threads (see transactionMutex)
+	void enableTransactionSerialisation() {
+		serialiseTransactions = true;
+	}
+
+	// On-demand: a writer on another thread holds this around its writes so they never join an
+	// open engine transaction. Lock order: this mutex, then the on-demand state lock, then the database lock.
+	Mutex transactionLock() {
+		return transactionMutex;
+	}
+
+	private void releaseTransactionMutex() {
+		if (serialiseTransactions && transactionMutexHeld) {
+			transactionMutexHeld = false;
+			transactionMutex.unlock();
+		}
+	}
+
+	// On-demand: does any item have the online-only hydration state?
+	bool hasOnlineOnlyItems() {
+		synchronized(databaseLock) {
+			auto stmt = db.prepare("SELECT COUNT(*) FROM item WHERE hydration = 'O';");
+			scope(exit) stmt.finalise(); // Ensure that the prepared statement is finalised after execution.
+			try {
+				auto res = stmt.exec();
+				if (!res.empty) {
+					return res.front[0].to!long > 0;
+				}
+			} catch (SqliteException exception) {
+				// Handle the error appropriately
+				detailSQLErrorMessage(exception);
+			}
+			return false;
 		}
 	}
 
