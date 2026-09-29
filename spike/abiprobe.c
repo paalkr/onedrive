@@ -62,6 +62,9 @@ int main(void)
 	O(fuse_operations, write_buf); O(fuse_operations, read_buf); O(fuse_operations, flock);
 	O(fuse_operations, fallocate); O(fuse_operations, copy_file_range); O(fuse_operations, lseek);
 
+	S(fuse_args);
+	O(fuse_args, argc); O(fuse_args, argv); O(fuse_args, allocated);
+
 	printf("sizeof stat %zu\nsizeof statvfs %zu\nsizeof flock %zu\nsizeof timespec %zu\n",
 		sizeof(struct stat), sizeof(struct statvfs), sizeof(struct flock), sizeof(struct timespec));
 	return 0;

@@ -12,6 +12,9 @@ module fused.fuse;
 /* reexport stat_t */
 public import core.sys.posix.fcntl;
 public import core.sys.posix.time : timespec;
+public import core.sys.posix.sys.statvfs : statvfs_t;
+public import c.fuse.common : fuse_file_info, fuse_conn_info;
+public import c.fuse.fuse : fuse_config;
 
 import std.algorithm;
 import std.array;
@@ -26,6 +29,7 @@ import core.sys.posix.signal;
 import c.fuse.fuse;
 
 import core.thread : Thread, thread_attachThis, thread_detachThis;
+import core.time : dur, MonoTime;
 import core.sys.posix.pthread;
 
 /**
@@ -99,6 +103,13 @@ private auto call(alias fn)()
     }
 }
 
+/* libfuse passes a null path to release, read, write, fsync and friends
+ * when the file was unlinked while open (hard_remove) */
+private const(char)[] dpath(const(char)* path) nothrow
+{
+    return path is null ? null : path[0 .. strlen(path)];
+}
+
 /* C calling convention compatible function wrappers to hand into libfuse which wrap
  * the call to our Operations object.
  *
@@ -112,7 +123,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                if(t.access(path[0..path.strlen], mode))
+                if(t.access(dpath(path), mode))
                 {
                     return 0;
                 }
@@ -125,7 +136,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.getattr(path[0..path.strlen], *st);
+                t.getattr(dpath(path), *st);
                 return 0;
             })();
     }
@@ -137,7 +148,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                foreach(file; t.readdir(path[0..path.strlen]))
+                foreach(file; t.readdir(dpath(path)))
                 {
                     filler(buf, toStringz(file), null, 0,
                         cast(fuse_fill_dir_flags) 0);
@@ -151,7 +162,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                auto length = t.readlink(path[0..path.strlen],
+                auto length = t.readlink(dpath(path),
                     (cast(ubyte*)buf)[0..size]);
                 /* Null-terminate the string and copy it over to the buffer. */
                 assert(length <= size);
@@ -166,7 +177,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.open(path[0..path.strlen]);
+                t.open(dpath(path), *fi);
                 return 0;
             })();
     }
@@ -176,7 +187,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.release(path[0..path.strlen]);
+                t.release(dpath(path), *fi);
                 return 0;
             })();
     }
@@ -192,8 +203,8 @@ extern(System)
             (Operations t)
             {
                 auto bbuf = cast(ubyte*) buf;
-                return cast(int) t.read(path[0..path.strlen], bbuf[0..size],
-                    to!ulong(offset));
+                return cast(int) t.read(dpath(path), bbuf[0..size],
+                    to!ulong(offset), *fi);
             })();
     }
 
@@ -207,8 +218,8 @@ extern(System)
             (Operations t)
             {
                 auto bdata = cast(ubyte*) data;
-                return t.write(path[0..path.strlen], bdata[0..size],
-                    to!ulong(offset));
+                return t.write(dpath(path), bdata[0..size],
+                    to!ulong(offset), *fi);
             })();
     }
 
@@ -218,7 +229,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.truncate(path[0..path.strlen], to!ulong(length));
+                t.truncate(dpath(path), to!ulong(length), fi);
                 return 0;
             })();
     }
@@ -230,7 +241,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.mknod(path[0..path.strlen], mod, dev);
+                t.mknod(dpath(path), mod, dev);
                 return 0;
             })();
     }
@@ -240,7 +251,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.unlink(path[0..path.strlen]);
+                t.unlink(dpath(path));
                 return 0;
             })();
     }
@@ -251,7 +262,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.mkdir(path[0..path.strlen], mode.to!uint);
+                t.mkdir(dpath(path), mode.to!uint);
                 return 0;
             })();
     }
@@ -260,7 +271,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.rmdir(path[0..path.strlen]);
+                t.rmdir(dpath(path));
                 return 0;
             })();
     }
@@ -278,7 +289,7 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.chmod(path[0 .. path.strlen], mode);
+                t.chmod(dpath(path), mode);
                 return 0;
             }
         )();
@@ -290,7 +301,7 @@ extern(System)
             (Operations t)
             {
                 /* tv is [atime, mtime]; tv_nsec may be UTIME_NOW or UTIME_OMIT */
-                t.utimens(path[0 .. path.strlen], tv is null ? null : tv[0 .. 2]);
+                t.utimens(dpath(path), tv is null ? null : tv[0 .. 2], fi);
                 return 0;
             }
         );
@@ -311,17 +322,104 @@ extern(System)
         return call!(
             (Operations t)
             {
-                t.chown(path[0 .. path.strlen], uid, gid);
+                t.chown(dpath(path), uid, gid);
                 return 0;
             }
         );
+    }
+
+    private int dfuse_create(const char* path, mode_t mode, fuse_file_info* fi)
+    {
+        return call!(
+            (Operations t)
+            {
+                t.create(dpath(path), mode, *fi);
+                return 0;
+            })();
+    }
+
+    private int dfuse_fsync(const char* path, int datasync, fuse_file_info* fi)
+    {
+        return call!(
+            (Operations t)
+            {
+                t.fsync(dpath(path), datasync != 0, *fi);
+                return 0;
+            })();
+    }
+
+    private int dfuse_statfs(const char* path, statvfs_t* st)
+    {
+        return call!(
+            (Operations t)
+            {
+                t.statfs(dpath(path), *st);
+                return 0;
+            })();
+    }
+
+    private int dfuse_setxattr(const char* path, const char* name,
+            const char* value, size_t size, int flags)
+    {
+        return call!(
+            (Operations t)
+            {
+                t.setxattr(dpath(path), name[0 .. name.strlen],
+                    (cast(const(ubyte)*) value)[0 .. size], flags);
+                return 0;
+            })();
+    }
+
+    /* size 0 asks for the length only; a too small buffer is ERANGE */
+    private int copyXattr(const(ubyte)[] value, char* buf, size_t size)
+    {
+        if (size == 0)
+            return cast(int) value.length;
+        if (value.length > size)
+            return -errno.ERANGE;
+        memcpy(buf, value.ptr, value.length);
+        return cast(int) value.length;
+    }
+
+    private int dfuse_getxattr(const char* path, const char* name, char* buf,
+            size_t size)
+    {
+        return call!(
+            (Operations t)
+            {
+                return copyXattr(t.getxattr(dpath(path),
+                    name[0 .. name.strlen]), buf, size);
+            })();
+    }
+
+    private int dfuse_listxattr(const char* path, char* buf, size_t size)
+    {
+        return call!(
+            (Operations t)
+            {
+                /* names are NUL separated and NUL terminated */
+                ubyte[] list;
+                foreach (n; t.listxattr(dpath(path)))
+                    list ~= cast(const(ubyte)[]) n ~ cast(ubyte) 0;
+                return copyXattr(list, buf, size);
+            })();
+    }
+
+    private int dfuse_removexattr(const char* path, const char* name)
+    {
+        return call!(
+            (Operations t)
+            {
+                t.removexattr(dpath(path), name[0 .. name.strlen]);
+                return 0;
+            })();
     }
 
     private void* dfuse_init(fuse_conn_info* conn, fuse_config* cfg)
     {
         attach();
         auto t = cast(Operations*) fuse_get_context().private_data;
-        (*t).initialize();
+        (*t).initialize(*conn, *cfg);
         return t;
     }
 
@@ -331,6 +429,40 @@ extern(System)
            exit (see attach()), so fuse_main() can simply return. */
     }
 } /* extern(C) */
+
+/* The callback table shared by Fuse and BackgroundFuse */
+private fuse_operations makeOperations()
+{
+    fuse_operations fops;
+    fops.init = &dfuse_init;
+    fops.access = &dfuse_access;
+    fops.getattr = &dfuse_getattr;
+    fops.readdir = &dfuse_readdir;
+    fops.open = &dfuse_open;
+    fops.release = &dfuse_release;
+    fops.read = &dfuse_read;
+    fops.write = &dfuse_write;
+    fops.truncate = &dfuse_truncate;
+    fops.readlink = &dfuse_readlink;
+    fops.destroy = &dfuse_destroy;
+    fops.mknod = &dfuse_mknod;
+    fops.unlink = &dfuse_unlink;
+    fops.mkdir = &dfuse_mkdir;
+    fops.rmdir = &dfuse_rmdir;
+    fops.rename = &dfuse_rename;
+    fops.chmod = &dfuse_chmod;
+    fops.utimens = &dfuse_utimens;
+    fops.symlink = &dfuse_symlink;
+    fops.chown = &dfuse_chown;
+    fops.create = &dfuse_create;
+    fops.fsync = &dfuse_fsync;
+    fops.statfs = &dfuse_statfs;
+    fops.setxattr = &dfuse_setxattr;
+    fops.getxattr = &dfuse_getxattr;
+    fops.listxattr = &dfuse_listxattr;
+    fops.removexattr = &dfuse_removexattr;
+    return fops;
+}
 
 export class FuseException : Exception
 {
@@ -356,6 +488,16 @@ export class Operations
     }
 
     /**
+     * Runs on filesystem creation with the connection and high-level
+     * configuration, which may be adjusted (e.g. cfg.hard_remove). The
+     * default calls initialize().
+     */
+    void initialize(ref fuse_conn_info conn, ref fuse_config cfg)
+    {
+        initialize();
+    }
+
+    /**
      * Called to get a stat(2) structure for a path.
      */
     void getattr(const(char)[] path, ref stat_t stat)
@@ -377,6 +519,13 @@ export class Operations
         throw new FuseException(errno.EOPNOTSUPP);
     }
 
+    /// read() with the file handle of open()/create(). Defaults to read().
+    ulong read(const(char)[] path, ubyte[] buf, ulong offset,
+        ref fuse_file_info fi)
+    {
+        return read(path, buf, offset);
+    }
+
     /**
      * Write the given data to the file.
      *
@@ -391,6 +540,13 @@ export class Operations
         throw new FuseException(errno.EOPNOTSUPP);
     }
 
+    /// write() with the file handle of open()/create(). Defaults to write().
+    int write(const(char)[] path, in ubyte[] data, ulong offset,
+        ref fuse_file_info fi)
+    {
+        return write(path, data, offset);
+    }
+
     /**
      * Truncate a file to the given length.
      * Params:
@@ -400,6 +556,15 @@ export class Operations
     void truncate(const(char)[] path, ulong length)
     {
         throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    /**
+     * truncate() with the file handle when called for ftruncate(2) on an
+     * open file, null otherwise. Defaults to truncate().
+     */
+    void truncate(const(char)[] path, ulong length, fuse_file_info* fi)
+    {
+        truncate(path, length);
     }
 
     /**
@@ -463,6 +628,12 @@ export class Operations
     void utimens(const(char)[] path, const(timespec)[] tv)
     {
         throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    /// utimens() with the file handle if the file is open (may be null)
+    void utimens(const(char)[] path, const(timespec)[] tv, fuse_file_info* fi)
+    {
+        utimens(path, tv);
     }
 
     /**
@@ -530,7 +701,65 @@ export class Operations
         throw new FuseException(errno.EOPNOTSUPP);
     }
 
+    /**
+     * open() with the open flags (fi.flags) and room for a file handle
+     * (fi.fh), passed back to read/write/release. Defaults to open().
+     */
+    void open(const(char)[] path, ref fuse_file_info fi)
+    {
+        open(path);
+    }
+
     void release(const(char)[] path)
+    {
+        throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    /// release() with the file handle of open()/create(). Defaults to release().
+    void release(const(char)[] path, ref fuse_file_info fi)
+    {
+        release(path);
+    }
+
+    /**
+     * Creates and opens a file. The default throws ENOSYS, which makes the
+     * kernel fall back to mknod() and open().
+     */
+    void create(const(char)[] path, mode_t mode, ref fuse_file_info fi)
+    {
+        throw new FuseException(errno.ENOSYS);
+    }
+
+    void fsync(const(char)[] path, bool datasync, ref fuse_file_info fi)
+    {
+        throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    void statfs(const(char)[] path, ref statvfs_t st)
+    {
+        throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    /// Extended attributes. flags are XATTR_CREATE / XATTR_REPLACE.
+    void setxattr(const(char)[] path, const(char)[] name, in ubyte[] value,
+        int flags)
+    {
+        throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    /// Returns the attribute value; throw ENODATA if it does not exist
+    const(ubyte)[] getxattr(const(char)[] path, const(char)[] name)
+    {
+        throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    /// Returns the attribute names
+    string[] listxattr(const(char)[] path)
+    {
+        throw new FuseException(errno.EOPNOTSUPP);
+    }
+
+    void removexattr(const(char)[] path, const(char)[] name)
     {
         throw new FuseException(errno.EOPNOTSUPP);
     }
@@ -587,28 +816,7 @@ public:
 
         debug writefln("fuse arguments s=(%s)", args);
 
-        fuse_operations fops;
-
-        fops.init = &dfuse_init;
-        fops.access = &dfuse_access;
-        fops.getattr = &dfuse_getattr;
-        fops.readdir = &dfuse_readdir;
-        fops.open = &dfuse_open;
-        fops.release = &dfuse_release;
-        fops.read = &dfuse_read;
-        fops.write = &dfuse_write;
-        fops.truncate = &dfuse_truncate;
-        fops.readlink = &dfuse_readlink;
-        fops.destroy = &dfuse_destroy;
-        fops.mknod = &dfuse_mknod;
-        fops.unlink = &dfuse_unlink;
-        fops.mkdir = &dfuse_mkdir;
-        fops.rmdir = &dfuse_rmdir;
-        fops.rename = &dfuse_rename;
-        fops.chmod = &dfuse_chmod;
-        fops.utimens = &dfuse_utimens;
-        fops.symlink = &dfuse_symlink;
-        fops.chown = &dfuse_chown;
+        fuse_operations fops = makeOperations();
 
         /* Create c-style arguments from a string[] array. */
         auto cargs = array(map!(a => toStringz(a))(args));
@@ -629,5 +837,138 @@ public:
     void exit()
     {
         kill(this.pid, SIGINT);
+    }
+}
+
+/* Runs on a plain pthread that is not registered with the D runtime: a
+   thread blocked in a request to its own FUSE mount cannot take the GC's
+   stop-the-world signal, so it must not be a D thread. */
+private extern(C) void* kickMount(void* arg) nothrow
+{
+    stat_t st;
+    stat(cast(const(char)*) arg, &st);
+    return null;
+}
+
+/**
+ * Mounts an Operations object and runs the multi-threaded libfuse loop on a
+ * background thread. Unlike fuse_main() this installs no signal handlers, so
+ * the host process keeps its own, and it does not daemonise.
+ */
+export class BackgroundFuse
+{
+private:
+    fuse* f;
+    Operations ops;          // referenced from C via private_data, keep alive
+    fuse_operations fops;
+    Thread loopThread;
+    string mountpoint;
+    int loopResult;
+
+    void runLoop()
+    {
+        loopResult = fuse_loop_mt_31(f, 0);
+    }
+
+public:
+    /**
+     * Mounts ops on mountpoint and starts the loop. Throws on failure, in
+     * which case nothing is left mounted.
+     *
+     * Params:
+     *   fsname     = argv[0] for libfuse and the source shown in /proc/mounts
+     *   mountopts  = options passed as -o (e.g. "default_permissions")
+     */
+    void start(Operations ops, string fsname, string mountpoint,
+        string[] mountopts)
+    {
+        import std.exception : enforce;
+        enforce(f is null, "already mounted");
+
+        string[] args = [fsname];
+        if (mountopts.length > 0)
+            args ~= format("-o%s", mountopts.join(","));
+        auto cargs = array(map!(a => cast(char*) toStringz(a))(args)) ~ null;
+        fuse_args fargs = fuse_args(cast(int) args.length, cargs.ptr, 0);
+
+        this.ops = ops;
+        this.mountpoint = mountpoint;
+        fops = makeOperations();
+        f = fuse_new_31(&fargs, &fops, fuse_operations.sizeof, &this.ops);
+        enforce(f !is null, "fuse_new failed for " ~ mountpoint);
+        if (fuse_mount(f, toStringz(mountpoint)) != 0)
+        {
+            fuse_destroy(f);
+            f = null;
+            throw new Exception("fuse_mount failed for " ~ mountpoint);
+        }
+
+        loopThread = new Thread(&runLoop);
+        loopThread.start();
+    }
+
+    bool mounted()
+    {
+        return f !is null;
+    }
+
+    /**
+     * Stops the loop, unmounts and frees the handle. Requests already being
+     * handled finish first, so anything they block on (e.g. a download)
+     * should be cancelled before calling this. Idempotent.
+     *
+     * Returns: false if the loop did not stop within the timeout; the mount
+     * is then detached lazily and the handle leaked.
+     */
+    bool stop(uint timeoutSeconds = 10)
+    {
+        if (f is null)
+            return true;
+
+        /* fuse_exit only sets a flag that the workers check after a
+           request. Send uncached requests (a lookup of a name that does
+           not exist) until one of them notices and the loop returns. */
+        fuse_exit(f);
+        /* C heap and never freed: a kicker may outlive this call */
+        import core.sys.posix.string : strdup;
+        auto probe = strdup(toStringz(mountpoint ~ "/.onedrive-fuse-stop"));
+        auto deadline = MonoTime.currTime + dur!"seconds"(timeoutSeconds);
+        while (loopThread.isRunning && MonoTime.currTime < deadline)
+        {
+            pthread_t kicker;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            pthread_create(&kicker, &attr, &kickMount, cast(void*) probe);
+            pthread_attr_destroy(&attr);
+            foreach (i; 0 .. 10)
+            {
+                if (!loopThread.isRunning)
+                    break;
+                Thread.sleep(dur!"msecs"(20));
+            }
+        }
+
+        bool clean = !loopThread.isRunning;
+        if (clean)
+        {
+            loopThread.join(false);
+            fuse_unmount(f);
+            fuse_destroy(f);
+        }
+        else
+        {
+            /* Workers are still inside a handler. Detach the mount so no new
+               requests arrive; the loop ends when they return. */
+            fuse_unmount(f);
+        }
+        f = null;
+        return clean;
+    }
+
+    /// fuse_loop_mt() result once stopped: 0 on a clean exit
+    int result()
+    {
+        return loopResult;
     }
 }
