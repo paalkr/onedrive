@@ -301,7 +301,10 @@ class ApplicationConfig {
 	string recycleBinInfoPath;
 	
 	// Runtime 'sync_dir' as initialised
+	// When 'on_demand' is enabled this is the on-demand backing directory, not the configured 'sync_dir'
 	string runtimeSyncDirectory;
+	// When 'on_demand' is enabled, the configured 'sync_dir' (expanded) which is used as the on-demand mountpoint
+	string onDemandMountPoint;
 		
 	// Initialise the application configuration
 	bool initialise(string confdirOption, bool helpRequested) {
@@ -410,6 +413,10 @@ class ApplicationConfig {
 		boolValues["check_nosync"] = false;
 		// Do we wish to download only?
 		boolValues["download_only"] = false;
+		// Do we present 'sync_dir' as a Files On-Demand mount backed by a separate local directory?
+		boolValues["on_demand"] = false;
+		// The local backing directory used when 'on_demand' is enabled. Empty means '<confdir>/ondemand/backing'
+		stringValues["on_demand_backing_dir"] = "";
 		// Do we disable notifications?
 		boolValues["disable_notifications"] = false;
 		// Do we bypass all the download validation? 
@@ -1445,6 +1452,12 @@ class ApplicationConfig {
 				"no-remote-delete",
 					"Do not delete local file 'deletes' from OneDrive when using --upload-only",
 					&boolValues["no_remote_delete"],
+				"on-demand",
+					"Present 'sync_dir' as a Files On-Demand mount. Requires --monitor",
+					&boolValues["on_demand"],
+				"on-demand-backing-dir",
+					"Specify the local backing directory used when --on-demand is enabled",
+					&stringValues["on_demand_backing_dir"],
 				"print-access-token",
 					"Print the access token, useful for debugging",
 					&boolValues["print_token"],
@@ -1807,6 +1820,8 @@ class ApplicationConfig {
 		addLogEntry("Config option 'dry_run'                       = " ~ to!string(getValueBool("dry_run")));
 		addLogEntry("Config option 'upload_only'                   = " ~ to!string(getValueBool("upload_only")));
 		addLogEntry("Config option 'download_only'                 = " ~ to!string(getValueBool("download_only")));
+		addLogEntry("Config option 'on_demand'                     = " ~ to!string(getValueBool("on_demand")));
+		addLogEntry("Config option 'on_demand_backing_dir'         = " ~ getValueString("on_demand_backing_dir"));
 		addLogEntry("Config option 'local_first'                   = " ~ to!string(getValueBool("local_first")));
 		addLogEntry("Config option 'mirror_local_state'            = " ~ to!string(getValueBool("mirror_local_state")));
 		addLogEntry("Config option 'check_nosync'                  = " ~ to!string(getValueBool("check_nosync")));
@@ -2442,6 +2457,18 @@ class ApplicationConfig {
 			configureRequiredFilePermissions();
 		}
 		
+		// --on-demand requires --monitor, and cannot be combined with one-directional sync modes
+		if (getValueBool("on_demand")) {
+			if (!getValueBool("monitor")) {
+				addLogEntry("ERROR: --on-demand can only be used with --monitor");
+				operationalConflictDetected = true;
+			}
+			if ((getValueBool("upload_only")) || (getValueBool("download_only"))) {
+				addLogEntry("ERROR: --on-demand cannot be used with --upload-only or --download-only");
+				operationalConflictDetected = true;
+			}
+		}
+		
 		// --upload-only and --download-only cannot be used together
 		if ((getValueBool("upload_only")) && (getValueBool("download_only"))) {
 			addLogEntry("ERROR: --upload-only and --download-only cannot be used together. Use one, not both at the same time");
@@ -2764,6 +2791,22 @@ class ApplicationConfig {
 					runtimeSyncDirectory = getValueString("sync_dir");
 				}
 			}
+		}
+		
+		// In on-demand mode the configured 'sync_dir' becomes the mountpoint and the engine operates on the backing directory
+		if (getValueBool("on_demand")) {
+			onDemandMountPoint = runtimeSyncDirectory;
+			string configuredBackingDir = strip(getValueString("on_demand_backing_dir"));
+			string backingDir;
+			if (configuredBackingDir.empty) {
+				backingDir = buildNormalizedPath(buildPath(configDirName, "ondemand", "backing"));
+			} else if (startsWith(configuredBackingDir, "~")) {
+				backingDir = buildNormalizedPath(defaultHomePath ~ configuredBackingDir[1 .. $]);
+			} else {
+				backingDir = buildNormalizedPath(absolutePath(configuredBackingDir));
+			}
+			if (debugLogging) {addLogEntry("sync_dir: on_demand enabled, mountpoint is: " ~ onDemandMountPoint ~ ", backing directory is: " ~ backingDir, ["debug"]);}
+			runtimeSyncDirectory = backingDir;
 		}
 		
 		// What will runtimeSyncDirectory be actually set to?

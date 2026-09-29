@@ -38,6 +38,7 @@ import onedrive;
 import itemdb;
 import clientSideFiltering;
 import xattr;
+import hydration;
 
 class JsonResponseException: Exception {
 	@safe pure this(string inputMessage) {
@@ -226,6 +227,8 @@ class SyncEngine {
 	bool syncListConfigured = false;
 	// Was --dry-run used?
 	bool dryRun = false;
+	// Is Files On-Demand (on_demand) enabled? The sync directory is then the on-demand backing directory
+	bool onDemand = false;
 	// Was --upload-only used?
 	bool uploadOnly = false;
 	// Was --remove-source-files used?
@@ -530,6 +533,9 @@ class SyncEngine {
 		// Configure the dryRun flag to capture if --dry-run was used
 		// Application startup already flagged we are also in a --dry-run state, so no need to output anything else here
 		this.dryRun = appConfig.getValueBool("dry_run");
+
+		// Configure the onDemand flag to capture if 'on_demand' is enabled
+		this.onDemand = appConfig.getValueBool("on_demand");
 
 		// Configure file size limit
 		if (appConfig.getValueLong("skip_size") != 0) {
@@ -3806,6 +3812,14 @@ class SyncEngine {
 		// How to handle this Potentially New Local Item JSON ?
 		final switch (newDatabaseItem.type) {
 			case ItemType.file:
+				// On-demand: a new online file is recorded as online-only and not downloaded,
+				// unless it is inside a pinned directory
+				if (onDemand && !exists(newItemPath) && !isPinnedOrHasPinnedAncestor(itemDB, newDatabaseItem.driveId, newDatabaseItem.parentId)) {
+					if (verboseLogging) {addLogEntry("On-demand: recording new online file as online-only: " ~ newItemPath, ["verbose"]);}
+					setItemHydration(newDatabaseItem, hydrationOnlineOnly);
+					itemDB.upsert(newDatabaseItem);
+					goto functionCompletion;
+				}
 				// Add to the file to the download array for processing later
 				fileJSONItemsToDownload ~= onedriveJSONItem;
 				goto functionCompletion;
@@ -4248,6 +4262,9 @@ class SyncEngine {
 		bool changedItemIsFile = (changedOneDriveItem.type == ItemType.file) ||
 			((changedOneDriveItem.type == ItemType.remote) && (changedOneDriveItem.remoteType == ItemType.file));
 		bool fileContentChanged = changedItemIsFile && !sameAppliedFileContent(existingDatabaseItem, changedOneDriveItem);
+		// On-demand: an online-only file has no local bytes. A move only changes its database
+		// location and a content change only updates its metadata; it stays online-only.
+		bool onDemandOnlineOnly = (existingDatabaseItem.type == ItemType.file) && onDemandAbsentOnlineOnly(existingDatabaseItem.driveId, existingDatabaseItem.id, existingItemPath);
 
 		// Do we need to actually update the database with the details that were provided by the OneDrive API?
 		// Calculate these time items from the provided items
@@ -4293,6 +4310,15 @@ class SyncEngine {
 					}
 				}
 
+				// On-demand: there is no local file to rename for an online-only item. Clear the
+				// destination as the rename would have (its content was preserved above if needed).
+				if (onDemandOnlineOnly) {
+					if (!dryRun && exists(changedItemPath) && isFile(changedItemPath)) {
+						safeRemove(changedItemPath);
+						if (!exists(changedItemPath)) notifyExpectedLocalRemoval(changedItemPath);
+					}
+					itemWasMoved = true;
+				} else
 				// We should no longer need a try block for safeRename() as retry / error handling occurs within safeRename() and setLocalPathTimestamp() .. but keeping this for the moment
 				try {
 					// If we are in a --dry-run situation?
@@ -4338,7 +4364,11 @@ class SyncEngine {
 
 			// What sort of changed item is this?
 			if (changedItemIsFile) {
-				if (fileContentChanged) {
+				if (fileContentChanged && onDemandOnlineOnly) {
+					// On-demand: record the new online metadata, the item stays online-only
+					if (verboseLogging) {addLogEntry("On-demand: online-only file changed online, updating metadata only: " ~ changedItemPath, ["verbose"]);}
+					itemDB.upsert(changedOneDriveItem);
+				} else if (fileContentChanged) {
 					// The online file contains bytes that have not yet been applied
 					// locally. Queue the download regardless of whether the same delta
 					// item also moved the path.
@@ -4876,10 +4906,15 @@ class SyncEngine {
 									// Was this item previously in-sync with the local system?
 									// We previously searched for the file in the DB, we need to use that record
 									if (fileFoundInDB && !exists(newItemPath)) {
-										// Purge DB record only when no canonical local file remains
-										// In a --dry-run scenario, this is being done against a DB copy
-										addLogEntry("Removing DB record due to failed integrity checks");
-										itemDB.deleteById(databaseItem.driveId, databaseItem.id);
+										if (onDemand) {
+											// On-demand: the item still exists online; keep it as online-only
+											onDemandRecordOnlineOnly(databaseItem.driveId, databaseItem.id, newItemPath);
+										} else {
+											// Purge DB record only when no canonical local file remains
+											// In a --dry-run scenario, this is being done against a DB copy
+											addLogEntry("Removing DB record due to failed integrity checks");
+											itemDB.deleteById(databaseItem.driveId, databaseItem.id);
+										}
 									}
 
 									// onedrive.d owns and removes the private staging file when this callback
@@ -5049,10 +5084,15 @@ class SyncEngine {
 									// Was this item previously in-sync with the local system?
 									// We previously searched for the file in the DB, we need to use that record
 									if (fileFoundInDB && !exists(newItemPath)) {
-										// Purge DB record only when no canonical local file remains
-										// In a --dry-run scenario, this is being done against a DB copy
-										addLogEntry("Removing existing DB record due to failed file download.");
-										itemDB.deleteById(databaseItem.driveId, databaseItem.id);
+										if (onDemand) {
+											// On-demand: the item still exists online; keep it as online-only
+											onDemandRecordOnlineOnly(databaseItem.driveId, databaseItem.id, newItemPath);
+										} else {
+											// Purge DB record only when no canonical local file remains
+											// In a --dry-run scenario, this is being done against a DB copy
+											addLogEntry("Removing existing DB record due to failed file download.");
+											itemDB.deleteById(databaseItem.driveId, databaseItem.id);
+										}
 									}
 								}
 								downloadFailed = true;
@@ -5167,7 +5207,16 @@ class SyncEngine {
 					// Since the requested online version was not downloaded, remove the
 					// database identity only when there is no final local file. If an older
 					// successfully applied file remains, preserve both it and its DB baseline.
-					if (!exists(newItemPath)) {
+					if (onDemand && !exists(newItemPath)) {
+						// On-demand: the item still exists online and can be hydrated later. Keep or create
+						// its record as online-only rather than removing it (an absent file with a removed
+						// record would vanish from the mount; an absent hydrated record reads as a local deletion).
+						if (itemDB.idInLocalDatabase(downloadDriveId, downloadItemId)) {
+							onDemandRecordOnlineOnly(downloadDriveId, downloadItemId, newItemPath);
+						} else if (!isItemRemote(onedriveJSONItem)) {
+							saveItem(onedriveJSONItem);
+						}
+					} else if (!exists(newItemPath)) {
 						// The local path does not exist
 						if (itemDB.idInLocalDatabase(downloadDriveId, downloadItemId)) {
 							// Since the path does not exist, but the driveId and itemId exists in the database, when we do the DB consistency check, we will think this file has been 'deleted'
@@ -5262,6 +5311,21 @@ class SyncEngine {
 		// Whilst this means some extra code / duplication in this function, it cannot be helped
 
 		if (!exists(path)) {
+			// On-demand: an online-only file is not present in the backing directory by design
+			if (onDemand && ((item.type == ItemType.file) || ((item.type == ItemType.remote) && (item.remoteType == ItemType.file)))) {
+				if ((item.hydration == hydrationOnlineOnly) || onDemandAbsentOnlineOnly(item.driveId, item.id, path)) {
+					if (debugLogging) {addLogEntry("On-demand: online-only file is in sync: " ~ path, ["debug"]);}
+
+					// Display function processing time if configured to do so
+					if (appConfig.getValueBool("display_processing_time") && debugLogging) {
+						// Combine module name & running Function
+						displayFunctionProcessingTime(thisFunctionName, functionStartTime, Clock.currTime(), logKey);
+					}
+
+					return true;
+				}
+			}
+
 			if (debugLogging) {addLogEntry("Unable to determine the sync state of this file as it does not exist: " ~ path, ["debug"]);}
 
 			// Display function processing time if configured to do so
@@ -5623,6 +5687,42 @@ class SyncEngine {
 			return itemName;
 		}
 		return buildNormalizedPath(calculatedParentPath ~ "/" ~ itemName);
+	}
+
+	// On-demand: is this database item an online-only file that is absent from the backing directory?
+	// Presence is tested before the state is re-read: HydrationService records 'O' before it removes
+	// a file, so an absent file is never paired with a stale hydrated state.
+	bool onDemandAbsentOnlineOnly(string driveId, string id, string localPath) {
+		if (!onDemand) return false;
+		if (exists(localPath)) return false;
+		Item currentItem;
+		if (!itemDB.selectById(driveId, id, currentItem)) return false;
+		return currentItem.hydration == hydrationOnlineOnly;
+	}
+
+	// On-demand: record an existing item as online-only if its file is absent from the backing directory
+	void onDemandRecordOnlineOnly(string driveId, string id, string localPath) {
+		auto stateLock = onDemandStateLock();
+		stateLock.lock();
+		scope(exit) stateLock.unlock();
+		if (exists(localPath)) return;
+		if (verboseLogging) {addLogEntry("On-demand: keeping file as online-only after failed download: " ~ localPath, ["verbose"]);}
+		itemDB.setHydration(driveId, id, hydrationOnlineOnly);
+	}
+
+	// On-demand: re-validate a queued local deletion immediately before it is sent online.
+	// Returns false if the deletion must not be performed.
+	bool onDemandLocalDeletionStillValid(Item itemToDelete, string localPath) {
+		if (!onDemand) return true;
+		auto stateLock = onDemandStateLock();
+		stateLock.lock();
+		scope(exit) stateLock.unlock();
+		if (exists(localPath)) return false;
+		Item currentItem;
+		if (!itemDB.selectById(itemToDelete.driveId, itemToDelete.id, currentItem)) return false;
+		if (currentItem.hydration == hydrationOnlineOnly) return false;
+		if (((currentItem.type == ItemType.dir) || (currentItem.type == ItemType.root)) && subtreeHasOnlineOnlyItems(itemDB, currentItem.driveId, currentItem.id)) return false;
+		return true;
 	}
 
 	// Query itemdb.computePath() and catch potential assert when DB consistency issue occurs
@@ -6460,6 +6560,11 @@ class SyncEngine {
 				// There are items to delete online
 				addLogEntry("Deleted local items to delete on Microsoft OneDrive: " ~ to!string(databaseItemsToDeleteOnline.length));
 				foreach(localItemToDeleteOnline; databaseItemsToDeleteOnline) {
+					// On-demand: never delete online what is only absent because it is online-only
+					if (!onDemandLocalDeletionStillValid(localItemToDeleteOnline.dbItem, localItemToDeleteOnline.localFilePath)) {
+						if (verboseLogging) {addLogEntry("On-demand: not deleting online, the item is online-only or present again: " ~ localItemToDeleteOnline.localFilePath, ["verbose"]);}
+						continue;
+					}
 					// Upload to OneDrive the instruction to delete this item. This will handle the 'noRemoteDelete' flag if set
 					uploadDeletedItem(localItemToDeleteOnline.dbItem, localItemToDeleteOnline.localFilePath);
 				}
@@ -6620,6 +6725,30 @@ class SyncEngine {
 		// What is the source of this item data?
 		string itemSource = "database";
 
+		// On-demand: take a consistent snapshot of backing-file presence and the current database
+		// record, so a concurrent hydration or dehydration is never misread as a local change
+		if (onDemand) {
+			auto stateLock = onDemandStateLock();
+			stateLock.lock();
+			bool presentInBackingDir = exists(localFilePath);
+			Item currentItem;
+			bool currentItemFound = itemDB.selectById(dbItem.driveId, dbItem.id, currentItem);
+			stateLock.unlock();
+
+			if (currentItemFound) dbItem = currentItem;
+			if (!currentItemFound || (!presentInBackingDir && (dbItem.hydration == hydrationOnlineOnly))) {
+				// Online-only and absent is in sync; a removed record needs no action
+				if (verboseLogging) {addLogEntry("The file is online-only and has not changed", ["verbose"]);}
+
+				// Display function processing time if configured to do so
+				if (appConfig.getValueBool("display_processing_time") && debugLogging) {
+					// Combine module name & running Function
+					displayFunctionProcessingTime(thisFunctionName, functionStartTime, Clock.currTime(), logKey);
+				}
+				return;
+			}
+		}
+
 		// Does this item|file still exist on disk?
 		if (exists(localFilePath)) {
 			// Path exists locally, is this path a file?
@@ -6737,7 +6866,10 @@ class SyncEngine {
 		} else {
 			// File does not exist locally, but is in our database as a dbItem containing all the data was passed into this function
 			// If we are in a --dry-run situation - this file may never have existed as we never downloaded it
-			if (!dryRun) {
+			if (onDemandAbsentOnlineOnly(dbItem.driveId, dbItem.id, localFilePath)) {
+				// On-demand: the file became online-only after the snapshot above
+				if (verboseLogging) {addLogEntry("The file is online-only and has not changed", ["verbose"]);}
+			} else if (!dryRun) {
 				// Not --dry-run situation
 				if (verboseLogging) {addLogEntry("The file has been deleted locally", ["verbose"]);}
 				// Add this to the array to handle post checking all database items
@@ -6804,8 +6936,13 @@ class SyncEngine {
 			try {
 				if (!isDir(localFilePath)) {
 					if (verboseLogging) {addLogEntry("The item was a directory but now it is a file", ["verbose"]);}
-					uploadDeletedItem(dbItem, localFilePath);
-					uploadNewFile(localFilePath);
+					if (onDemand && subtreeHasOnlineOnlyItems(itemDB, dbItem.driveId, dbItem.id)) {
+						// On-demand: deleting the directory online would delete online-only files that were never local
+						addLogEntry("On-demand: not replacing online directory that contains online-only files with a local file: " ~ localFilePath, ["info", "notify"]);
+					} else {
+						uploadDeletedItem(dbItem, localFilePath);
+						uploadNewFile(localFilePath);
+					}
 				} else {
 					// Directory still exists locally
 					if (verboseLogging) {addLogEntry("The directory has not changed", ["verbose"]);}
@@ -6828,7 +6965,23 @@ class SyncEngine {
 		} else {
 			// Directory does not exist locally, but it is in our database as a dbItem containing all the data was passed into this function
 			// If we are in a --dry-run situation - this directory may never have existed as we never created it
-			if (!dryRun) {
+			if (onDemand && !dryRun && subtreeHasOnlineOnlyItems(itemDB, dbItem.driveId, dbItem.id)) {
+				// On-demand: directories always exist in the backing directory. A missing directory that
+				// holds online-only files is recreated rather than treated as a local deletion, which
+				// would delete those files online.
+				addLogEntry("On-demand: recreating missing backing directory that contains online-only files: " ~ localFilePath);
+				try {
+					mkdirRecurse(localFilePath);
+					if (!appConfig.getValueBool("disable_permission_set")) {
+						localFilePath.setAttributes(appConfig.returnRequiredDirectoryPermissions());
+					}
+				} catch (FileException e) {
+					displayFileSystemErrorMessage(e.msg, thisFunctionName, localFilePath);
+				}
+				if (exists(localFilePath) && isDir(localFilePath)) {
+					checkDirectoryDatabaseItemForConsistency(dbItem, localFilePath);
+				}
+			} else if (!dryRun) {
 				// Not --dry-run situation
 				if (!appConfig.getValueBool("monitor")) {
 					// Not in --monitor mode
@@ -12702,9 +12855,33 @@ class SyncEngine {
 						}
 					}
 
-					// Add to the local database
-					if (debugLogging) {addLogEntry("Saving this DB item record: " ~ to!string(item), ["debug"]);}
-					itemDB.upsert(item);
+					// On-demand: record the hydration state of a file from its presence in the backing
+					// directory, atomically with respect to HydrationService. A present file is hydrated
+					// (pinned if it, or an ancestor, is pinned). An absent file with no existing record is
+					// online-only; an absent file with an existing record keeps its state.
+					if (onDemand && (item.type == ItemType.file)) {
+						auto stateLock = onDemandStateLock();
+						stateLock.lock();
+						scope(exit) stateLock.unlock();
+						Item existingItem;
+						bool existingItemFound = itemDB.selectById(item.driveId, item.id, existingItem);
+						// A path can only be computed through database records; without a parent record there is nothing to decide
+						if (existingItemFound || itemDB.idInLocalDatabase(item.driveId, item.parentId)) {
+							string localPath = existingItemFound ? computeItemPath(existingItem.driveId, existingItem.id) : computeItemPath(item.driveId, item.parentId) ~ "/" ~ item.name;
+							if (exists(localPath)) {
+								bool pinned = (existingItemFound && (existingItem.hydration == hydrationPinned)) || isPinnedOrHasPinnedAncestor(itemDB, item.driveId, item.parentId);
+								setItemHydration(item, pinned ? hydrationPinned : hydrationHydrated);
+							} else if (!existingItemFound) {
+								setItemHydration(item, hydrationOnlineOnly);
+							}
+						}
+						if (debugLogging) {addLogEntry("Saving this DB item record: " ~ to!string(item), ["debug"]);}
+						itemDB.upsert(item);
+					} else {
+						// Add to the local database
+						if (debugLogging) {addLogEntry("Saving this DB item record: " ~ to!string(item), ["debug"]);}
+						itemDB.upsert(item);
+					}
 
 					// If we have a remote drive ID, add this to our list of known drive id's
 					if (!item.remoteDriveId.empty) {
@@ -13009,6 +13186,11 @@ class SyncEngine {
 				foreach (searchDriveId; onlineDriveDetails.keys) {
 					Item dbItem;
 					if (itemDB.selectByPath(failedFile, searchDriveId, dbItem)) {
+						// On-demand: an online-only record is the expected state of a file that is not local
+						if (onDemand && (operation == "download") && (dbItem.hydration == hydrationOnlineOnly)) {
+							if (debugLogging) {addLogEntry("On-demand: retaining online-only database identity for failed download: " ~ failedFile, ["debug"]);}
+							continue;
+						}
 						addLogEntry("ERROR: Failed " ~ operation ~ " path found in database, must delete this item from the database .. it should not be in there if the file failed to " ~ operation);
 						itemDB.deleteById(dbItem.driveId, dbItem.id);
 						if (dbItem.remoteDriveId != null) {
@@ -14231,7 +14413,11 @@ class SyncEngine {
 					scanLocalFilesystemPathForNewData(newPath);
 				}
 			} else {
-				if (!exists(newPath)) {
+				// On-demand: an online-only file has no local bytes to move. The move is a rename
+				// online only and keeps the recorded timestamp.
+				bool onDemandOnlineOnlyMove = onDemand && (oldItem.type == ItemType.file) && (oldItem.hydration == hydrationOnlineOnly) && !exists(newPath);
+
+				if (!exists(newPath) && !onDemandOnlineOnlyMove) {
 					// is this --monitor use?
 					if (appConfig.getValueBool("monitor")) {
 						if (verboseLogging) {addLogEntry("uploadMoveItem target has disappeared: " ~ newPath, ["verbose"]);}
@@ -14243,7 +14429,7 @@ class SyncEngine {
 				// filesystem timestamp of the moved item; never manufacture a new mtime.
 				SysTime mtime;
 				try {
-					mtime = timeLastModified(newPath).toUTC();
+					mtime = onDemandOnlineOnlyMove ? oldItem.mtime : timeLastModified(newPath).toUTC();
 				} catch (FileException exception) {
 					if ((exception.errno == ENOENT) || (exception.errno == ENOTDIR)) {
 						addLogEntry("Moved local item disappeared before timestamp update: " ~ newPath);

@@ -46,6 +46,19 @@ struct Item {
 	string   size;
 	string   relocDriveId;
 	string   relocParentId;
+	// On-demand hydration state: "O" online-only, "H" hydrated, "P" pinned.
+	// null means hydrated (non-on-demand behaviour).
+	string   hydration;
+	// insert/update/upsert write 'hydration' only when this is set; otherwise the stored
+	// state is kept. This stops a stale copy of an item from overwriting a state change
+	// made concurrently by the on-demand layer. Not stored.
+	bool     writeHydration;
+}
+
+// Set the hydration state of an item so that the next insert/update/upsert stores it
+void setItemHydration(ref Item item, string state) {
+	item.hydration = state;
+	item.writeHydration = true;
 }
 
 // Construct an Item DB struct from a JSON driveItem
@@ -184,7 +197,7 @@ Item makeDatabaseItem(JSONValue driveItem) {
 
 final class ItemDatabase {
 	// increment this for every change in the db schema
-	immutable int itemDatabaseVersion = 18;
+	immutable int itemDatabaseVersion = 19;
 
 	Database db;
 	string insertItemStmt;
@@ -300,12 +313,12 @@ final class ItemDatabase {
 		} 
 		
 		insertItemStmt = "
-			INSERT OR REPLACE INTO item (driveId, id, name, remoteName, type, eTag, cTag, mtime, parentId, quickXorHash, sha256Hash, remoteDriveId, remoteParentId, remoteId, remoteType, syncStatus, size, relocDriveId, relocParentId)
-			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+			INSERT OR REPLACE INTO item (driveId, id, name, remoteName, type, eTag, cTag, mtime, parentId, quickXorHash, sha256Hash, remoteDriveId, remoteParentId, remoteId, remoteType, syncStatus, size, relocDriveId, relocParentId, hydration)
+			VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, COALESCE(?20, (SELECT hydration FROM item WHERE driveId = ?1 AND id = ?2)))
 		";
 		updateItemStmt = "
 			UPDATE item
-			SET name = ?3, remoteName = ?4, type = ?5, eTag = ?6, cTag = ?7, mtime = ?8, parentId = ?9, quickXorHash = ?10, sha256Hash = ?11, remoteDriveId = ?12, remoteParentId = ?13, remoteId = ?14, remoteType = ?15, syncStatus = ?16, size = ?17, relocDriveId = ?18, relocParentId = ?19
+			SET name = ?3, remoteName = ?4, type = ?5, eTag = ?6, cTag = ?7, mtime = ?8, parentId = ?9, quickXorHash = ?10, sha256Hash = ?11, remoteDriveId = ?12, remoteParentId = ?13, remoteId = ?14, remoteType = ?15, syncStatus = ?16, size = ?17, relocDriveId = ?18, relocParentId = ?19, hydration = COALESCE(?20, hydration)
 			WHERE driveId = ?1 AND id = ?2
 		";
 		deleteOrphanItemStmt = "
@@ -383,6 +396,7 @@ final class ItemDatabase {
 				size             TEXT,
 				relocDriveId     TEXT,
 				relocParentId    TEXT,
+				hydration        TEXT,
 				PRIMARY KEY (driveId, id),
 				FOREIGN KEY (driveId, parentId)
 				REFERENCES item (driveId, id)
@@ -778,6 +792,23 @@ final class ItemDatabase {
 		}
 	}
 
+	// Set only the on-demand hydration state of an item. A null state stores NULL (hydrated).
+	void setHydration(const(char)[] driveId, const(char)[] id, const(char)[] state) {
+		synchronized(databaseLock) {
+			auto p = db.prepare("UPDATE item SET hydration = ?3 WHERE driveId = ?1 AND id = ?2");
+			scope(exit) p.finalise(); // Ensure that the prepared statement is finalised after execution.
+			try {
+				p.bind(1, driveId);
+				p.bind(2, id);
+				p.bind(3, state);
+				p.exec();
+			} catch (SqliteException exception) {
+				// Handle the error appropriately
+				detailSQLErrorMessage(exception);
+			}
+		}
+	}
+
 	private void bindItem(const ref Item item, ref Statement stmt) {
 		with (stmt) with (item) {
 			bind(1, driveId);
@@ -819,12 +850,14 @@ final class ItemDatabase {
 			bind(17, size);
 			bind(18, relocDriveId);
 			bind(19, relocParentId);
+			// NULL keeps the stored value (COALESCE in the statements)
+			bind(20, writeHydration ? hydration : null);
 		}
 	}
 
 	private Item buildItem(Statement.Result result) {
 		assert(!result.empty, "The DB result must not be empty");
-		assert(result.front.length == 20, "The DB result must have 20 columns");
+		assert(result.front.length == 21, "The DB result must have 21 columns");
 		
 		// Make one owned copy of the DB row before extracting fields.
 		// On OpenBSD, avoid repeatedly evaluating result.front[] while
@@ -874,6 +907,7 @@ final class ItemDatabase {
 			// column 17: size
 			// column 18: relocDriveId
 			// column 19: relocParentId
+			// column 20: hydration
 				
 			driveId: dbRow[0].dup,
 			id: dbRow[1].dup,
@@ -895,6 +929,7 @@ final class ItemDatabase {
 			size: dbRow[17].dup,
 			relocDriveId: dbRow[18].dup,
 			relocParentId: dbRow[19].dup,
+			hydration: dbRow[20].dup,
 		};
 		
 		// Configure item.type
