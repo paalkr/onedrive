@@ -94,6 +94,8 @@ SOURCES = \
 	src/socketio.d \
 	src/curlWebsockets.d \
 	src/localAuth.d \
+	src/hydration.d \
+	src/ondemandglue.d \
 	src/c/fuse/common.d \
 	src/c/fuse/fuse.d \
 	src/fused/fuse.d

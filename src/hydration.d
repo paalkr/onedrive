@@ -1,0 +1,552 @@
+// What is this module called?
+module hydration;
+
+// What does this module require to function?
+import core.stdc.errno;
+import core.sync.condition;
+import core.sync.mutex;
+import std.algorithm;
+import std.conv;
+import std.datetime;
+import std.exception;
+import std.file;
+import std.json;
+import std.path;
+import std.string;
+
+// What other modules that we have created do we need to import?
+import config;
+import curlEngine;
+import itemdb;
+import log;
+import onedrive;
+import util;
+
+// On-demand hydration state of a file item
+enum HydrationState { onlineOnly, hydrated, pinned }
+
+// Database encoding of HydrationState. NULL (null) in the database means hydrated.
+enum string hydrationOnlineOnly = "O";
+enum string hydrationHydrated = "H";
+enum string hydrationPinned = "P";
+
+// Error raised to FUSE callers. errnoCode: ENETUNREACH/EIO offline, ENOENT gone online, EIO other
+class HydrationError : Exception {
+	int errnoCode;
+
+	this(int errnoCode, string msg, string file = __FILE__, size_t line = __LINE__) {
+		super(msg, file, line);
+		this.errnoCode = errnoCode;
+	}
+}
+
+// Local change kinds reported by the FUSE layer for the backing directory
+enum OnDemandChangeKind { changed, createDir, deleted, moved }
+
+// A local change reported by the FUSE layer. Paths are "./a/b", relative to the backing directory
+struct OnDemandLocalChange {
+	OnDemandChangeKind kind;
+	string path;
+	string oldPath;
+}
+
+// Message sent to the main thread to wake the monitor loop: send(mainTid, OnDemandWake())
+struct OnDemandWake {}
+
+// Mutex-protected queue of local changes. Written by FUSE threads, drained by the main thread.
+final class OnDemandChangeQueue {
+	private Mutex queueMutex;
+	private OnDemandLocalChange[] changes;
+
+	this() {
+		queueMutex = new Mutex();
+	}
+
+	void push(OnDemandLocalChange change) {
+		queueMutex.lock();
+		scope(exit) queueMutex.unlock();
+		changes ~= change;
+	}
+
+	// Remove and return all queued changes in arrival order
+	OnDemandLocalChange[] drain() {
+		queueMutex.lock();
+		scope(exit) queueMutex.unlock();
+		OnDemandLocalChange[] result = changes;
+		changes = null;
+		return result;
+	}
+}
+
+// Serialises every check-then-act sequence that reads backing-file presence and writes the
+// DB hydration state, between the main-thread sync engine and HydrationService (FUSE threads).
+// Lock order: this mutex first, then the ItemDatabase lock. Never held across network I/O.
+private __gshared Mutex onDemandStateMutex;
+
+shared static this() {
+	onDemandStateMutex = new Mutex();
+}
+
+Mutex onDemandStateLock() {
+	return onDemandStateMutex;
+}
+
+// Convert a DB hydration value to a HydrationState. null means hydrated.
+HydrationState hydrationStateFromDatabase(string value) {
+	if (value == hydrationOnlineOnly) return HydrationState.onlineOnly;
+	if (value == hydrationPinned) return HydrationState.pinned;
+	return HydrationState.hydrated;
+}
+
+// Is this item, or any ancestor of it, pinned?
+bool isPinnedOrHasPinnedAncestor(ItemDatabase itemDB, string driveId, string id) {
+	string currentDriveId = driveId;
+	string currentId = id;
+	// Guard against a broken parent chain
+	foreach (depth; 0 .. 4096) {
+		Item item;
+		if (!itemDB.selectById(currentDriveId, currentId, item)) return false;
+		if (item.hydration == hydrationPinned) return true;
+		if (item.parentId.empty || (item.type == ItemType.root)) return false;
+		currentId = item.parentId;
+	}
+	return false;
+}
+
+// Does this item's subtree contain an online-only file?
+bool subtreeHasOnlineOnlyItems(ItemDatabase itemDB, string driveId, string id) {
+	foreach (child; itemDB.selectChildren(driveId, id)) {
+		if (child.hydration == hydrationOnlineOnly) return true;
+		if ((child.type == ItemType.dir) && subtreeHasOnlineOnlyItems(itemDB, child.driveId, child.id)) return true;
+	}
+	return false;
+}
+
+// Does the file at 'path' match the content hash recorded for 'item'?
+bool localFileMatchesItemHash(string path, const ref Item item) {
+	if (!item.quickXorHash.empty) return item.quickXorHash == computeQuickXorHash(path);
+	if (!item.sha256Hash.empty) return item.sha256Hash == computeSHA256Hash(path);
+	return false;
+}
+
+// One in-flight hydration of an item. Concurrent hydrate() callers wait on it.
+private final class HydrationInFlight {
+	bool done;
+	int errnoCode;   // 0 on success
+	string message;
+}
+
+// Thread-safe hydration service called from FUSE worker threads.
+// It never touches SyncEngine state and only uses the dependencies passed to the constructor.
+final class HydrationService {
+	private ApplicationConfig appConfig;
+	private ItemDatabase itemDB;
+	private string backingDir;
+	private string stagingDir;
+	private bool disableDownloadValidation;
+	private bool disablePermissionSet;
+	private int filePermissions;
+	private long spaceReservation;
+
+	private Mutex serviceMutex;
+	private Condition serviceCondition;
+	private HydrationInFlight[string] inFlight;
+	private bool shuttingDown;
+
+	this(ApplicationConfig appConfig, ItemDatabase itemDB, string backingDir) {
+		this.appConfig = appConfig;
+		this.itemDB = itemDB;
+		this.backingDir = buildNormalizedPath(absolutePath(backingDir));
+		// Staging lives beside the backing directory so the final rename stays on one filesystem
+		// and partial downloads never appear inside the mount
+		this.stagingDir = buildNormalizedPath(buildPath(dirName(this.backingDir), "." ~ baseName(this.backingDir) ~ ".staging"));
+		// Read configuration once; appConfig is owned by the main thread
+		this.disableDownloadValidation = appConfig.getValueBool("disable_download_validation");
+		this.disablePermissionSet = appConfig.getValueBool("disable_permission_set");
+		this.filePermissions = appConfig.returnRequiredFilePermissions();
+		this.spaceReservation = appConfig.getValueLong("space_reservation");
+		serviceMutex = new Mutex();
+		serviceCondition = new Condition(serviceMutex);
+	}
+
+	HydrationState stateOf(string driveId, string id) {
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) {
+			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		}
+		return hydrationStateFromDatabase(item.hydration);
+	}
+
+	// Blocks until the file is in the backing dir with a verified hash, the backing mtime set
+	// from the DB, and DB state H (or P if pinned). Concurrent calls for the same item wait on
+	// the one download.
+	void hydrate(string driveId, string id) {
+		string key = driveId ~ "/" ~ id;
+		HydrationInFlight entry;
+		bool owner = false;
+
+		serviceMutex.lock();
+		try {
+			if (shuttingDown) throw new HydrationError(EIO, "Hydration service is shutting down");
+			auto existing = key in inFlight;
+			if (existing !is null) {
+				entry = *existing;
+			} else {
+				entry = new HydrationInFlight();
+				inFlight[key] = entry;
+				owner = true;
+			}
+		} finally {
+			serviceMutex.unlock();
+		}
+
+		if (owner) {
+			int errnoCode = 0;
+			string message;
+			try {
+				performHydrate(driveId, id);
+			} catch (HydrationError e) {
+				errnoCode = e.errnoCode;
+				message = e.msg;
+			} catch (Exception e) {
+				errnoCode = EIO;
+				message = e.msg;
+			}
+
+			serviceMutex.lock();
+			entry.done = true;
+			entry.errnoCode = errnoCode;
+			entry.message = message;
+			inFlight.remove(key);
+			serviceCondition.notifyAll();
+			serviceMutex.unlock();
+
+			if (errnoCode != 0) throw new HydrationError(errnoCode, message);
+			return;
+		}
+
+		// Wait on the download started by another caller
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		while (!entry.done && !shuttingDown) {
+			serviceCondition.wait();
+		}
+		if (!entry.done) throw new HydrationError(EIO, "Hydration service is shutting down");
+		if (entry.errnoCode != 0) throw new HydrationError(entry.errnoCode, entry.message);
+	}
+
+	// Free up space. Only if the backing file matches the DB hash and has no pending local
+	// change. Deletes the backing file, sets DB state O. Returns false if refused (dirty, pinned).
+	bool dehydrate(string driveId, string id) {
+		onDemandStateMutex.lock();
+		scope(exit) onDemandStateMutex.unlock();
+
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) {
+			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		}
+		if (item.type != ItemType.file) return false;
+		if (item.hydration == hydrationPinned) return false;
+		if (isPinnedOrHasPinnedAncestor(itemDB, driveId, id)) return false;
+		if (item.hydration == hydrationOnlineOnly) return true;
+
+		string backingPath = backingPathFor(driveId, id);
+		if (!exists(backingPath)) {
+			// Never leave a hydrated state for an absent file: that would read as a local deletion
+			itemDB.setHydration(driveId, id, hydrationOnlineOnly);
+			return true;
+		}
+		if (!isFile(backingPath)) return false;
+
+		// A local modification that has not been uploaded yet makes the file dirty
+		if (!localFileMatchesItemHash(backingPath, item)) {
+			if (verboseLogging) {addLogEntry("On-demand: refusing to free up space for a file with local changes: " ~ backingPath, ["verbose"]);}
+			return false;
+		}
+
+		// Record online-only before removing the file, so an absent file is never observed with a hydrated state
+		string previousState = item.hydration;
+		itemDB.setHydration(driveId, id, hydrationOnlineOnly);
+		try {
+			std.file.remove(backingPath);
+		} catch (FileException e) {
+			itemDB.setHydration(driveId, id, previousState);
+			addLogEntry("On-demand: unable to free up space for " ~ backingPath ~ ": " ~ e.msg);
+			return false;
+		}
+		if (verboseLogging) {addLogEntry("On-demand: freed up space for " ~ backingPath, ["verbose"]);}
+		return true;
+	}
+
+	// Set P and hydrate. For a directory, pin it and hydrate every file below it.
+	void pin(string driveId, string id) {
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) {
+			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		}
+
+		if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
+			itemDB.setHydration(driveId, id, hydrationPinned);
+			HydrationError firstError;
+			hydrateSubtree(driveId, id, firstError);
+			if (firstError !is null) throw firstError;
+			return;
+		}
+
+		// Hydrate first: a pinned state must never be recorded for an absent file
+		hydrate(driveId, id);
+		onDemandStateMutex.lock();
+		scope(exit) onDemandStateMutex.unlock();
+		if (exists(backingPathFor(driveId, id))) {
+			itemDB.setHydration(driveId, id, hydrationPinned);
+		} else {
+			throw new HydrationError(EIO, "Pinned file is not present after hydration");
+		}
+	}
+
+	// Set H. For a directory, clear the pin on it and on every pinned item below it.
+	void unpin(string driveId, string id) {
+		onDemandStateMutex.lock();
+		scope(exit) onDemandStateMutex.unlock();
+
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) {
+			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		}
+		unpinLocked(item);
+	}
+
+	// Cancel waiting callers with EIO and refuse new hydrations
+	void shutdown() {
+		serviceMutex.lock();
+		shuttingDown = true;
+		serviceCondition.notifyAll();
+		serviceMutex.unlock();
+	}
+
+	private void unpinLocked(Item item) {
+		if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
+			if (item.hydration == hydrationPinned) itemDB.setHydration(item.driveId, item.id, null);
+			foreach (child; itemDB.selectChildren(item.driveId, item.id)) {
+				unpinLocked(child);
+			}
+			return;
+		}
+		if (item.hydration != hydrationPinned) return;
+		// An absent pinned file must become online-only, never hydrated (which would read as a local deletion)
+		string newState = exists(backingPathFor(item.driveId, item.id)) ? hydrationHydrated : hydrationOnlineOnly;
+		itemDB.setHydration(item.driveId, item.id, newState);
+	}
+
+	private void hydrateSubtree(string driveId, string id, ref HydrationError firstError) {
+		foreach (child; itemDB.selectChildren(driveId, id)) {
+			if (child.type == ItemType.dir) {
+				hydrateSubtree(child.driveId, child.id, firstError);
+			} else if (child.type == ItemType.file) {
+				try {
+					hydrate(child.driveId, child.id);
+					// hydrate() records P for a file under a pinned ancestor
+				} catch (HydrationError e) {
+					addLogEntry("On-demand: unable to hydrate pinned file " ~ child.name ~ ": " ~ e.msg);
+					if (firstError is null) firstError = e;
+				}
+			}
+		}
+	}
+
+	private void removeStagingFile(string stagingPath) {
+		try {
+			if (exists(stagingPath)) std.file.remove(stagingPath);
+		} catch (FileException e) {
+			addLogEntry("On-demand: unable to remove staging file " ~ stagingPath ~ ": " ~ e.msg);
+		}
+	}
+
+	private string backingPathFor(string driveId, string id) {
+		string relativePath = itemDB.computePath(driveId, id);
+		return buildNormalizedPath(buildPath(backingDir, relativePath));
+	}
+
+	private void performHydrate(string driveId, string id) {
+		// A concurrent online change can alter the item while it downloads; retry a bounded number of times
+		foreach (attempt; 0 .. 3) {
+			if (performHydrateAttempt(driveId, id)) return;
+			if (debugLogging) {addLogEntry("On-demand: database item changed during hydration, retrying: " ~ driveId ~ " " ~ id, ["debug"]);}
+		}
+		throw new HydrationError(EIO, "Item changed repeatedly during hydration");
+	}
+
+	// Returns false when the database item changed during the download and the attempt should be repeated
+	private bool performHydrateAttempt(string driveId, string id) {
+		Item dbItem;
+		if (!itemDB.selectById(driveId, id, dbItem)) {
+			throw new HydrationError(ENOENT, "Item is not in the local database");
+		}
+		if ((dbItem.type == ItemType.dir) || (dbItem.type == ItemType.root)) return true;
+		if (dbItem.type != ItemType.file) {
+			// Shared (remote) items are out of scope for on-demand
+			throw new HydrationError(EIO, "Only files on the account drive can be hydrated");
+		}
+
+		string backingPath = backingPathFor(driveId, id);
+		if (exists(backingPath)) {
+			// Already present. This includes an online-only file that was truncated and written
+			// locally; its content must not be replaced by a download.
+			return true;
+		}
+
+		// A request while offline must not block in the API retry loop
+		auto probe = probeMicrosoftService(appConfig, false);
+		if (!probe.reachable) {
+			throw new HydrationError(ENETUNREACH, "Microsoft OneDrive is not reachable");
+		}
+
+		// Fetch the current online item. Do not depend on possibly stale DB content fields.
+		OneDriveApi api = new OneDriveApi(appConfig);
+		scope(exit) {
+			api.releaseCurlEngine();
+			api = null;
+		}
+		api.initialise();
+
+		JSONValue onlineItem;
+		try {
+			onlineItem = api.getPathDetailsById(driveId, id);
+		} catch (OneDriveException e) {
+			if (e.httpStatusCode == 404) throw new HydrationError(ENOENT, "Item no longer exists online");
+			throw new HydrationError(EIO, "Unable to query the online item: " ~ e.msg);
+		}
+		if ((onlineItem.type != JSONType.object) || isItemDeleted(onlineItem)) {
+			throw new HydrationError(ENOENT, "Item no longer exists online");
+		}
+		if (!isItemFile(onlineItem)) {
+			throw new HydrationError(EIO, "Online item is not a file");
+		}
+		if (isMalware(onlineItem)) {
+			addLogEntry("ERROR: MALWARE DETECTED IN FILE - HYDRATION REFUSED: " ~ backingPath, ["info", "notify"]);
+			throw new HydrationError(EIO, "Online item is flagged as malware");
+		}
+
+		Item onlineDbItem = makeDatabaseItem(onlineItem);
+		long fileSize = hasFileSize(onlineItem) ? onlineItem["size"].integer : 0;
+		string expectedQuickXorHash = onlineDbItem.quickXorHash;
+		string expectedSHA256Hash = onlineDbItem.sha256Hash;
+
+		JSONValue onlineHash;
+		if (!expectedQuickXorHash.empty) {
+			onlineHash = JSONValue(["quickXorHash": JSONValue(expectedQuickXorHash)]);
+		} else if (!expectedSHA256Hash.empty) {
+			onlineHash = JSONValue(["sha256Hash": JSONValue(expectedSHA256Hash)]);
+		} else {
+			onlineHash = JSONValue(["hashMissing": JSONValue("none")]);
+		}
+
+		// Staging area beside the backing directory
+		if (!exists(stagingDir)) mkdirRecurse(stagingDir);
+		ulong freeSpace = getAvailableDiskSpace(stagingDir);
+		if ((to!long(freeSpace) < spaceReservation) || (fileSize > to!long(freeSpace) - spaceReservation)) {
+			throw new HydrationError(ENOSPC, "Insufficient local disk space to hydrate the file");
+		}
+		string stagingPath = buildPath(stagingDir, driveId ~ "_" ~ id);
+		scope(exit) removeStagingFile(stagingPath);
+
+		// Verify size and hash before the download layer promotes the staging file
+		string verificationFailure;
+		bool delegate(DownloadCommitInfo) verifyDownload = (DownloadCommitInfo info) {
+			if (disableDownloadValidation) {
+				if (verboseLogging) {addLogEntry("WARNING: Skipping hydration integrity check for: " ~ backingPath, ["verbose"]);}
+				return true;
+			}
+			string downloadedHash;
+			string expectedHash;
+			if (!expectedQuickXorHash.empty) {
+				expectedHash = expectedQuickXorHash;
+				downloadedHash = info.hasStreamedQuickXorHash ? info.streamedQuickXorHash : info.generatedQuickXorHash;
+			} else if (!expectedSHA256Hash.empty) {
+				expectedHash = expectedSHA256Hash;
+				downloadedHash = info.generatedSHA256Hash;
+			} else {
+				verificationFailure = "the online item has no content hash";
+				return false;
+			}
+			if (info.size != fileSize) {
+				verificationFailure = "size mismatch: expected " ~ to!string(fileSize) ~ ", actual " ~ to!string(info.size);
+				return false;
+			}
+			if (downloadedHash != expectedHash) {
+				verificationFailure = "hash mismatch: expected " ~ expectedHash ~ ", actual " ~ downloadedHash;
+				return false;
+			}
+			return true;
+		};
+
+		addLogEntry("On-demand: hydrating " ~ backingPath);
+		CurlResponse response;
+		try {
+			response = api.downloadById(driveId, id, stagingPath, fileSize, onlineHash, 0, verifyDownload);
+		} catch (OneDriveException e) {
+			if (e.httpStatusCode == 404) throw new HydrationError(ENOENT, "Item no longer exists online");
+			throw new HydrationError(EIO, "Download failed: " ~ e.msg);
+		} catch (FileException e) {
+			throw new HydrationError(EIO, "Local file system error during download: " ~ e.msg);
+		}
+		if ((response is null) || !exists(stagingPath)) {
+			if (!verificationFailure.empty) {
+				addLogEntry("ERROR: On-demand hydration integrity check failed for " ~ backingPath ~ ": " ~ verificationFailure);
+			}
+			throw new HydrationError(EIO, verificationFailure.empty ? "Download failed" : "Download integrity check failed: " ~ verificationFailure);
+		}
+
+		// Local metadata from the online item that was downloaded
+		SysTime onlineMtime = onlineDbItem.mtime;
+		if (!disablePermissionSet) {
+			stagingPath.setAttributes(filePermissions);
+		}
+		setTimes(stagingPath, onlineMtime, onlineMtime);
+
+		// Commit: move into the backing dir and record the state atomically with respect to the engine
+		onDemandStateMutex.lock();
+		scope(exit) onDemandStateMutex.unlock();
+
+		Item currentItem;
+		if (!itemDB.selectById(driveId, id, currentItem)) {
+			throw new HydrationError(ENOENT, "Item was removed from the local database during hydration");
+		}
+		// The engine applied a different online version while downloading: the downloaded
+		// content may be stale, so start again
+		if ((currentItem.eTag != dbItem.eTag) && (currentItem.eTag != onlineDbItem.eTag)) {
+			return false;
+		}
+		// The path moved while downloading
+		string currentBackingPath = backingPathFor(driveId, id);
+		if (currentBackingPath != backingPath) {
+			return false;
+		}
+		if (exists(backingPath)) {
+			// Something created the file locally meanwhile; never overwrite local content
+			return true;
+		}
+
+		string parentPath = dirName(backingPath);
+		if (!exists(parentPath)) mkdirRecurse(parentPath);
+		try {
+			rename(stagingPath, backingPath);
+		} catch (FileException e) {
+			throw new HydrationError(EIO, "Unable to move hydrated file into the backing directory: " ~ e.msg);
+		}
+
+		// Record the content that is now present, then the hydration state
+		currentItem.eTag = onlineDbItem.eTag;
+		currentItem.cTag = onlineDbItem.cTag;
+		currentItem.mtime = onlineDbItem.mtime;
+		currentItem.quickXorHash = onlineDbItem.quickXorHash;
+		currentItem.sha256Hash = onlineDbItem.sha256Hash;
+		currentItem.size = onlineDbItem.size;
+		bool pinned = (currentItem.hydration == hydrationPinned) || isPinnedOrHasPinnedAncestor(itemDB, driveId, id);
+		currentItem.hydration = pinned ? hydrationPinned : hydrationHydrated;
+		itemDB.update(currentItem);
+
+		addLogEntry("On-demand: hydrating " ~ backingPath ~ " ... done");
+		return true;
+	}
+}
