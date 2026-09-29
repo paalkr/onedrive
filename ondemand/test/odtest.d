@@ -4,6 +4,9 @@
  * and a backing dir under <work>, mounts OnDemandFs on <mnt>, prints every
  * change event, and stops when <work>/stop appears. Driven by run-test.sh.
  *
+ * Moves under ./apply are applied to the database one second after their
+ * event, as the engine would; all other changes are never applied.
+ *
  * Usage: odtest <work> <mnt> [downloadDelayMsecs]
  */
 import core.time : dur;
@@ -11,7 +14,7 @@ import std.concurrency : receiveTimeout, thisTid;
 import std.conv : to;
 import std.datetime : SysTime, DateTime, UTC;
 import std.file;
-import std.path : buildPath;
+import std.path : baseName, buildPath, dirName;
 import std.stdio;
 
 import hydration;
@@ -32,9 +35,12 @@ void main(string[] args)
 
 	string remote = buildPath(work, "remote");
 	string backing = buildPath(work, "backing");
-	mkdirRecurse(buildPath(remote, "docs/sub"));
-	mkdirRecurse(buildPath(backing, "docs/sub"));
+	foreach (d; ["docs/sub", "docs/target", "apply/d1", "hold/d1", "shared"]) {
+		mkdirRecurse(buildPath(remote, d));
+		mkdirRecurse(buildPath(backing, d));
+	}
 	mkdirRecurse(buildPath(backing, "emptydir"));
+	onDemandPendingMoveWaitSeconds = 2;
 
 	auto db = new ItemDatabase(buildPath(work, "items.sqlite3"));
 	auto svc = new HydrationService(null, db, backing);
@@ -42,9 +48,10 @@ void main(string[] args)
 	HydrationService.downloadDelayMsecs = delay;
 
 	auto mtime = SysTime(DateTime(2024, 1, 2, 3, 4, 5), UTC());
-	void add(string id, string parent, string name, ItemType type, string size = null)
+	void add(string id, string parent, string name, ItemType type, string size = null,
+		string drive = driveId)
 	{
-		Item item = { driveId: driveId, id: id, name: name, type: type, mtime: mtime,
+		Item item = { driveId: drive, id: id, name: name, type: type, mtime: mtime,
 			parentId: parent, size: size, eTag: "e" ~ id };
 		db.insert(item);
 	}
@@ -69,6 +76,26 @@ void main(string[] args)
 	onlineFile("f-pin", "d-docs", "docs/pin-me.txt", "pin me\n");
 	onlineFile("f-deep", "d-sub", "docs/sub/deep.txt", "deep\n");
 	onlineFile("f-write", "root", "write-me.txt", "0123456789\n");
+	onlineFile("f-trunc0", "d-docs", "docs/trunc0.txt", "old content for truncate -s 0\n");
+	// V3: a directory whose only child is online-only, and files to rename over
+	add("d-target", "d-docs", "target", ItemType.dir);
+	onlineFile("f-target", "d-target", "docs/target/t.txt", "only child\n");
+	onlineFile("f-victim", "d-docs", "docs/victim.txt", "victim\n");
+	onlineFile("f-victim2", "d-docs", "docs/victim2.txt", "victim2 old\n");
+	// V4: moves applied by the simulated engine (apply) and never applied (hold)
+	add("d-apply", "root", "apply", ItemType.dir);
+	add("d-apply1", "d-apply", "d1", ItemType.dir);
+	onlineFile("f-apply", "d-apply1", "apply/d1/f.txt", "applied move\n");
+	add("d-hold", "root", "hold", ItemType.dir);
+	add("d-hold1", "d-hold", "d1", ItemType.dir);
+	onlineFile("f-hold", "d-hold1", "hold/d1/g.txt", "held move\n");
+	// V-partial: a database item whose real name ends in .partial
+	onlineFile("f-keep", "d-docs", "docs/keep.partial", "not an engine partial\n");
+	// V2: a shared folder from another drive
+	Item shortcut = { driveId: driveId, id: "r-shared", name: "shared", type: ItemType.remote,
+		mtime: mtime, parentId: "root", remoteDriveId: "drive2", remoteId: "s-root" };
+	db.insert(shortcut);
+	add("s-root", null, "shared", ItemType.dir, null, "drive2");
 	// Hydrated file: present in the backing dir
 	std.file.write(buildPath(backing, "local.txt"), "hydrated content\n");
 	add("f-local", "root", "local.txt", ItemType.file, "17");
@@ -80,15 +107,34 @@ void main(string[] args)
 	writeln("READY");
 	stdout.flush();
 
+	import core.time : MonoTime;
+	struct Due { MonoTime at; OnDemandLocalChange change; }
+	Due[] due;
 	string stopFile = buildPath(work, "stop");
 	while (!exists(stopFile)) {
 		receiveTimeout(dur!"msecs"(100), (OnDemandWake w) {
 			foreach (c; queue.drain()) {
 				if (c.oldPath is null) writeln("EVENT ", c.kind, " ", c.path);
 				else writeln("EVENT ", c.kind, " ", c.oldPath, " -> ", c.path);
+				if (c.kind == OnDemandChangeKind.moved && c.oldPath.length > 8 && c.oldPath[0 .. 8] == "./apply/")
+					due ~= Due(MonoTime.currTime + dur!"seconds"(1), c);
 			}
 			stdout.flush();
 		});
+		while (due.length && due[0].at <= MonoTime.currTime) {
+			auto c = due[0].change;
+			due = due[1 .. $];
+			Item item, parent;
+			if (db.selectByPath(c.oldPath, driveId, item) && db.selectByPath(dirName(c.path), driveId, parent)) {
+				item.name = baseName(c.path);
+				item.parentId = parent.id;
+				db.update(item);
+				writeln("APPLIED ", c.oldPath, " -> ", c.path);
+			} else {
+				writeln("APPLY FAILED ", c.oldPath, " -> ", c.path);
+			}
+			stdout.flush();
+		}
 	}
 	foreach (id; ["f-big", "f-trunc", "f-move", "f-pin", "f-write"])
 		writeln("DOWNLOADS ", id, " ", svc.downloadCount(driveId, id));

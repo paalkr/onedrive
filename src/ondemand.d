@@ -6,15 +6,18 @@ import core.stdc.errno;
 import core.stdc.stdio : renamePath = rename;
 import core.stdc.string : strlen;
 import core.sync.mutex;
+import core.thread : Thread;
+import core.time : MonoTime, dur;
 import core.sys.linux.sys.xattr : lgetxattr, llistxattr, lremovexattr, lsetxattr;
 import core.sys.posix.dirent;
 import core.sys.posix.fcntl;
 import core.sys.posix.sys.stat;
 import core.sys.posix.sys.statvfs;
 import core.sys.posix.unistd;
-import std.algorithm.searching : startsWith;
+import std.algorithm.searching : endsWith, startsWith;
 import std.concurrency : Tid, send;
 import std.conv : octal, to;
+import std.path : baseName, dirName;
 import std.string : toStringz, fromStringz;
 
 // What other modules that we have created do we need to import?
@@ -34,15 +37,22 @@ import log;
  *
  * Everything this layer changes in the backing dir is reported to the
  * engine as an OnDemandLocalChange. Until the engine has applied a delete
- * or move to the database, the old database path is hidden here and a
- * moved path is resolved through its old database path.
+ * or move to the database, the deleted item and the old path of a moved
+ * item are hidden here, and a moved path is resolved through its old
+ * database path. Nothing is downloaded or created through such a
+ * redirect: the engine would write it at the old database path.
  */
+
+// How long a download or O_TRUNC waits for the engine to apply a pending move. Tests lower it.
+__gshared uint onDemandPendingMoveWaitSeconds = 30;
 
 private enum pinXattr = "user.onedrive.pin";
 private enum stateXattr = "user.onedrive.state";
 private enum FUSE_CAP_ATOMIC_O_TRUNC = 1 << 3;
 private enum fileMode = octal!600;
 private enum dirMode = octal!700;
+// The engine's own downloads stage as "<name>.partial" inside the backing dir
+private enum partialSuffix = ".partial";
 
 // One open file. fd stays -1 until an online-only file is first read or written.
 private final class Handle
@@ -76,7 +86,8 @@ final class OnDemandFs : Operations
 
 	// Local deletes and moves not yet reflected in the database
 	private Mutex pendingLock;
-	private bool[string] hiddenPaths;      // "./a" hides "./a" and "./a/..."
+	private bool[string] deletedItems;     // item key of a local delete
+	private string[string] stalePaths;     // "./a" -> key of the item there before a move away or over it
 	private string[string] movedFrom;      // new "./b" -> old "./a"
 
 	this(ItemDatabase itemDB, HydrationService hydration, OnDemandChangeQueue changes,
@@ -122,54 +133,123 @@ final class OnDemandFs : Operations
 		return itemDB.selectByPath(rel, rootDriveId, item);
 	}
 
-	// Database item for a path, taking pending local deletes and moves into account
-	private bool resolve(const(char)[] path, out Item item) {
+	private static string itemKey(const ref Item item) {
+		return item.driveId ~ "/" ~ item.id;
+	}
+
+	// Caller holds pendingLock. Is item a locally deleted or moved-away/replaced item that the engine has not applied yet?
+	private bool isStale(string rel, const ref Item item, bool viaRedirect) {
+		string k = itemKey(item);
+		if (k in deletedItems) {
+			Item current;
+			if (itemDB.selectById(item.driveId, item.id, current)) return true;
+			deletedItems.remove(k);
+		}
+		// The old path of a redirect is stale by construction; only deletes apply there
+		if (viaRedirect) return false;
+		string[] applied;
+		bool stale = false;
+		foreach (path, pathKey; stalePaths) {
+			if (!underPath(rel, path)) continue;
+			Item current;
+			if (rawSelect(path, current) && itemKey(current) == pathKey) stale = true;
+			// The engine has applied it (or something else is there now)
+			else applied ~= path;
+		}
+		foreach (path; applied) stalePaths.remove(path);
+		return stale;
+	}
+
+	// Database item for a path, taking pending local deletes and moves into account.
+	// redirected is set when the item was found through a pending move, i.e. the
+	// database still has it at its old path.
+	private bool resolve(const(char)[] path, out Item item, out bool redirected) {
 		string rel = dbPath(path);
-		string oldPrefix;
-		string newPrefix;
 		synchronized (pendingLock) {
-			string applied;
-			foreach (hidden, _; hiddenPaths) {
-				if (!underPath(rel, hidden)) continue;
-				Item stale;
-				if (rawSelect(hidden, stale)) return false;
-				// The engine has applied the delete or move
-				applied = hidden;
-				break;
-			}
-			if (applied.length) hiddenPaths.remove(applied);
+			string oldPrefix;
+			string newPrefix;
 			foreach (newPath, oldPath; movedFrom) {
 				if (underPath(rel, newPath) && newPath.length > newPrefix.length) {
 					newPrefix = newPath;
 					oldPrefix = oldPath;
 				}
 			}
+			if (rawSelect(rel, item) && !isStale(rel, item, false)) {
+				// The engine has applied the move
+				if (newPrefix.length && rel == newPrefix) movedFrom.remove(newPrefix);
+				return true;
+			}
+			if (newPrefix.length) {
+				string oldRel = oldPrefix ~ rel[newPrefix.length .. $];
+				if (rawSelect(oldRel, item) && !isStale(oldRel, item, true)) {
+					redirected = true;
+					return true;
+				}
+			}
+			item = Item.init;
+			return false;
 		}
-		if (rawSelect(rel, item)) {
-			if (newPrefix.length && rel == newPrefix)
-				synchronized (pendingLock) movedFrom.remove(newPrefix);
-			return true;
-		}
-		if (newPrefix.length)
-			return rawSelect(oldPrefix ~ rel[newPrefix.length .. $], item);
-		return false;
 	}
 
-	private void markHidden(string rel) {
-		synchronized (pendingLock) hiddenPaths[rel] = true;
+	private bool resolve(const(char)[] path, out Item item) {
+		bool redirected;
+		return resolve(path, item, redirected);
 	}
 
-	// A new local item at rel replaces whatever was pending there
+	// resolve() for downloads and O_TRUNC: waits (bounded) until a pending move covering
+	// the path is applied, so the engine writes the file where the mount shows it
+	private bool resolveSettled(const(char)[] path, out Item item) {
+		auto deadline = MonoTime.currTime + dur!"seconds"(onDemandPendingMoveWaitSeconds);
+		while (true) {
+			bool redirected;
+			if (!resolve(path, item, redirected)) return false;
+			if (!redirected) return true;
+			if (MonoTime.currTime >= deadline) {
+				addLogEntry("On-demand: move to " ~ dbPath(path) ~ " not applied yet, refusing to download through it");
+				fail(EAGAIN);
+			}
+			Thread.sleep(dur!"msecs"(100));
+		}
+	}
+
+	private void markDeleted(const ref Item item) {
+		synchronized (pendingLock) deletedItems[itemKey(item)] = true;
+	}
+
+	// A new local item at rel replaces a pending redirect there
 	private void clearPending(string rel) {
-		synchronized (pendingLock) {
-			hiddenPaths.remove(rel);
-			movedFrom.remove(rel);
+		synchronized (pendingLock) movedFrom.remove(rel);
+	}
+
+	// A "<name>.partial" backing entry that is an engine download in progress, not a user file
+	private bool isEnginePartial(const(char)[] path) {
+		if (!path.endsWith(partialSuffix)) return false;
+		Item item;
+		return !rawSelect(dbPath(path), item);
+	}
+
+	// Drive of the nearest ancestor directory of path that is in the database
+	private string parentDriveOf(const(char)[] path) {
+		const(char)[] parent = dirName(path);
+		while (true) {
+			Item item;
+			if (resolve(parent, item)) {
+				if (item.type == ItemType.remote && item.remoteDriveId.length) return item.remoteDriveId;
+				return item.driveId;
+			}
+			if (parent == "/") return rootDriveId;
+			parent = dirName(parent);
 		}
 	}
 
 	private bool isOnlineOnly(const ref Item item) {
-		return item.type == ItemType.file
-			&& hydration.stateOf(item.driveId, item.id) == HydrationState.onlineOnly;
+		if (item.type != ItemType.file) return false;
+		try {
+			return hydration.stateOf(item.driveId, item.id) == HydrationState.onlineOnly;
+		} catch (HydrationError e) {
+			// Removed from the database since it was resolved
+			return false;
+		}
 	}
 
 	private static bool isDirectory(const ref Item item) {
@@ -204,6 +284,8 @@ final class OnDemandFs : Operations
 		Item item;
 		if (!resolve(path, item)) fail(ENOENT);
 		if (!isOnlineOnly(item)) return;
+		if (!resolveSettled(path, item)) fail(ENOENT);
+		if (existsPath(backingPath(path)) || !isOnlineOnly(item)) return;
 		try {
 			hydration.hydrate(item.driveId, item.id);
 		} catch (HydrationError e) {
@@ -212,16 +294,20 @@ final class OnDemandFs : Operations
 		}
 	}
 
-	// Creates an empty backing file for an online-only file that is truncated to 0
-	private bool truncateOnlineOnly(const(char)[] path) {
-		string target = backingPath(path);
-		if (existsPath(target)) return false;
+	// Creates the empty backing file of an online-only file whose content is discarded
+	// (O_TRUNC, truncate to 0) instead of downloading it. False if path is not an
+	// online-only file without a backing file (any more); the caller then takes its normal path.
+	private bool createEmptyOnlineOnly(const(char)[] path) {
+		if (existsPath(backingPath(path))) return false;
 		Item item;
 		if (!resolve(path, item) || !isOnlineOnly(item)) return false;
-		int fd = core.sys.posix.fcntl.open(toStringz(target), O_WRONLY | O_CREAT | O_TRUNC, fileMode);
-		check(fd);
-		core.sys.posix.unistd.close(fd);
-		return true;
+		if (!resolveSettled(path, item)) return false;
+		try {
+			return hydration.createEmpty(item.driveId, item.id);
+		} catch (HydrationError e) {
+			fail(e.errnoCode ? e.errnoCode : EIO);
+			assert(0);
+		}
 	}
 
 	// Handles
@@ -262,6 +348,7 @@ final class OnDemandFs : Operations
 	// Operations
 
 	override void getattr(const(char)[] path, ref stat_t st) {
+		if (isEnginePartial(path)) fail(ENOENT);
 		if (lstatPath(backingPath(path), st)) {
 			// A backing file whose database path is hidden was recreated locally
 			return;
@@ -307,6 +394,7 @@ final class OnDemandFs : Operations
 			for (auto entry = core.sys.posix.dirent.readdir(dir); entry !is null; entry = core.sys.posix.dirent.readdir(dir)) {
 				string name = fromStringz(entry.d_name.ptr).idup;
 				if (name == "." || name == "..") continue;
+				if (name.endsWith(partialSuffix) && isEnginePartial((path == "/" ? "" : path) ~ "/" ~ name)) continue;
 				seen[name] = true;
 				names ~= name;
 			}
@@ -340,27 +428,28 @@ final class OnDemandFs : Operations
 	}
 
 	override void open(const(char)[] path, ref fuse_file_info fi) {
+		if (isEnginePartial(path)) fail(ENOENT);
 		auto h = new Handle();
 		h.flags = fi.flags;
-		string target = backingPath(path);
-		if (existsPath(target)) {
-			h.fd = openBacking(path, fi.flags);
-			if (fi.flags & O_TRUNC) {
-				check(ftruncate(h.fd, 0));
-				h.written = true;
-			}
-		} else {
+		bool truncating = (fi.flags & O_TRUNC) && (fi.flags & O_ACCMODE) != O_RDONLY;
+		if (!existsPath(backingPath(path))) {
 			Item item;
 			if (!resolve(path, item)) fail(ENOENT);
 			if (isDirectory(item)) fail(EISDIR);
 			if (!isOnlineOnly(item)) fail(ENOENT);
-			if ((fi.flags & O_TRUNC) && (fi.flags & O_ACCMODE) != O_RDONLY) {
-				// The old content is discarded: create an empty file instead of downloading it
-				h.fd = core.sys.posix.fcntl.open(toStringz(target),
-					(fi.flags & ~O_EXCL) | O_CREAT | O_TRUNC, fileMode);
-				check(h.fd);
-				h.written = true;
+			if (!truncating) {
+				// Downloaded on the first read or write
+				addHandle(fi, h);
+				return;
 			}
+			// The old content is discarded: an empty file instead of a download. If the state
+			// changed meanwhile (hydrated by another caller) the backing file is truncated below.
+			if (!createEmptyOnlineOnly(path)) hydrateIfNeeded(path);
+		}
+		h.fd = openBacking(path, fi.flags);
+		if (fi.flags & O_TRUNC) {
+			check(ftruncate(h.fd, 0));
+			h.written = true;
 		}
 		addHandle(fi, h);
 	}
@@ -368,6 +457,7 @@ final class OnDemandFs : Operations
 	override void create(const(char)[] path, mode_t mode, ref fuse_file_info fi) {
 		auto h = new Handle();
 		h.flags = fi.flags;
+		if (path.endsWith(partialSuffix)) fail(EINVAL);
 		h.fd = core.sys.posix.fcntl.open(toStringz(backingPath(path)), fi.flags | O_CREAT, mode);
 		check(h.fd);
 		// A new file is uploaded even if nothing is written to it
@@ -408,7 +498,7 @@ final class OnDemandFs : Operations
 	}
 
 	override void truncate(const(char)[] path, ulong length, fuse_file_info* fi) {
-		bool created = length == 0 && path !is null && truncateOnlineOnly(path);
+		bool created = length == 0 && path !is null && createEmptyOnlineOnly(path);
 		if (fi !is null) {
 			auto h = handleOf(*fi);
 			int fd = fdOf(path, h);
@@ -447,6 +537,7 @@ final class OnDemandFs : Operations
 	}
 
 	override void mkdir(const(char)[] path, uint mode) {
+		if (path.endsWith(partialSuffix)) fail(EINVAL);
 		check(core.sys.posix.sys.stat.mkdir(toStringz(backingPath(path)), cast(mode_t) mode));
 		clearPending(dbPath(path));
 		emit(OnDemandChangeKind.createDir, path);
@@ -454,14 +545,15 @@ final class OnDemandFs : Operations
 
 	override void unlink(const(char)[] path) {
 		string target = backingPath(path);
+		Item item;
+		bool inDatabase = resolve(path, item);
 		if (existsPath(target)) {
 			check(core.sys.posix.unistd.unlink(toStringz(target)));
 		} else {
 			// An online-only file has nothing to remove locally
-			Item item;
-			if (!resolve(path, item) || !isOnlineOnly(item)) fail(ENOENT);
+			if (!inDatabase || !isOnlineOnly(item)) fail(ENOENT);
 		}
-		markHidden(dbPath(path));
+		if (inDatabase) markDeleted(item);
 		emit(OnDemandChangeKind.deleted, path);
 	}
 
@@ -472,28 +564,55 @@ final class OnDemandFs : Operations
 		// Online-only children keep the directory non-empty
 		if (listNames(path).length) fail(ENOTEMPTY);
 		string target = backingPath(path);
+		Item item;
+		bool inDatabase = resolve(path, item);
 		if (existsPath(target)) check(core.sys.posix.unistd.rmdir(toStringz(target)));
-		markHidden(dbPath(path));
+		if (inDatabase) markDeleted(item);
 		emit(OnDemandChangeKind.deleted, path);
 	}
 
 	override void rename(const(char)[] orig, const(char)[] dest, uint flags) {
 		enum RENAME_NOREPLACE = 1;
+		// RENAME_EXCHANGE and RENAME_WHITEOUT are not supported
 		if (flags & ~RENAME_NOREPLACE) fail(EINVAL);
-		if (flags & RENAME_NOREPLACE) {
-			stat_t st;
-			bool destExists = true;
-			try getattr(dest, st);
-			catch (FuseException e) destExists = false;
-			if (destExists) fail(EEXIST);
+		if (dest.endsWith(partialSuffix)) fail(EINVAL);
+
+		// Judge source and destination by what the mount shows, not by the backing dir:
+		// a directory whose children are all online-only is empty in the backing dir
+		stat_t srcSt;
+		getattr(orig, srcSt);
+		bool srcIsDir = (srcSt.st_mode & S_IFMT) == S_IFDIR;
+		stat_t destSt;
+		bool destExists = true;
+		try getattr(dest, destSt);
+		catch (FuseException e) {
+			if (e.errno != ENOENT) throw e;
+			destExists = false;
 		}
+		if (orig == dest) return;
+		Item replaced;
+		bool replacesDatabaseItem = false;
+		if (destExists) {
+			if (flags & RENAME_NOREPLACE) fail(EEXIST);
+			bool destIsDir = (destSt.st_mode & S_IFMT) == S_IFDIR;
+			if (srcIsDir && !destIsDir) fail(ENOTDIR);
+			if (!srcIsDir && destIsDir) fail(EISDIR);
+			if (destIsDir && listNames(dest).length) fail(ENOTEMPTY);
+			replacesDatabaseItem = resolve(dest, replaced);
+		}
+		// A move between drives (into or out of a shared folder) is a copy and a delete
+		if (parentDriveOf(orig) != parentDriveOf(dest)) fail(EXDEV);
+
 		// The engine uploads a move from the new local path, so it must exist on disk
-		hydrateIfNeeded(orig);
+		if (!srcIsDir) hydrateIfNeeded(orig);
+		Item moved;
+		bool movesDatabaseItem = resolve(orig, moved);
+		// An empty destination directory that exists only in the database has no backing dir to replace
 		check(renamePath(toStringz(backingPath(orig)), toStringz(backingPath(dest))));
+
 		string oldRel = dbPath(orig);
 		string newRel = dbPath(dest);
 		synchronized (pendingLock) {
-			hiddenPaths.remove(newRel);
 			// A move of something that was itself moved resolves to the original
 			string source = oldRel;
 			if (auto p = oldRel in movedFrom) {
@@ -501,7 +620,12 @@ final class OnDemandFs : Operations
 				movedFrom.remove(oldRel);
 			}
 			movedFrom[newRel] = source;
-			hiddenPaths[oldRel] = true;
+			if (movesDatabaseItem) {
+				Item atOld;
+				if (rawSelect(oldRel, atOld)) stalePaths[oldRel] = itemKey(atOld);
+			}
+			// The replaced destination item stays in the database until the engine applies the move
+			if (replacesDatabaseItem) stalePaths[newRel] = itemKey(replaced);
 		}
 		emit(OnDemandChangeKind.moved, dest, orig);
 	}
@@ -577,7 +701,11 @@ final class OnDemandFs : Operations
 			if (stateName(path, item) is null) fail(ENOTSUP);
 			auto v = cast(const(char)[]) value;
 			try {
-				if (v == "1") hydration.pin(item.driveId, item.id);
+				if (v == "1") {
+					// pin() downloads to the database path of the item
+					if (!resolveSettled(path, item)) fail(ENOENT);
+					hydration.pin(item.driveId, item.id);
+				}
 				else if (v == "0") hydration.unpin(item.driveId, item.id);
 				else fail(EINVAL);
 			} catch (HydrationError e) {
