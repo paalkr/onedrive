@@ -2317,6 +2317,23 @@ bool startOnDemand() {
 		return false;
 	}
 
+	// An item database built without on-demand records present files as hydrated. Against an on-demand
+	// backing directory those files are absent and would be treated as local deletions, deleting them
+	// online. Only use a database that was empty when on-demand was first enabled for it.
+	string onDemandDatabaseMarker = runtimeDatabaseFile ~ ".ondemand";
+	if (!exists(onDemandDatabaseMarker)) {
+		if (itemDB.getTotalRowCount() > 1) {
+			addLogEntry("ERROR: The item database was not created in on-demand mode. Re-run the client with '--resync' to enable on-demand.", ["info", "notify"]);
+			return false;
+		}
+		try {
+			std.file.write(onDemandDatabaseMarker, "");
+		} catch (FileException e) {
+			addLogEntry("ERROR: Unable to create " ~ onDemandDatabaseMarker ~ ": " ~ e.msg, ["info", "notify"]);
+			return false;
+		}
+	}
+
 	onDemandChangeQueue = new OnDemandChangeQueue();
 	onDemandHydrationService = new HydrationService(appConfig, itemDB, backingDir);
 
