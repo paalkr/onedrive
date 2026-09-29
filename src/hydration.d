@@ -2,6 +2,7 @@
 module hydration;
 
 // What does this module require to function?
+import core.atomic;
 import core.stdc.errno;
 import core.sync.condition;
 import core.sync.mutex;
@@ -122,6 +123,13 @@ bool subtreeHasOnlineOnlyItems(ItemDatabase itemDB, string driveId, string id) {
 	return false;
 }
 
+// Do two items record the same file content?
+bool sameContent(const ref Item a, const ref Item b) {
+	if (a.size != b.size) return false;
+	if (!a.quickXorHash.empty || !b.quickXorHash.empty) return a.quickXorHash == b.quickXorHash;
+	return a.sha256Hash == b.sha256Hash;
+}
+
 // Does the file at 'path' match the content hash recorded for 'item'?
 bool localFileMatchesItemHash(string path, const ref Item item) {
 	if (!item.quickXorHash.empty) return item.quickXorHash == computeQuickXorHash(path);
@@ -152,6 +160,10 @@ final class HydrationService {
 	private Condition serviceCondition;
 	private HydrationInFlight[string] inFlight;
 	private bool shuttingDown;
+	// Hydration threads currently inside a database section; shutdown() waits for them
+	private int databaseUsers;
+	// Set by shutdown(); aborts in-progress transfers of this service's OneDriveApi instances
+	private shared bool abortTransfers;
 
 	this(ApplicationConfig appConfig, ItemDatabase itemDB, string backingDir) {
 		this.appConfig = appConfig;
@@ -238,8 +250,8 @@ final class HydrationService {
 	// Free up space. Only if the backing file matches the DB hash and has no pending local
 	// change. Deletes the backing file, sets DB state O. Returns false if refused (dirty, pinned).
 	bool dehydrate(string driveId, string id) {
-		onDemandStateMutex.lock();
-		scope(exit) onDemandStateMutex.unlock();
+		lockForStateWrite();
+		scope(exit) unlockForStateWrite();
 
 		Item item;
 		if (!itemDB.selectById(driveId, id, item)) {
@@ -286,7 +298,9 @@ final class HydrationService {
 		}
 
 		if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
+			lockForStateWrite();
 			itemDB.setHydration(driveId, id, hydrationPinned);
+			unlockForStateWrite();
 			HydrationError firstError;
 			hydrateSubtree(driveId, id, firstError);
 			if (firstError !is null) throw firstError;
@@ -295,8 +309,8 @@ final class HydrationService {
 
 		// Hydrate first: a pinned state must never be recorded for an absent file
 		hydrate(driveId, id);
-		onDemandStateMutex.lock();
-		scope(exit) onDemandStateMutex.unlock();
+		lockForStateWrite();
+		scope(exit) unlockForStateWrite();
 		if (exists(backingPathFor(driveId, id))) {
 			itemDB.setHydration(driveId, id, hydrationPinned);
 		} else {
@@ -307,8 +321,8 @@ final class HydrationService {
 	// Set H. For a directory, set H on it and on every pinned item below it (no dehydration).
 	// A pinned file that is absent becomes O instead, as an absent H file reads as a local deletion.
 	void unpin(string driveId, string id) {
-		onDemandStateMutex.lock();
-		scope(exit) onDemandStateMutex.unlock();
+		lockForStateWrite();
+		scope(exit) unlockForStateWrite();
 
 		Item item;
 		if (!itemDB.selectById(driveId, id, item)) {
@@ -317,12 +331,58 @@ final class HydrationService {
 		unpinLocked(item);
 	}
 
-	// Cancel waiting callers with EIO and refuse new hydrations
+	// Create an empty backing file for an online-only item (O_TRUNC / truncate to 0), without a
+	// download. Waits for a hydration commit of the item in progress. Returns false if the item
+	// is not online-only. An existing backing file of an online-only item is truncated.
+	bool createEmpty(string driveId, string id) {
+		lockForStateWrite();
+		scope(exit) unlockForStateWrite();
+
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) {
+			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		}
+		if ((item.type != ItemType.file) || (item.hydration != hydrationOnlineOnly)) return false;
+
+		string backingPath = backingPathFor(driveId, id);
+		try {
+			string parentPath = dirName(backingPath);
+			if (!exists(parentPath)) mkdirRecurse(parentPath);
+			std.file.write(backingPath, "");
+			if (!disablePermissionSet) {
+				backingPath.setAttributes(filePermissions);
+			}
+		} catch (FileException e) {
+			throw new HydrationError(EIO, "Unable to create an empty backing file: " ~ e.msg);
+		}
+		return true;
+	}
+
+	// Cancel waiting callers with EIO, refuse new hydrations, abort in-progress transfers and
+	// wait (bounded) for them to finish, then wait for any database section to complete
 	void shutdown() {
 		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
 		shuttingDown = true;
+		atomicStore(abortTransfers, true);
 		serviceCondition.notifyAll();
-		serviceMutex.unlock();
+
+		// In-progress downloads stop at their next progress callback or retry decision
+		MonoTime deadline = MonoTime.currTime + dur!"seconds"(30);
+		while ((inFlight.length > 0) && (MonoTime.currTime < deadline)) {
+			serviceCondition.wait(dur!"msecs"(200));
+		}
+		if (inFlight.length > 0) {
+			addLogEntry("WARNING: On-demand: " ~ to!string(inFlight.length) ~ " hydration(s) did not stop within 30 seconds; they will not update the database");
+		}
+		// A hydration past its download may be committing; no new database section can start now
+		deadline = MonoTime.currTime + dur!"seconds"(30);
+		while ((databaseUsers > 0) && (MonoTime.currTime < deadline)) {
+			serviceCondition.wait(dur!"msecs"(200));
+		}
+		if (databaseUsers > 0) {
+			addLogEntry("WARNING: On-demand: a hydration database update did not complete within 30 seconds");
+		}
 	}
 
 	private void unpinLocked(Item item) {
@@ -368,6 +428,34 @@ final class HydrationService {
 		return buildNormalizedPath(buildPath(backingDir, relativePath));
 	}
 
+	// Every hydration-state write holds the database transaction lock first, so it never joins an
+	// open engine transaction, then the on-demand state lock
+	private void lockForStateWrite() {
+		itemDB.transactionLock().lock();
+		onDemandStateMutex.lock();
+	}
+
+	private void unlockForStateWrite() {
+		onDemandStateMutex.unlock();
+		itemDB.transactionLock().unlock();
+	}
+
+	// Enter a database section of a hydration. Returns false once shutdown() has been called.
+	private bool enterDatabase() {
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		if (shuttingDown) return false;
+		databaseUsers++;
+		return true;
+	}
+
+	private void leaveDatabase() {
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		databaseUsers--;
+		serviceCondition.notifyAll();
+	}
+
 	private void performHydrate(string driveId, string id) {
 		// A concurrent online change can alter the item while it downloads; retry a bounded number of times
 		foreach (attempt; 0 .. 3) {
@@ -380,16 +468,20 @@ final class HydrationService {
 	// Returns false when the database item changed during the download and the attempt should be repeated
 	private bool performHydrateAttempt(string driveId, string id) {
 		Item dbItem;
-		if (!itemDB.selectById(driveId, id, dbItem)) {
-			throw new HydrationError(ENOENT, "Item is not in the local database");
+		string backingPath;
+		if (!enterDatabase()) throw new HydrationError(EIO, "Hydration service is shutting down");
+		{
+			scope(exit) leaveDatabase();
+			if (!itemDB.selectById(driveId, id, dbItem)) {
+				throw new HydrationError(ENOENT, "Item is not in the local database");
+			}
+			if ((dbItem.type == ItemType.dir) || (dbItem.type == ItemType.root)) return true;
+			if (dbItem.type != ItemType.file) {
+				// Shared (remote) items are out of scope for on-demand
+				throw new HydrationError(EIO, "Only files on the account drive can be hydrated");
+			}
+			backingPath = backingPathFor(driveId, id);
 		}
-		if ((dbItem.type == ItemType.dir) || (dbItem.type == ItemType.root)) return true;
-		if (dbItem.type != ItemType.file) {
-			// Shared (remote) items are out of scope for on-demand
-			throw new HydrationError(EIO, "Only files on the account drive can be hydrated");
-		}
-
-		string backingPath = backingPathFor(driveId, id);
 		if (exists(backingPath)) {
 			// Already present. This includes an online-only file that was truncated and written
 			// locally; its content must not be replaced by a download.
@@ -409,6 +501,7 @@ final class HydrationService {
 			api = null;
 		}
 		api.initialise();
+		api.setTransferAbortFlag(&abortTransfers);
 
 		JSONValue onlineItem;
 		try {
@@ -417,6 +510,7 @@ final class HydrationService {
 			if (e.httpStatusCode == 404) throw new HydrationError(ENOENT, "Item no longer exists online");
 			throw new HydrationError(EIO, "Unable to query the online item: " ~ e.msg);
 		}
+		if (atomicLoad(abortTransfers)) throw new HydrationError(EIO, "Hydration service is shutting down");
 		if ((onlineItem.type != JSONType.object) || isItemDeleted(onlineItem)) {
 			throw new HydrationError(ENOENT, "Item no longer exists online");
 		}
@@ -498,25 +592,29 @@ final class HydrationService {
 			throw new HydrationError(EIO, verificationFailure.empty ? "Download failed" : "Download integrity check failed: " ~ verificationFailure);
 		}
 
-		// Local metadata from the online item that was downloaded
-		SysTime onlineMtime = onlineDbItem.mtime;
 		if (!disablePermissionSet) {
 			stagingPath.setAttributes(filePermissions);
 		}
-		setTimes(stagingPath, onlineMtime, onlineMtime);
 
-		// Commit: move into the backing dir and record the state atomically with respect to the engine
-		onDemandStateMutex.lock();
-		scope(exit) onDemandStateMutex.unlock();
+		// Commit: move into the backing dir and record the state atomically with respect to the engine.
+		// Only the hydration column is written, so concurrent engine updates of the row are kept.
+		if (!enterDatabase()) throw new HydrationError(EIO, "Hydration service is shutting down");
+		scope(exit) leaveDatabase();
+		lockForStateWrite();
+		scope(exit) unlockForStateWrite();
 
 		Item currentItem;
 		if (!itemDB.selectById(driveId, id, currentItem)) {
 			throw new HydrationError(ENOENT, "Item was removed from the local database during hydration");
 		}
-		// The engine applied a different online version while downloading: the downloaded
-		// content may be stale, so start again
-		if ((currentItem.eTag != dbItem.eTag) && (currentItem.eTag != onlineDbItem.eTag)) {
-			return false;
+		// The downloaded bytes must be the content the database records; otherwise the file would
+		// look locally modified and be uploaded over the version the database describes
+		if (!sameContent(currentItem, onlineDbItem)) {
+			if (!sameContent(currentItem, dbItem)) {
+				// The engine applied a different online version while downloading: start again
+				return false;
+			}
+			throw new HydrationError(EIO, "The online file is newer than the local database; it can be opened after the next sync");
 		}
 		// The path moved while downloading
 		string currentBackingPath = backingPathFor(driveId, id);
@@ -528,6 +626,8 @@ final class HydrationService {
 			return true;
 		}
 
+		// The backing mtime comes from the database record
+		setTimes(stagingPath, currentItem.mtime, currentItem.mtime);
 		string parentPath = dirName(backingPath);
 		if (!exists(parentPath)) mkdirRecurse(parentPath);
 		try {
@@ -536,16 +636,8 @@ final class HydrationService {
 			throw new HydrationError(EIO, "Unable to move hydrated file into the backing directory: " ~ e.msg);
 		}
 
-		// Record the content that is now present, then the hydration state
-		currentItem.eTag = onlineDbItem.eTag;
-		currentItem.cTag = onlineDbItem.cTag;
-		currentItem.mtime = onlineDbItem.mtime;
-		currentItem.quickXorHash = onlineDbItem.quickXorHash;
-		currentItem.sha256Hash = onlineDbItem.sha256Hash;
-		currentItem.size = onlineDbItem.size;
 		bool pinned = (currentItem.hydration == hydrationPinned) || isPinnedOrHasPinnedAncestor(itemDB, driveId, id);
-		setItemHydration(currentItem, pinned ? hydrationPinned : hydrationHydrated);
-		itemDB.update(currentItem);
+		itemDB.setHydration(driveId, id, pinned ? hydrationPinned : hydrationHydrated);
 
 		addLogEntry("On-demand: hydrating " ~ backingPath ~ " ... done");
 		return true;

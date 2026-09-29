@@ -6,6 +6,7 @@ import core.stdc.stdlib: EXIT_SUCCESS, EXIT_FAILURE, exit;
 import core.memory;
 import core.thread;
 import core.sync.mutex;
+import core.atomic;
 import std.stdio;
 import std.string;
 import std.utf;
@@ -206,6 +207,8 @@ class OneDriveApi {
 	const(char)[] refreshToken = "";
 	bool dryRun = false;
 	bool keepAlive = false;
+	// On-demand: when set and true, a transfer on this instance is aborted and not retried
+	private shared(bool)* transferAbortFlag = null;
 
 	this(ApplicationConfig appConfig) {
 		// Configure the class variable to consume the application configuration
@@ -252,6 +255,15 @@ class OneDriveApi {
 	}
 
 	// Configure the active CurlEngine using the current application settings
+	// On-demand: abort transfers on this instance once '*flag' becomes true (HydrationService shutdown)
+	void setTransferAbortFlag(shared(bool)* flag) {
+		transferAbortFlag = flag;
+	}
+
+	private bool transferAbortRequested() {
+		return (transferAbortFlag !is null) && atomicLoad(*transferAbortFlag);
+	}
+
 	private void initialiseCurlEngine() {
 		curlEngine.initialise(appConfig.getValueLong("dns_timeout"), appConfig.getValueLong("connect_timeout"), appConfig.getValueLong("data_timeout"), appConfig.getValueLong("operation_timeout"), appConfig.defaultMaxRedirects, appConfig.getValueBool("debug_https"), appConfig.getValueString("user_agent"), appConfig.getValueBool("force_http_11"), appConfig.getValueLong("rate_limit"), appConfig.getValueLong("ip_protocol_version"), appConfig.getValueLong("max_curl_idle"), keepAlive);
 	}
@@ -2191,6 +2203,13 @@ class OneDriveApi {
 		// Threshold for displaying download bar
 		long thresholdFileSize = 4 * 2^^20; // 4 MiB
 
+		// On-demand: do not leave an abort-aware progress callback on a pooled CurlEngine
+		scope(exit) {
+			if ((transferAbortFlag !is null) && (curlEngine !is null)) {
+				curlEngine.http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) { return 0; };
+			}
+		}
+
 		// To support marking of partially-downloaded files. The staging pathname and its
 		// final promotion are private to the download subsystem.
 		string originalFilename = filename;
@@ -2322,6 +2341,9 @@ class OneDriveApi {
 				curlEngine.http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) {
 					// Log entry construct
 					string downloadLogEntry = "Downloading: " ~ filename ~ " ... ";
+
+					// On-demand: the owner of this instance requested an abort
+					if (transferAbortRequested()) return 1;
 
 					// Handle SIGINT (CTRL-C) and SIGTERM (kill) events + 'force_xfer_abort'
 					if ((exitHandlerTriggered) && (appConfig.getValueBool("force_xfer_abort"))) {
@@ -2486,6 +2508,12 @@ class OneDriveApi {
 				};
 			} else {
 				// No progress bar, no resumable download
+				// On-demand: still allow the owner of this instance to abort the transfer
+				if (transferAbortFlag !is null) {
+					curlEngine.http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) {
+						return transferAbortRequested() ? 1 : 0;
+					};
+				}
 			}
 
 			// Ensure curlEngine.download() continues to populate the wrapper-owned
@@ -2853,6 +2881,11 @@ class OneDriveApi {
 					}
 				}
 
+				// On-demand: the owner of this instance requested an abort; do not retry
+				if (transferAbortRequested()) {
+					return result;
+				}
+
 				// Parse and display error message received from OneDrive
 				if (debugLogging) {addLogEntry(callingFunction ~ "() - Generated a OneDrive CurlException", ["debug"]);}
 				auto errorArray = splitLines(exception.msg);
@@ -3109,6 +3142,10 @@ class OneDriveApi {
 				}
 
 				// Thread sleep
+				// On-demand: do not wait to retry once the owner of this instance requested an abort
+				if (transferAbortRequested()) {
+					throw new OneDriveException(503, "Transfer aborted by request", response);
+				}
 				Thread.sleep(dur!"seconds"(thisBackOffInterval));
 			}
 		}

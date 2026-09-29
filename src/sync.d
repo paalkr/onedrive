@@ -4254,6 +4254,14 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
+		// On-demand: hold the state lock from the online-only check to the database write, so a
+		// hydration commit cannot land in between (DB metadata of one version with bytes of another)
+		Mutex onDemandLock = onDemand ? onDemandStateLock() : null;
+		if (onDemandLock !is null) onDemandLock.lock();
+		scope(exit) {
+			if (onDemandLock !is null) onDemandLock.unlock();
+		}
+
 		// Track whether the online item changed location and whether its file
 		// content identity also changed. A move and content update can arrive in
 		// the same delta item; moving the old local bytes does not apply the new
@@ -4313,7 +4321,10 @@ class SyncEngine {
 				// On-demand: there is no local file to rename for an online-only item. Clear the
 				// destination as the rename would have (its content was preserved above if needed).
 				if (onDemandOnlineOnly) {
-					if (!dryRun && exists(changedItemPath) && isFile(changedItemPath)) {
+					// Never remove a file that is the local copy of another hydrated or pinned item (for
+					// example an online swap of two names in one delta, where that item moves next)
+					if (!dryRun && exists(changedItemPath) && isFile(changedItemPath) &&
+						!onDemandPathHeldByOtherLocalItem(changedOneDriveItem.driveId, changedOneDriveItem.parentId, changedOneDriveItem.name, changedOneDriveItem.id)) {
 						safeRemove(changedItemPath);
 						if (!exists(changedItemPath)) notifyExpectedLocalRemoval(changedItemPath);
 					}
@@ -5700,6 +5711,24 @@ class SyncEngine {
 		return currentItem.hydration == hydrationOnlineOnly;
 	}
 
+	// On-demand: is the path parentId/name the local copy of a database item other than excludeId
+	// that is not online-only (H, P or NULL)?
+	bool onDemandPathHeldByOtherLocalItem(string driveId, string parentId, string name, string excludeId) {
+		if (!onDemand) return false;
+		foreach (child; itemDB.selectChildren(driveId, parentId)) {
+			if ((child.name == name) && (child.id != excludeId) && (child.hydration != hydrationOnlineOnly)) return true;
+		}
+		return false;
+	}
+
+	// On-demand: is this a folder with an online-only file below it?
+	bool onDemandFolderHasOnlineOnlyItems(Item item) {
+		if (!onDemand) return false;
+		if ((item.type != ItemType.dir) && (item.type != ItemType.root) && !((item.type == ItemType.remote) && (item.remoteType == ItemType.dir))) return false;
+		if (item.type == ItemType.remote) return subtreeHasOnlineOnlyItems(itemDB, item.remoteDriveId, item.remoteId);
+		return subtreeHasOnlineOnlyItems(itemDB, item.driveId, item.id);
+	}
+
 	// On-demand: record an existing item as online-only if its file is absent from the backing directory
 	void onDemandRecordOnlineOnly(string driveId, string id, string localPath) {
 		auto stateLock = onDemandStateLock();
@@ -6736,6 +6765,19 @@ class SyncEngine {
 			stateLock.unlock();
 
 			if (currentItemFound) dbItem = currentItem;
+			if (currentItemFound && presentInBackingDir && (dbItem.hydration == hydrationOnlineOnly) &&
+				onDemandPathHeldByOtherLocalItem(dbItem.driveId, dbItem.parentId, dbItem.name, dbItem.id)) {
+				// The file at this path is the local copy of another item that has not moved away yet;
+				// it must not be uploaded as a change of this online-only item
+				if (verboseLogging) {addLogEntry("On-demand: the local file belongs to another item, not treating it as a change of the online-only item: " ~ localFilePath, ["verbose"]);}
+
+				// Display function processing time if configured to do so
+				if (appConfig.getValueBool("display_processing_time") && debugLogging) {
+					// Combine module name & running Function
+					displayFunctionProcessingTime(thisFunctionName, functionStartTime, Clock.currTime(), logKey);
+				}
+				return;
+			}
 			if (!currentItemFound || (!presentInBackingDir && (dbItem.hydration == hydrationOnlineOnly))) {
 				// Online-only and absent is in sync; a removed record needs no action
 				if (verboseLogging) {addLogEntry("The file is online-only and has not changed", ["verbose"]);}
@@ -12857,23 +12899,26 @@ class SyncEngine {
 
 					// On-demand: record the hydration state of a file from its presence in the backing
 					// directory, atomically with respect to HydrationService. A present file is hydrated
-					// (pinned if it, or an ancestor, is pinned). An absent file with no existing record is
-					// online-only; an absent file with an existing record keeps its state.
+					// (pinned if it, or an ancestor, is pinned); an absent file is online-only, never a
+					// hydrated record without its file.
 					if (onDemand && (item.type == ItemType.file)) {
 						auto stateLock = onDemandStateLock();
 						stateLock.lock();
 						scope(exit) stateLock.unlock();
 						Item existingItem;
 						bool existingItemFound = itemDB.selectById(item.driveId, item.id, existingItem);
-						// A path can only be computed through database records; without a parent record there is nothing to decide
-						if (existingItemFound || itemDB.idInLocalDatabase(item.driveId, item.parentId)) {
-							string localPath = existingItemFound ? computeItemPath(existingItem.driveId, existingItem.id) : computeItemPath(item.driveId, item.parentId) ~ "/" ~ item.name;
-							if (exists(localPath)) {
-								bool pinned = (existingItemFound && (existingItem.hydration == hydrationPinned)) || isPinnedOrHasPinnedAncestor(itemDB, item.driveId, item.parentId);
-								setItemHydration(item, pinned ? hydrationPinned : hydrationHydrated);
-							} else if (!existingItemFound) {
-								setItemHydration(item, hydrationOnlineOnly);
-							}
+						// The saved item's own location is where its file is; fall back to the existing record
+						string localPath;
+						if (itemDB.idInLocalDatabase(item.driveId, item.parentId)) {
+							localPath = computeItemPath(item.driveId, item.parentId) ~ "/" ~ item.name;
+						} else if (existingItemFound) {
+							localPath = computeItemPath(existingItem.driveId, existingItem.id);
+						}
+						if (!localPath.empty && exists(localPath)) {
+							bool pinned = (existingItemFound && (existingItem.hydration == hydrationPinned)) || isPinnedOrHasPinnedAncestor(itemDB, item.driveId, item.parentId);
+							setItemHydration(item, pinned ? hydrationPinned : hydrationHydrated);
+						} else {
+							setItemHydration(item, hydrationOnlineOnly);
 						}
 						if (debugLogging) {addLogEntry("Saving this DB item record: " ~ to!string(item), ["debug"]);}
 						itemDB.upsert(item);
@@ -14402,7 +14447,12 @@ class SyncEngine {
 
 			if (oldItem.driveId != parentItem.driveId) {
 				// items cannot be moved between drives
-				uploadDeletedItem(oldItem, oldPath);
+				if (onDemandFolderHasOnlineOnlyItems(oldItem)) {
+					// On-demand: the online-only files below it have no local copy; keep the online folder (a duplicate is acceptable, loss is not)
+					addLogEntry("WARNING: Not deleting the online folder " ~ oldPath ~ " after moving it to another drive because it contains online-only files; the online folder is kept", ["info", "notify"]);
+				} else {
+					uploadDeletedItem(oldItem, oldPath);
+				}
 
 				// what sort of move is this?
 				if (isFile(newPath)) {
@@ -14565,6 +14615,9 @@ class SyncEngine {
 			// delete is issued with a default constructed Item and cannot identify anything.
 			if (!itemDB.selectByPath(oldPath, appConfig.defaultDriveId, oldItem)) {
 				if (debugLogging) {addLogEntry("uploadMoveItem: old path has no local database entry, nothing to remove online: " ~ oldPath, ["debug"]);}
+			} else if (onDemandFolderHasOnlineOnlyItems(oldItem)) {
+				// On-demand: the online-only files below it have no local copy; keep the online folder
+				addLogEntry("WARNING: Not deleting the online folder " ~ oldPath ~ " after moving it to an excluded location because it contains online-only files; the online folder is kept", ["info", "notify"]);
 			} else {
 				uploadDeletedItem(oldItem, oldPath);
 			}

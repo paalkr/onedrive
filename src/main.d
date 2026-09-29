@@ -138,6 +138,8 @@ OnDemandChangeQueue onDemandChangeQueue;
 bool onDemandMountActive = false;
 // On-demand local changes drained from onDemandChangeQueue, waiting to be applied
 OnDemandLocalChange[] pendingOnDemandChanges;
+// On-demand local deletions that could not be applied online yet; retried on the next scheduled sync
+OnDemandLocalChange[] deferredOnDemandChanges;
 
 // Class variables
 // Flag for performing a synchronised shutdown
@@ -1005,6 +1007,11 @@ int main(string[] cliArgs) {
 		}
 	}
 	
+	// Refuse to use an item database with a sync directory it does not describe (on-demand vs normal mode)
+	if (!checkOnDemandProfileState()) {
+		return EXIT_RESYNC_REQUIRED;
+	}
+
 	// Configure the sync directory based on the runtimeSyncDirectory configured directory
 	if (verboseLogging) {addLogEntry("All application operations will be performed in the configured local 'sync_dir' directory: " ~ runtimeSyncDirectory, ["verbose"]);}
 	// Try and set the 'sync_dir', attempt to create if it does not exist
@@ -1274,7 +1281,7 @@ int main(string[] cliArgs) {
 					if (filesystemMonitor !is null && filesystemMonitor.initialised) captureInotifyEvents(source);
 				};
 				syncEngineInstance.hasPendingLocalDeparture = delegate(string path) {
-					return filesystemMonitor !is null && filesystemMonitor.initialised && filesystemMonitor.hasPendingDeparture(path);
+					return (filesystemMonitor !is null && filesystemMonitor.initialised && filesystemMonitor.hasPendingDeparture(path)) || onDemandHasPendingDeparture(path);
 				};
 				syncEngineInstance.recordExpectedLocalDirectoryCreate = delegate(string path) {
 					if (filesystemMonitor !is null && filesystemMonitor.initialised) filesystemMonitor.recordExpectedDirectoryCreate(path);
@@ -1605,6 +1612,8 @@ int main(string[] cliArgs) {
 								// Perform the --upload-only sync process
 								performUploadOnlySyncProcess(localPath, filesystemMonitor);
 							} else {
+								// On-demand: retry local deletions that could not be applied online earlier
+								requeueDeferredOnDemandChanges();
 								// Perform the standard sync process
 								performStandardSyncProcess(localPath, filesystemMonitor);
 							}
@@ -2240,6 +2249,9 @@ void applyPendingLocalChanges(string invocationSource) {
 				} catch (Exception e) {
 					addLogEntry("Cannot delete remote item: " ~ e.msg, ["info", "notify"]);
 				}
+				// On-demand: an online-only item that is absent locally is in sync, so a later database
+				// consistency check would never retry this deletion. Keep it until it is applied.
+				deferOnDemandDeletionIfNotApplied(change.src);
 				break;
 
 			case LocalChangeType.moved:
@@ -2291,6 +2303,74 @@ void completeRemoteApplyInotifyEvents(string invocationSource) {
 	captureAndApplyInotifyEvents(invocationSource);
 }
 
+// An item database and the local directory it describes must match:
+// - A database used in on-demand mode records online-only files that do not exist locally. Used in
+//   normal mode against 'sync_dir' (the empty mountpoint) every item looks locally deleted and would
+//   be deleted online.
+// - A database from normal mode records present files as hydrated. Used in on-demand mode against an
+//   empty backing directory the same happens.
+// - A changed 'on_demand_backing_dir' points the on-demand database at a different, usually empty, directory.
+// The marker '<database>.ondemand' records the backing directory the database was built against.
+// An empty database (first use or --resync) is always accepted and (re)sets the marker.
+bool checkOnDemandProfileState() {
+	string marker = appConfig.databaseFilePath ~ ".ondemand";
+	bool emptyDatabase = itemDB.getTotalRowCount() <= 1;
+
+	if (appConfig.getValueBool("on_demand")) {
+		string backingDir = buildNormalizedPath(absolutePath(appConfig.runtimeSyncDirectory));
+		if (emptyDatabase) {
+			if (!dryRun) {
+				try {
+					std.file.write(marker, backingDir);
+				} catch (FileException e) {
+					addLogEntry("ERROR: Unable to create " ~ marker ~ ": " ~ e.msg, ["info", "notify"]);
+					return false;
+				}
+			}
+			return true;
+		}
+		if (!exists(marker)) {
+			addLogEntry("ERROR: The item database was not created in on-demand mode. Re-run the client with '--resync' to enable on-demand.", ["info", "notify"]);
+			return false;
+		}
+		string recordedBackingDir;
+		try {
+			recordedBackingDir = strip(readText(marker));
+		} catch (Exception e) {
+			addLogEntry("ERROR: Unable to read " ~ marker ~ ": " ~ e.msg, ["info", "notify"]);
+			return false;
+		}
+		if (recordedBackingDir != backingDir) {
+			addLogEntry("ERROR: 'on_demand_backing_dir' has changed from '" ~ recordedBackingDir ~ "' to '" ~ backingDir ~ "'. Re-run the client with '--resync' to use the new backing directory.", ["info", "notify"]);
+			return false;
+		}
+		return true;
+	}
+
+	// Normal mode
+	if (exists(marker)) {
+		if (emptyDatabase) {
+			// --resync (or a fresh database) converts the profile back to normal mode
+			if (!dryRun) {
+				try {
+					std.file.remove(marker);
+				} catch (FileException e) {
+					addLogEntry("ERROR: Unable to remove " ~ marker ~ ": " ~ e.msg, ["info", "notify"]);
+					return false;
+				}
+			}
+			return true;
+		}
+		addLogEntry("ERROR: This profile was used with --on-demand. Run it with --on-demand, or re-run with '--resync' to convert it to a normal synchronisation.", ["info", "notify"]);
+		return false;
+	}
+	if (itemDB.hasOnlineOnlyItems()) {
+		addLogEntry("ERROR: The item database contains online-only (on-demand) files. Run with --on-demand, or re-run with '--resync' to convert it to a normal synchronisation.", ["info", "notify"]);
+		return false;
+	}
+	return true;
+}
+
 // Start the Files On-Demand mount of the configured 'sync_dir' over the on-demand backing directory
 bool startOnDemand() {
 	string mountPoint = buildNormalizedPath(absolutePath(appConfig.onDemandMountPoint));
@@ -2317,22 +2397,8 @@ bool startOnDemand() {
 		return false;
 	}
 
-	// An item database built without on-demand records present files as hydrated. Against an on-demand
-	// backing directory those files are absent and would be treated as local deletions, deleting them
-	// online. Only use a database that was empty when on-demand was first enabled for it.
-	string onDemandDatabaseMarker = runtimeDatabaseFile ~ ".ondemand";
-	if (!exists(onDemandDatabaseMarker)) {
-		if (itemDB.getTotalRowCount() > 1) {
-			addLogEntry("ERROR: The item database was not created in on-demand mode. Re-run the client with '--resync' to enable on-demand.", ["info", "notify"]);
-			return false;
-		}
-		try {
-			std.file.write(onDemandDatabaseMarker, "");
-		} catch (FileException e) {
-			addLogEntry("ERROR: Unable to create " ~ onDemandDatabaseMarker ~ ": " ~ e.msg, ["info", "notify"]);
-			return false;
-		}
-	}
+	// Writes from HydrationService threads must never join an open engine transaction
+	itemDB.enableTransactionSerialisation();
 
 	onDemandChangeQueue = new OnDemandChangeQueue();
 	onDemandHydrationService = new HydrationService(appConfig, itemDB, backingDir);
@@ -2388,6 +2454,40 @@ LocalChange[] takePendingOnDemandChanges() {
 	pendingOnDemandChanges = null;
 	if (debugLogging && result.length > 0) {addLogEntry("On-demand: local changes reported by the mount: " ~ to!string(result.length), ["debug"]);}
 	return result;
+}
+
+// On-demand: keep a local deletion for the next scheduled sync if its item is still in the database
+void deferOnDemandDeletionIfNotApplied(string path) {
+	if (!onDemandMountActive) return;
+	if (exists(path)) return;
+	Item item;
+	if (!itemDB.selectByPath(path, appConfig.defaultDriveId, item)) return;
+	addLogEntry("On-demand: the local deletion of " ~ path ~ " was not applied online; it will be retried on the next sync");
+	deferredOnDemandChanges ~= OnDemandLocalChange(OnDemandChangeKind.deleted, path, null);
+}
+
+// On-demand: move deferred local deletions back into the pending list
+void requeueDeferredOnDemandChanges() {
+	if (deferredOnDemandChanges.empty) return;
+	pendingOnDemandChanges ~= deferredOnDemandChanges;
+	deferredOnDemandChanges = null;
+}
+
+// On-demand: is a move away from, or deletion of, 'path' (or a parent of it) reported by the mount
+// but not yet applied? Delta processing must then not recreate the old path.
+bool onDemandHasPendingDeparture(string path) {
+	if (!onDemandMountActive) return false;
+	drainOnDemandChangeQueue();
+	string target = normaliseOnDemandChangePath(path);
+	bool departs(string departurePath) {
+		string normalised = normaliseOnDemandChangePath(departurePath);
+		return (target == normalised) || startsWith(target, normalised ~ "/");
+	}
+	foreach (change; pendingOnDemandChanges ~ deferredOnDemandChanges) {
+		if ((change.kind == OnDemandChangeKind.moved) && departs(change.oldPath)) return true;
+		if ((change.kind == OnDemandChangeKind.deleted) && departs(change.path)) return true;
+	}
+	return false;
 }
 
 // On-demand change paths are "./a/b", relative to the backing directory (the working directory)
