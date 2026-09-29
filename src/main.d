@@ -2338,8 +2338,15 @@ bool startOnDemand() {
 	onDemandHydrationService = new HydrationService(appConfig, itemDB, backingDir);
 
 	addLogEntry("Starting Files On-Demand mount of " ~ mountPoint ~ " (backing directory: " ~ backingDir ~ ") ...");
-	if (!startOnDemandMount(itemDB, onDemandHydrationService, onDemandChangeQueue, thisTid, mountPoint, backingDir, appConfig.defaultDriveId, appConfig.defaultRootId)) {
+	bool mountStarted = false;
+	try {
+		mountStarted = startOnDemandMount(itemDB, onDemandHydrationService, onDemandChangeQueue, thisTid, mountPoint, backingDir, appConfig.defaultDriveId, appConfig.defaultRootId);
+	} catch (Exception e) {
+		addLogEntry("ERROR: Unable to start the Files On-Demand mount of " ~ mountPoint ~ ": " ~ e.msg, ["info", "notify"]);
+	}
+	if (!mountStarted) {
 		addLogEntry("ERROR: Unable to start the Files On-Demand mount of " ~ mountPoint, ["info", "notify"]);
+		addLogEntry("If a previous mount is stale ('Transport endpoint is not connected'), unmount it with: fusermount3 -u -z " ~ mountPoint);
 		onDemandHydrationService.shutdown();
 		onDemandHydrationService = null;
 		onDemandChangeQueue = null;

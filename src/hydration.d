@@ -304,7 +304,8 @@ final class HydrationService {
 		}
 	}
 
-	// Set H. For a directory, clear the pin on it and on every pinned item below it.
+	// Set H. For a directory, set H on it and on every pinned item below it (no dehydration).
+	// A pinned file that is absent becomes O instead, as an absent H file reads as a local deletion.
 	void unpin(string driveId, string id) {
 		onDemandStateMutex.lock();
 		scope(exit) onDemandStateMutex.unlock();
@@ -326,7 +327,7 @@ final class HydrationService {
 
 	private void unpinLocked(Item item) {
 		if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
-			if (item.hydration == hydrationPinned) itemDB.setHydration(item.driveId, item.id, null);
+			if (item.hydration == hydrationPinned) itemDB.setHydration(item.driveId, item.id, hydrationHydrated);
 			foreach (child; itemDB.selectChildren(item.driveId, item.id)) {
 				unpinLocked(child);
 			}
