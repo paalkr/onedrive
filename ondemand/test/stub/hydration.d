@@ -149,18 +149,29 @@ final class HydrationService
 	}
 
 	/* Creates the empty backing file of an online-only item instead of
-	   downloading it (O_TRUNC). False if the item is not online-only. */
+	   downloading it (O_TRUNC). As in the engine (9af10d7) the state stays
+	   O until the change is uploaded, an existing backing file is
+	   truncated, and it is false for anything but an online-only file. */
 	bool createEmpty(string driveId, string id)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
-		if (key(driveId, id) in inFlight || stateLocked(driveId, id) != HydrationState.onlineOnly)
+		// The engine waits for a hydration commit in progress; afterwards the state is H
+		if (key(driveId, id) in inFlight)
+			return false;
+		Item item;
+		if (!itemDB.selectById(driveId, id, item))
+			throw new HydrationError(errno.ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		if (item.type != ItemType.file || stateLocked(driveId, id) != HydrationState.onlineOnly)
 			return false;
 		string target = targetOf(driveId, id);
-		if (exists(target))
-			return false;
-		std.file.write(target, "");
-		itemDB.setHydration(driveId, id, "H");
+		try
+		{
+			mkdirRecurse(dirName(target));
+			std.file.write(target, "");
+		}
+		catch (FileException e)
+			throw new HydrationError(errno.EIO, e.msg);
 		stderr.writeln("STUB createEmpty ", itemDB.computePath(driveId, id));
 		return true;
 	}
