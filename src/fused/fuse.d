@@ -11,7 +11,7 @@ module fused.fuse;
 
 /* reexport stat_t */
 public import core.sys.posix.fcntl;
-public import core.sys.posix.utime;
+public import core.sys.posix.time : timespec;
 
 import std.algorithm;
 import std.array;
@@ -25,29 +25,48 @@ import core.sys.posix.signal;
 
 import c.fuse.fuse;
 
-import core.thread : thread_attachThis, thread_detachThis;
+import core.thread : Thread, thread_attachThis, thread_detachThis;
 import core.sys.posix.pthread;
 
 /**
  * libfuse is handling the thread creation and we cannot hook into it. However
  * we need to make the GC aware of the threads. So for any call to a handler
  * we check if the current thread is attached and attach it if necessary.
+ *
+ * The thread is detached again from a pthread key destructor, which runs on
+ * thread exit whether the thread returns or is cancelled. A pthread_cleanup
+ * handler pushed here did not detach the libfuse workers, leaving dangling
+ * Thread objects that crashed in pthread_detach() during runtime shutdown.
  */
 private int threadAttached = false;
-private pthread_cleanup cleanup;
+private __gshared pthread_key_t detachKey;
+private __gshared pthread_once_t detachKeyOnce = PTHREAD_ONCE_INIT;
 
 extern(C) void detach(void* ptr) nothrow
 {
-    import std.exception;
-    collectException(thread_detachThis());
+    /* Once removed from the thread list the Thread object's destructor no
+       longer calls pthread_detach() on the (by then joined) handle */
+    thread_detachThis();
+}
+
+extern(C) private void createDetachKey() nothrow
+{
+    pthread_key_create(&detachKey, &detach);
 }
 
 private void attach()
 {
     if (!threadAttached)
     {
-        thread_attachThis();
-        cleanup.push(&detach, cast(void*) null);
+        /* Threads created by D (e.g. the main thread with -s) are already
+           registered and must not be detached on exit */
+        if (Thread.getThis() is null)
+        {
+            thread_attachThis();
+            pthread_once(&detachKeyOnce, &createDetachKey);
+            /* any non-null value makes the destructor run on thread exit */
+            pthread_setspecific(detachKey, cast(void*) 1);
+        }
         threadAttached = true;
     }
 }
@@ -101,7 +120,7 @@ extern(System)
             })();
     }
 
-    private int dfuse_getattr(const char*  path, stat_t* st)
+    private int dfuse_getattr(const char*  path, stat_t* st, fuse_file_info* fi)
     {
         return call!(
             (Operations t)
@@ -112,14 +131,16 @@ extern(System)
     }
 
     private int dfuse_readdir(const char* path, void* buf,
-            fuse_fill_dir_t filler, off_t offset, fuse_file_info* fi)
+            fuse_fill_dir_t filler, off_t offset, fuse_file_info* fi,
+            fuse_readdir_flags flags)
     {
         return call!(
             (Operations t)
             {
                 foreach(file; t.readdir(path[0..path.strlen]))
                 {
-                    filler(buf, cast(char*) toStringz(file), null, 0);
+                    filler(buf, toStringz(file), null, 0,
+                        cast(fuse_fill_dir_flags) 0);
                 }
                 return 0;
             })();
@@ -176,7 +197,7 @@ extern(System)
             })();
     }
 
-    private int dfuse_write(const char* path, char* data, size_t size,
+    private int dfuse_write(const char* path, const char* data, size_t size,
                             off_t offset, fuse_file_info* fi)
     {
         static assert(ulong.max >= size_t.max);
@@ -191,7 +212,7 @@ extern(System)
             })();
     }
 
-    private int dfuse_truncate(const char* path, off_t length)
+    private int dfuse_truncate(const char* path, off_t length, fuse_file_info* fi)
     {
         static assert(ulong.max >= off_t.max);
         return call!(
@@ -244,16 +265,16 @@ extern(System)
             })();
     }
 
-    private int dfuse_rename(const char* orig, const char* dest) {
+    private int dfuse_rename(const char* orig, const char* dest, uint flags) {
         return call!(
             (Operations t)
             {
-                t.rename(orig[0..orig.strlen], dest[0..dest.strlen]);
+                t.rename(orig[0..orig.strlen], dest[0..dest.strlen], flags);
                 return 0;
             })();
     }
 
-    private int dfuse_chmod(const char* path, mode_t mode) {
+    private int dfuse_chmod(const char* path, mode_t mode, fuse_file_info* fi) {
         return call!(
             (Operations t)
             {
@@ -263,17 +284,19 @@ extern(System)
         )();
     }
 
-    private int dfuse_utime(const char* path, utimbuf* time) {
+    private int dfuse_utimens(const char* path, const(timespec)* tv,
+            fuse_file_info* fi) {
         return call!(
             (Operations t)
             {
-                t.utime(path[0 .. path.strlen], time);
+                /* tv is [atime, mtime]; tv_nsec may be UTIME_NOW or UTIME_OMIT */
+                t.utimens(path[0 .. path.strlen], tv is null ? null : tv[0 .. 2]);
                 return 0;
             }
         );
     }
 
-    private int dfuse_symlink(const char* target, char* link) {
+    private int dfuse_symlink(const char* target, const char* link) {
         return call!(
             (Operations t)
             {
@@ -283,7 +306,8 @@ extern(System)
         );
     }
 
-    private int dfuse_chown(const char* path, uid_t uid, gid_t gid) {
+    private int dfuse_chown(const char* path, uid_t uid, gid_t gid,
+            fuse_file_info* fi) {
         return call!(
             (Operations t)
             {
@@ -293,7 +317,7 @@ extern(System)
         );
     }
 
-    private void* dfuse_init(fuse_conn_info* conn)
+    private void* dfuse_init(fuse_conn_info* conn, fuse_config* cfg)
     {
         attach();
         auto t = cast(Operations*) fuse_get_context().private_data;
@@ -303,12 +327,8 @@ extern(System)
 
     private void dfuse_destroy(void* data)
     {
-        /* this is an ugly hack at the moment. We need to somehow detach all
-           threads from the runtime because after fuse_main finishes the pthreads
-           are joined. We circumvent that problem by just exiting while our
-           threads still run. */
-        import core.stdc.stdlib : exit;
-        exit(0);
+        /* libfuse worker threads detach themselves from the D runtime on
+           exit (see attach()), so fuse_main() can simply return. */
     }
 } /* extern(C) */
 
@@ -433,13 +453,14 @@ export class Operations
     }
 
     /**
-     * Sets access and modification time.
+     * Sets access and modification time with nanosecond resolution.
      *
      * Params:
      *   path = The path to modify.
-     *   time = The time to set.
+     *   tv   = [atime, mtime], see utimensat(2) for UTIME_NOW and UTIME_OMIT.
+     *          May be null.
      */
-    void utime(const(char)[] path, utimbuf* time)
+    void utimens(const(char)[] path, const(timespec)[] tv)
     {
         throw new FuseException(errno.EOPNOTSUPP);
     }
@@ -489,7 +510,17 @@ export class Operations
         throw new FuseException(errno.EOPNOTSUPP);
     }
 
-    void rename(const(char)[] orig, const(char)[] dest)
+    /**
+     * Renames a file.
+     *
+     * Params:
+     *   orig  = The path to rename.
+     *   dest  = The new path.
+     *   flags = RENAME_EXCHANGE or RENAME_NOREPLACE, see rename(2). A
+     *           filesystem that does not support a flag should throw
+     *           FuseException(EINVAL).
+     */
+    void rename(const(char)[] orig, const(char)[] dest, uint flags)
     {
         throw new FuseException(errno.EOPNOTSUPP);
     }
@@ -575,7 +606,7 @@ public:
         fops.rmdir = &dfuse_rmdir;
         fops.rename = &dfuse_rename;
         fops.chmod = &dfuse_chmod;
-        fops.utime = &dfuse_utime;
+        fops.utimens = &dfuse_utimens;
         fops.symlink = &dfuse_symlink;
         fops.chown = &dfuse_chown;
 
