@@ -38,7 +38,7 @@ import webhook;
 import intune;
 import socketio;
 import hydration;
-import ondemandglue;
+import ondemand;
 
 // Native stack trace support for fatal signal diagnostics.
 // On OpenBSD this is provided by libexecinfo; on Linux this is provided by glibc.
@@ -2340,7 +2340,8 @@ bool startOnDemand() {
 	addLogEntry("Starting Files On-Demand mount of " ~ mountPoint ~ " (backing directory: " ~ backingDir ~ ") ...");
 	bool mountStarted = false;
 	try {
-		mountStarted = startOnDemandMount(itemDB, onDemandHydrationService, onDemandChangeQueue, thisTid, mountPoint, backingDir, appConfig.defaultDriveId, appConfig.defaultRootId);
+		startOnDemandMount(itemDB, onDemandHydrationService, onDemandChangeQueue, thisTid, mountPoint, backingDir, appConfig.defaultDriveId, appConfig.defaultRootId);
+		mountStarted = true;
 	} catch (Exception e) {
 		addLogEntry("ERROR: Unable to start the Files On-Demand mount of " ~ mountPoint ~ ": " ~ e.msg, ["info", "notify"]);
 	}
