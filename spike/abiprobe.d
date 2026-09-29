@@ -46,6 +46,7 @@ void main()
 	dump!fuse_config("fuse_config");
 	dump!fuse_context("fuse_context");
 	dump!fuse_operations("fuse_operations");
+	dump!fuse_args("fuse_args");
 	printf("sizeof stat %zu\nsizeof statvfs %zu\nsizeof flock %zu\nsizeof timespec %zu\n",
 		stat_t.sizeof, statvfs_t.sizeof, flock.sizeof, timespec.sizeof);
 }

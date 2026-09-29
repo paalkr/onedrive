@@ -23,6 +23,15 @@ import core.sys.posix.time;
 extern (System)
 {
     struct fuse;
+    struct fuse_session;
+
+    /** Argument list, <fuse3/fuse_opt.h> */
+    struct fuse_args
+    {
+        int argc;
+        char** argv;
+        int allocated;
+    }
 
     struct fuse_pollhandle;
     struct fuse_bufvec;
@@ -170,11 +179,32 @@ extern (System)
         static assert(fuse_context.pid.offsetof == 16);
         static assert(fuse_context.private_data.offsetof == 24);
         static assert(fuse_context.umask.offsetof == 32);
+
+        static assert(fuse_args.sizeof == 24);
+        static assert(fuse_args.argv.offsetof == 8);
+        static assert(fuse_args.allocated.offsetof == 16);
     }
 
     fuse_context* fuse_get_context();
     void fuse_exit(fuse* f);
     int fuse_version();
+
+    /* Exported as fuse_new_31@@FUSE_3.1 by libfuse 3.14. fuse_new() copies
+       *op but keeps private_data as given. Mount options in args (-o ...)
+       are parsed here, not by fuse_mount(). */
+    fuse* fuse_new_31(fuse_args* args, const(fuse_operations)* op,
+        size_t op_size, void* private_data);
+    int fuse_mount(fuse* f, const(char)* mountpoint);
+    void fuse_unmount(fuse* f);
+    void fuse_destroy(fuse* f);
+    fuse_session* fuse_get_session(fuse* f);
+    int fuse_session_exited(fuse_session* se);
+
+    /* FUSE_USE_VERSION < 32 variant, exported as fuse_loop_mt_31@@FUSE_3.2.
+       Takes clone_fd instead of struct fuse_loop_config, so no config
+       struct has to be mirrored. Unlike fuse_main() it installs no signal
+       handlers. Returns 0 on a clean exit. */
+    int fuse_loop_mt_31(fuse* f, int clone_fd);
 
     /* Exported unversioned as fuse_main_real@@FUSE_3.0 by libfuse 3.14 */
     int fuse_main_real(int argc, char** argv, const(fuse_operations)* op,
