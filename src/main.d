@@ -138,8 +138,18 @@ OnDemandChangeQueue onDemandChangeQueue;
 bool onDemandMountActive = false;
 // On-demand local changes drained from onDemandChangeQueue, waiting to be applied
 OnDemandLocalChange[] pendingOnDemandChanges;
-// On-demand local deletions that could not be applied online yet; retried on the next scheduled sync
-OnDemandLocalChange[] deferredOnDemandChanges;
+// On-demand local deletions that could not be applied online yet; retried on the next scheduled sync.
+// The item identity is recorded so a retry never deletes a different or newer item at the same path.
+struct DeferredOnDemandDeletion {
+	string path;
+	string driveId;
+	string id;
+	string eTag;
+	int attempts;
+}
+DeferredOnDemandDeletion[] deferredOnDemandDeletions;
+// Retries of a deferred deletion before it is dropped
+immutable int maxDeferredOnDemandDeletionAttempts = 5;
 
 // Class variables
 // Flag for performing a synchronised shutdown
@@ -1613,7 +1623,7 @@ int main(string[] cliArgs) {
 								performUploadOnlySyncProcess(localPath, filesystemMonitor);
 							} else {
 								// On-demand: retry local deletions that could not be applied online earlier
-								requeueDeferredOnDemandChanges();
+								retryDeferredOnDemandDeletions();
 								// Perform the standard sync process
 								performStandardSyncProcess(localPath, filesystemMonitor);
 							}
@@ -2351,6 +2361,13 @@ bool checkOnDemandProfileState() {
 	if (exists(marker)) {
 		if (emptyDatabase) {
 			// --resync (or a fresh database) converts the profile back to normal mode
+			string recordedBackingDir;
+			try {
+				recordedBackingDir = strip(readText(marker));
+			} catch (Exception e) {
+				recordedBackingDir = "<unknown>";
+			}
+			addLogEntry("WARNING: This profile has been converted from on-demand mode to normal mode. Changes in the on-demand backing directory (" ~ recordedBackingDir ~ ") that were not uploaded are not synchronised.", ["info", "notify"]);
 			if (!dryRun) {
 				try {
 					std.file.remove(marker);
@@ -2463,14 +2480,50 @@ void deferOnDemandDeletionIfNotApplied(string path) {
 	Item item;
 	if (!itemDB.selectByPath(path, appConfig.defaultDriveId, item)) return;
 	addLogEntry("On-demand: the local deletion of " ~ path ~ " was not applied online; it will be retried on the next sync");
-	deferredOnDemandChanges ~= OnDemandLocalChange(OnDemandChangeKind.deleted, path, null);
+	deferredOnDemandDeletions ~= DeferredOnDemandDeletion(path, item.driveId, item.id, item.eTag, 0);
 }
 
-// On-demand: move deferred local deletions back into the pending list
-void requeueDeferredOnDemandChanges() {
-	if (deferredOnDemandChanges.empty) return;
-	pendingOnDemandChanges ~= deferredOnDemandChanges;
-	deferredOnDemandChanges = null;
+// On-demand: retry deferred local deletions. An entry is dropped when the item at its path is gone,
+// is a different item, or changed online since it was deleted locally, and after too many attempts.
+void retryDeferredOnDemandDeletions() {
+	if (deferredOnDemandDeletions.empty) return;
+	DeferredOnDemandDeletion[] stillDeferred;
+	foreach (deletion; deferredOnDemandDeletions) {
+		if (exists(deletion.path)) {
+			addLogEntry("On-demand: dropping deferred deletion of " ~ deletion.path ~ " because the path exists locally again");
+			continue;
+		}
+		Item item;
+		if (!itemDB.selectByPath(deletion.path, appConfig.defaultDriveId, item)) {
+			addLogEntry("On-demand: dropping deferred deletion of " ~ deletion.path ~ " because the item is no longer in the database");
+			continue;
+		}
+		if ((item.driveId != deletion.driveId) || (item.id != deletion.id) || (item.eTag != deletion.eTag)) {
+			addLogEntry("On-demand: dropping deferred deletion of " ~ deletion.path ~ " because the item at that path is a different item or changed online since it was deleted locally");
+			continue;
+		}
+
+		deletion.attempts++;
+		try {
+			addLogEntry("On-demand: retrying the local deletion of " ~ deletion.path);
+			syncEngineInstance.deleteByPath(deletion.path);
+		} catch (CurlException e) {
+			// Offline: does not count as an attempt
+			deletion.attempts--;
+			if (verboseLogging) {addLogEntry("Offline, cannot delete item: " ~ deletion.path, ["verbose"]);}
+		} catch (Exception e) {
+			addLogEntry("Cannot delete remote item: " ~ e.msg, ["info", "notify"]);
+		}
+
+		Item remaining;
+		if (!itemDB.selectById(deletion.driveId, deletion.id, remaining)) continue;
+		if (deletion.attempts >= maxDeferredOnDemandDeletionAttempts) {
+			addLogEntry("WARNING: On-demand: giving up deleting " ~ deletion.path ~ " online after " ~ to!string(deletion.attempts) ~ " attempts; the online item is kept", ["info", "notify"]);
+			continue;
+		}
+		stillDeferred ~= deletion;
+	}
+	deferredOnDemandDeletions = stillDeferred;
 }
 
 // On-demand: is a move away from, or deletion of, 'path' (or a parent of it) reported by the mount
@@ -2483,9 +2536,12 @@ bool onDemandHasPendingDeparture(string path) {
 		string normalised = normaliseOnDemandChangePath(departurePath);
 		return (target == normalised) || startsWith(target, normalised ~ "/");
 	}
-	foreach (change; pendingOnDemandChanges ~ deferredOnDemandChanges) {
+	foreach (change; pendingOnDemandChanges) {
 		if ((change.kind == OnDemandChangeKind.moved) && departs(change.oldPath)) return true;
 		if ((change.kind == OnDemandChangeKind.deleted) && departs(change.path)) return true;
+	}
+	foreach (deletion; deferredOnDemandDeletions) {
+		if (departs(deletion.path)) return true;
 	}
 	return false;
 }

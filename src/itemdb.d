@@ -1399,6 +1399,14 @@ final class ItemDatabase {
 				addLogEntry();
 				addLogEntry("ERROR: Unable to commit the database transaction: " ~ exception.msg);
 				addLogEntry();
+				// On-demand: do not leave a half-open transaction that other threads' writes could join
+				if (serialiseTransactions && db.inTransaction()) {
+					try {
+						db.exec("ROLLBACK;");
+					} catch (SqliteException rollbackException) {
+						addLogEntry("ERROR: Unable to roll back the database transaction after a failed commit: " ~ rollbackException.msg);
+					}
+				}
 			}
 		}
 	}
@@ -1438,8 +1446,17 @@ final class ItemDatabase {
 		return transactionMutex;
 	}
 
+	// The mutex is only released once no transaction is open, so no other thread can write into it
 	private void releaseTransactionMutex() {
 		if (serialiseTransactions && transactionMutexHeld) {
+			bool stillInTransaction;
+			synchronized(databaseLock) {
+				stillInTransaction = db.inTransaction();
+			}
+			if (stillInTransaction) {
+				addLogEntry("ERROR: A database transaction is still open; on-demand writes stay blocked until it ends");
+				return;
+			}
 			transactionMutexHeld = false;
 			transactionMutex.unlock();
 		}

@@ -345,9 +345,11 @@ final class HydrationService {
 		if ((item.type != ItemType.file) || (item.hydration != hydrationOnlineOnly)) return false;
 
 		string backingPath = backingPathFor(driveId, id);
+		// Never create missing parents: the database path may be stale after a local folder move
+		if (!exists(dirName(backingPath))) {
+			throw new HydrationError(EAGAIN, "The backing parent directory does not exist: " ~ dirName(backingPath));
+		}
 		try {
-			string parentPath = dirName(backingPath);
-			if (!exists(parentPath)) mkdirRecurse(parentPath);
 			std.file.write(backingPath, "");
 			if (!disablePermissionSet) {
 				backingPath.setAttributes(filePermissions);
@@ -408,6 +410,10 @@ final class HydrationService {
 					hydrate(child.driveId, child.id);
 					// hydrate() records P for a file under a pinned ancestor
 				} catch (HydrationError e) {
+					if (e.errnoCode == EAGAIN) {
+						addLogEntry("On-demand: skipping pinned file " ~ child.name ~ " for now: " ~ e.msg);
+						continue;
+					}
 					addLogEntry("On-demand: unable to hydrate pinned file " ~ child.name ~ ": " ~ e.msg);
 					if (firstError is null) firstError = e;
 				}
@@ -481,6 +487,9 @@ final class HydrationService {
 				throw new HydrationError(EIO, "Only files on the account drive can be hydrated");
 			}
 			backingPath = backingPathFor(driveId, id);
+		}
+		if (!exists(dirName(backingPath))) {
+			throw new HydrationError(EAGAIN, "The backing parent directory does not exist: " ~ dirName(backingPath));
 		}
 		if (exists(backingPath)) {
 			// Already present. This includes an online-only file that was truncated and written
@@ -626,10 +635,14 @@ final class HydrationService {
 			return true;
 		}
 
+		// Never create missing parents: the database path may be stale after a local folder move
+		// that has not been applied yet
+		if (!exists(dirName(backingPath))) {
+			throw new HydrationError(EAGAIN, "The backing parent directory does not exist: " ~ dirName(backingPath));
+		}
+
 		// The backing mtime comes from the database record
 		setTimes(stagingPath, currentItem.mtime, currentItem.mtime);
-		string parentPath = dirName(backingPath);
-		if (!exists(parentPath)) mkdirRecurse(parentPath);
 		try {
 			rename(stagingPath, backingPath);
 		} catch (FileException e) {
