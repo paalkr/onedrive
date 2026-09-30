@@ -21,3 +21,5 @@ contrib/systemd/onedrive@.service
 
 # Ensure spellcheck.yaml in .github is not ignored
 !.github/actions/spelling/spellcheck.yaml
+__pycache__/
+*.pyc
