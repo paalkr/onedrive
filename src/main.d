@@ -1449,6 +1449,12 @@ int main(string[] cliArgs) {
 					// Process any inotify events
 					captureAndApplyInotifyEvents("monitor_loop.pre_notification_check");
 				}
+
+				// On-demand: due locked-online upload retries run here as well, in case applying local
+				// changes returned early (for example while the system time gate is closed)
+				if (onDemandMountActive && appConfig.systemTimeAllowsSync()) {
+					syncEngineInstance.onDemandRetryDueLockedUploads();
+				}
 				
 				// WebSocket and Webhook Notification Handling
 				bool notificationReceived = false;
@@ -1631,8 +1637,13 @@ int main(string[] cliArgs) {
 								// Perform the --upload-only sync process
 								performUploadOnlySyncProcess(localPath, filesystemMonitor);
 							} else {
-								// On-demand: retry local deletions that could not be applied online earlier
+								// On-demand: retry local deletions that could not be applied online earlier, and
+								// re-check online changes deferred for files that are no longer open
 								retryDeferredOnDemandDeletions();
+								if (onDemandMountActive) {
+									readyClosedDeferredOnlineChanges();
+									syncEngineInstance.onDemandApplyReadyDeferredOnlineChanges();
+								}
 								// Perform the standard sync process
 								performStandardSyncProcess(localPath, filesystemMonitor);
 							}
@@ -1746,9 +1757,11 @@ int main(string[] cliArgs) {
 					auto nextCheckTime = lastCheckTime + nextMonitorCheckInterval;
 					currentTime = MonoTime.currTime();
 					auto sleepTime = nextCheckTime - currentTime;
-					// On-demand: wake for the next locked-online upload retry
+					// On-demand: wake for the next locked-online upload retry (at least 1 s, so a retry that
+					// is due but could not be taken yet never makes this loop spin)
 					if (onDemandMountActive) {
 						Duration nextLockedRetry = nextLockedUploadDueIn();
+						if (nextLockedRetry < dur!"seconds"(1)) nextLockedRetry = dur!"seconds"(1);
 						if (nextLockedRetry < sleepTime) sleepTime = nextLockedRetry;
 					}
 					if (debugLogging) {addLogEntry("Sleep for " ~ to!string(sleepTime), ["debug"]);}
@@ -2439,6 +2452,19 @@ bool startOnDemand() {
 
 	// Writes from HydrationService threads must never join an open engine transaction
 	itemDB.enableTransactionSerialisation();
+
+	// Online changes deferred for open files are persisted; re-evaluate those left from before a restart
+	itemDB.ensureOnDemandDeferredTable();
+	syncEngineInstance.onDemandQueuePersistedDeferrals();
+
+	// Per-item on-demand state of a deleted item is dropped (runs on the deleting thread; no main-thread globals)
+	ItemDatabase deletedItemDatabase = itemDB;
+	itemDB.itemDeletedHandler = delegate(string driveId, string id) {
+		setTransientState(driveId, id, TransientState.none);
+		clearDeferredOnlineChange(driveId, id);
+		clearLockedUploadRetry(driveId, id);
+		deletedItemDatabase.removeOnDemandDeferred(driveId, id);
+	};
 
 	onDemandChangeQueue = new OnDemandChangeQueue();
 	// The last close of a file with a deferred online change wakes the main thread to apply it
@@ -3239,6 +3265,7 @@ void shutdownFilesystemMonitor() {
 
 void shutdownOnDemand() {
 	setDeferredOnlineChangeReadyHandler(null);
+	if (itemDB !is null) itemDB.itemDeletedHandler = null;
 	if (onDemandThumbnailService !is null) {
 		if (debugLogging) {addLogEntry("Shutting down on-demand thumbnail service", ["debug"]);}
 		onDemandThumbnailService.shutdown();

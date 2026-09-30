@@ -16,7 +16,8 @@ import core.sys.posix.signal;
 import core.atomic;
 import core.memory : GC;
 // Required for WebSocket Support
-import core.stdc.stdlib : getenv;
+import core.stdc.stdlib : getenv, malloc, free;
+import core.lifetime : emplace;
 import core.stdc.string : strcmp;
 import core.sys.posix.dlfcn : dlopen, dlsym, dlclose, RTLD_NOW; // Posix elements
 import std.exception : enforce;     // for enforce(...)
@@ -577,7 +578,16 @@ extern (C) int curlUploadSeekCallback(void* userData, long offset, int origin) n
 
 class CurlEngine {
 
-	HTTP http;
+	// The HTTP instance lives in malloc'd memory, not in this GC object. When the GC finalises a
+	// CurlEngine (for example in the final collection at process exit, after libcurl may be
+	// unloaded), neither ~this nor a field destructor may call into libcurl. HTTP's refcounted
+	// payload destructor (std.net.curl HTTP.Impl.~this) calls curl_slist_free_all and
+	// curl_easy_cleanup, so as a field it would run during finalisation; held here, the finaliser
+	// path deliberately leaks it instead.
+	private HTTP* httpStorage;
+	@property ref HTTP http() {
+		return *httpStorage;
+	}
 	File uploadFile;
 	CurlResponse response;
 	bool keepAlive;
@@ -601,7 +611,10 @@ class CurlEngine {
 	private ulong uploadStreamHashBytes = 0;
 	
 	this() {
-		http = HTTP();   // Directly initializes HTTP using its default constructor
+		httpStorage = cast(HTTP*) malloc(HTTP.sizeof);
+		if (httpStorage is null) throw new Exception("Unable to allocate an HTTP instance");
+		GC.addRange(httpStorage, HTTP.sizeof);
+		emplace(httpStorage, HTTP());   // Directly initializes HTTP using its default constructor
 		response = null; // Initialize as null
 		internalThreadId = generateAlphanumericString(); // Give this CurlEngine instance a unique ID
 		atomicOp!"+="(curlEnginesAlive, 1);
@@ -630,6 +643,9 @@ class CurlEngine {
 		}
 		// Make sure this HTTP instance is destroyed
 		object.destroy(http);
+		GC.removeRange(httpStorage);
+		free(httpStorage);
+		httpStorage = null;
 		// ThreadId needs to be set to null
 		internalThreadId = null;
 	}
@@ -990,7 +1006,7 @@ class CurlEngine {
 			return data.length;
 		};
 		http.perform();
-		response.update(&http);
+		response.update(httpStorage);
 		return response;
 	}
 
@@ -1057,7 +1073,7 @@ class CurlEngine {
 		// Update response and return response. Promotion of the temporary download
 		// into the final destination is deliberately owned by the API layer after
 		// HTTP response validation has completed.
-		response.update(&http);
+		response.update(httpStorage);
 		if (enableStreamedHash) {
 			response.streamedQuickXorHash = quickXorStreamHasher.finishB64();
 			response.hasStreamedQuickXorHash = true;

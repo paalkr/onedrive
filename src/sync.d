@@ -3433,15 +3433,6 @@ class SyncEngine {
 					addLogEntry("Number of items to download from Microsoft OneDrive: " ~ to!string(fileJSONItemsToDownload.length));
 					downloadOneDriveItems();
 
-					// On-demand: an online change deferred because the file is open must be seen again by
-					// the next sync (also after a restart), so do not advance the delta checkpoint
-					if (onDemand && takeOnlineChangeDeferredFlag()) {
-						if (verboseLogging) {addLogEntry("On-demand: retaining the previous deltaLink because an online change was deferred for an open file", ["verbose"]);}
-						deltaLinkCache.driveId = null;
-						deltaLinkCache.itemId = null;
-						deltaLinkCache.latestDeltaLink = null;
-						latestDeltaLink = null;
-					}
 				}
 
 				// Cleanup array memory
@@ -4724,15 +4715,12 @@ class SyncEngine {
 
 		// On-demand: never replace a local file that is open. Defer the newer online version;
 		// it is re-evaluated when the last handle closes, and at every sync cycle while it stays open.
-		if (onDemand && canonicalFileExistedBeforeDownload && onDemandItemIsOpen(downloadDriveId, downloadItemId)) {
-			if (recordDeferredOnlineChange(downloadDriveId, downloadItemId, onedriveJSONItem, ignoreDataPreservationCheck)) {
-				addLogEntry("On-demand: " ~ newItemPath ~ " is open locally; the newer online version will be applied when it is closed");
-			}
+		if (onDemand && canonicalFileExistedBeforeDownload && onDemandDeferIfOpen(downloadDriveId, downloadItemId, onedriveJSONItem, ignoreDataPreservationCheck, newItemPath)) {
 			return;
 		}
 		bool onDemandDownloadSucceeded = false;
 		if (onDemand) {
-			clearDeferredOnlineChange(downloadDriveId, downloadItemId);
+			onDemandForgetDeferral(downloadDriveId, downloadItemId);
 			setTransientState(downloadDriveId, downloadItemId, TransientState.syncing);
 		}
 		scope(exit) {
@@ -5029,10 +5017,7 @@ class SyncEngine {
 						} // end of (!disableDownloadValidation)
 
 						// On-demand: the file may have been opened during the transfer; do not replace it
-						if (onDemand && exists(newItemPath) && onDemandItemIsOpen(downloadDriveId, downloadItemId)) {
-							if (recordDeferredOnlineChange(downloadDriveId, downloadItemId, onedriveJSONItem, ignoreDataPreservationCheck)) {
-								addLogEntry("On-demand: " ~ newItemPath ~ " was opened locally; the newer online version will be applied when it is closed");
-							}
+						if (onDemand && exists(newItemPath) && onDemandDeferIfOpen(downloadDriveId, downloadItemId, onedriveJSONItem, ignoreDataPreservationCheck, newItemPath)) {
 							return false;
 						}
 
@@ -5797,15 +5782,108 @@ class SyncEngine {
 		return subtreeHasOnlineOnlyItems(itemDB, item.driveId, item.id);
 	}
 
+	// On-demand: if the item is open locally, defer (and persist) its newer online version instead
+	// of replacing the file. Returns true when deferred.
+	bool onDemandDeferIfOpen(string driveId, string id, JSONValue onlineItem, bool ignoreDataPreservationCheck, string localPath) {
+		string eTag = hasETag(onlineItem) ? onlineItem["eTag"].str : null;
+		bool first;
+		if (!deferOnlineChangeIfOpen(driveId, id, eTag, ignoreDataPreservationCheck, first)) return false;
+		itemDB.addOnDemandDeferred(driveId, id, eTag);
+		if (first) addLogEntry("On-demand: " ~ localPath ~ " is open locally; the newer online version will be applied when it is closed");
+		return true;
+	}
+
+	// On-demand: forget a deferral (in memory and persisted)
+	void onDemandForgetDeferral(string driveId, string id) {
+		clearDeferredOnlineChange(driveId, id);
+		itemDB.removeOnDemandDeferred(driveId, id);
+	}
+
+	// On-demand: after a restart, re-evaluate the online changes that were deferred before it
+	void onDemandQueuePersistedDeferrals() {
+		if (!onDemand) return;
+		foreach (row; itemDB.selectOnDemandDeferred()) {
+			queueDeferredOnlineChangeForReevaluation(row[0], row[1], row[2]);
+		}
+	}
+
 	// On-demand: apply online changes deferred while their file was open, now that it is closed.
-	// downloadFileItem() compares the local file with the database baseline at commit: an unchanged
-	// file is replaced; a locally changed file is preserved once as a safeBackup, then replaced.
+	// The item is fetched again: if it changed online since (eTag, name or parent differ from what
+	// was deferred and what the database records), or is gone, the deferral is dropped and the
+	// next delta handles it. Otherwise downloadFileItem() applies it to the current database
+	// location; its commit-time comparison replaces an unchanged local file, or preserves a changed
+	// one once as a safeBackup and then replaces it.
 	void onDemandApplyReadyDeferredOnlineChanges() {
 		if (!onDemand) return;
-		foreach (deferred; takeReadyDeferredOnlineChanges()) {
-			addLogEntry("On-demand: applying the online change deferred while the file was open: " ~ deferred.onlineItem["name"].str);
+		DeferredOnlineChange[] ready = takeReadyDeferredOnlineChanges();
+		if (ready.length == 0) return;
+		OneDriveApi api;
+		scope(exit) {
+			if (api !is null) {
+				api.releaseCurlEngine();
+				api = null;
+			}
+		}
+		foreach (deferred; ready) {
+			Item dbItem;
+			if (!itemDB.selectById(deferred.driveId, deferred.id, dbItem)) {
+				onDemandForgetDeferral(deferred.driveId, deferred.id);
+				setTransientState(deferred.driveId, deferred.id, TransientState.none);
+				continue;
+			}
+			string localPath = computeItemPath(dbItem.driveId, dbItem.id);
+			bool first;
+			if (deferOnlineChangeIfOpen(deferred.driveId, deferred.id, deferred.eTag, deferred.ignoreDataPreservationCheck, first)) {
+				// Opened again before it could be applied
+				continue;
+			}
+
+			JSONValue current;
 			try {
-				downloadFileItem(deferred.onlineItem, deferred.ignoreDataPreservationCheck);
+				if (api is null) {
+					api = new OneDriveApi(appConfig);
+					api.initialise();
+				}
+				current = api.getPathDetailsById(deferred.driveId, deferred.id);
+			} catch (OneDriveException e) {
+				if (e.httpStatusCode == 404) {
+					addLogEntry("On-demand: dropping the deferred online change of " ~ localPath ~ ", the item no longer exists online");
+					onDemandForgetDeferral(deferred.driveId, deferred.id);
+					setTransientState(deferred.driveId, deferred.id, TransientState.none);
+				} else {
+					// Try again at the next sync cycle
+					restoreDeferredOnlineChange(deferred);
+				}
+				continue;
+			} catch (Exception e) {
+				restoreDeferredOnlineChange(deferred);
+				continue;
+			}
+
+			bool usable = (current.type == JSONType.object) && !isItemDeleted(current) && hasETag(current) && hasName(current) && hasParentReferenceId(current);
+			if (!usable) {
+				addLogEntry("On-demand: dropping the deferred online change of " ~ localPath ~ ", the item is no longer available online");
+				onDemandForgetDeferral(deferred.driveId, deferred.id);
+				setTransientState(deferred.driveId, deferred.id, TransientState.none);
+				continue;
+			}
+			string currentETag = current["eTag"].str;
+			if (currentETag == dbItem.eTag) {
+				// Already applied (for example by a conflict resolution during an upload)
+				onDemandForgetDeferral(deferred.driveId, deferred.id);
+				setTransientState(deferred.driveId, deferred.id, TransientState.none);
+				continue;
+			}
+			if (((!deferred.eTag.empty) && (currentETag != deferred.eTag)) || (current["name"].str != dbItem.name) || (current["parentReference"]["id"].str != dbItem.parentId)) {
+				addLogEntry("On-demand: dropping the deferred online change of " ~ localPath ~ ", the item changed online again; the next sync applies it");
+				onDemandForgetDeferral(deferred.driveId, deferred.id);
+				setTransientState(deferred.driveId, deferred.id, TransientState.none);
+				continue;
+			}
+
+			addLogEntry("On-demand: applying the online change deferred while the file was open: " ~ localPath);
+			try {
+				downloadFileItem(current, deferred.ignoreDataPreservationCheck);
 			} catch (Exception e) {
 				addLogEntry("On-demand: unable to apply a deferred online change: " ~ e.msg);
 			}
@@ -8360,7 +8438,7 @@ class SyncEngine {
 			if (onDemand) {
 				int lockedAttemptsAfter = lockedUploadAttempts(changedItemDriveId, changedItemId);
 				bool lockedAgain = (lockedAttemptsAfter >= 0) && ((lockedAttemptsBefore < 0) || (lockedAttemptsAfter > lockedAttemptsBefore));
-				if (lockedAgain) {
+				if (lockedAgain || hasDeferredOnlineChange(changedItemDriveId, changedItemId)) {
 					setTransientState(changedItemDriveId, changedItemId, TransientState.pending);
 				} else if (uploadFailed || skippedMaxSize || skippedExceptionError) {
 					clearLockedUploadRetry(changedItemDriveId, changedItemId);
@@ -8918,6 +8996,38 @@ class SyncEngine {
 				// no valid JSON response - greater potential for a 412 error to occur if we are creating a session upload
 				if (debugLogging) {addLogEntry("Online data returned was invalid - using database eTag value", ["debug"]);}
 				currentETag = dbItem.eTag;
+			}
+
+			// On-demand: never upload over a newer online version. The item changed online since its
+			// database baseline (content differs), or a newer online version was deferred while the file
+			// was open: keep the local version as a conflict copy (uploaded as a new file) and apply the
+			// online version. Applies to every modified upload: change events, save by rename, lock retries.
+			if (onDemand && !uploadOnly) {
+				bool onlineChangeDeferred = hasDeferredOnlineChange(dbItem.driveId, dbItem.id);
+				if (currentOnlineJSONData.type() == JSONType.object) {
+					Item onlineNow = makeItem(currentOnlineJSONData);
+					if (onlineChangeDeferred || !sameContent(dbItem, onlineNow)) {
+						addLogEntry("On-demand: " ~ localFilePath ~ " changed both locally and online; keeping the local version as a conflict copy and applying the online version");
+						string backupPath;
+						if (!safeBackupPreserveForReplacement(localFilePath, false, backupPath, true)) {
+							uploadFileOneDriveApiInstance.releaseCurlEngine();
+							uploadFileOneDriveApiInstance = null;
+							return uploadResponse;
+						}
+						uploadNewFile(backupPath);
+						// The deferral (if any) is resolved by applying the current online version now
+						onDemandForgetDeferral(dbItem.driveId, dbItem.id);
+						downloadFileItem(currentOnlineJSONData, true);
+						uploadFileOneDriveApiInstance.releaseCurlEngine();
+						uploadFileOneDriveApiInstance = null;
+						return uploadResponse;
+					}
+				} else if (onlineChangeDeferred) {
+					addLogEntry("On-demand: not uploading " ~ localFilePath ~ " because a newer online version is pending and the online state could not be read");
+					uploadFileOneDriveApiInstance.releaseCurlEngine();
+					uploadFileOneDriveApiInstance = null;
+					return uploadResponse;
+				}
 			}
 
 			// What upload method should be used?

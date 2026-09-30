@@ -219,6 +219,8 @@ final class ItemDatabase {
 	private Mutex transactionMutex;
 	private bool transactionMutexHeld = false;
 	private bool serialiseTransactions = false;
+	// On-demand: called after deleteById() (outside the database lock), so per-item on-demand state can be dropped
+	void delegate(string driveId, string id) itemDeletedHandler;
 	// On-demand: incremented on every hydration state write and delete, so cached derived states can be invalidated
 	private shared ulong hydrationWriteGeneration;
 	
@@ -789,6 +791,9 @@ final class ItemDatabase {
 
 	void deleteById(const(char)[] driveId, const(char)[] id) {
 		atomicOp!"+="(hydrationWriteGeneration, 1);
+		scope(exit) {
+			if (itemDeletedHandler !is null) itemDeletedHandler(driveId.idup, id.idup);
+		}
 		synchronized(databaseLock) {
 			auto p = db.prepare(deleteItemByIdStmt);
 			scope(exit) p.finalise(); // Ensure that the prepared statement is finalised after execution.
@@ -1470,6 +1475,66 @@ final class ItemDatabase {
 			}
 			transactionMutexHeld = false;
 			transactionMutex.unlock();
+		}
+	}
+
+	// On-demand: online changes deferred because the local file was open, persisted so a restart
+	// re-evaluates them. The table is created only when on-demand is used.
+	void ensureOnDemandDeferredTable() {
+		synchronized(databaseLock) {
+			try {
+				db.exec("CREATE TABLE IF NOT EXISTS ondemand_deferred (driveId TEXT NOT NULL, id TEXT NOT NULL, eTag TEXT, PRIMARY KEY (driveId, id))");
+			} catch (SqliteException exception) {
+				detailSQLErrorMessage(exception);
+			}
+		}
+	}
+
+	void addOnDemandDeferred(const(char)[] driveId, const(char)[] id, const(char)[] eTag) {
+		synchronized(databaseLock) {
+			auto p = db.prepare("INSERT OR REPLACE INTO ondemand_deferred (driveId, id, eTag) VALUES (?1, ?2, ?3)");
+			scope(exit) p.finalise();
+			try {
+				p.bind(1, driveId);
+				p.bind(2, id);
+				p.bind(3, eTag);
+				p.exec();
+			} catch (SqliteException exception) {
+				detailSQLErrorMessage(exception);
+			}
+		}
+	}
+
+	void removeOnDemandDeferred(const(char)[] driveId, const(char)[] id) {
+		synchronized(databaseLock) {
+			auto p = db.prepare("DELETE FROM ondemand_deferred WHERE driveId = ?1 AND id = ?2");
+			scope(exit) p.finalise();
+			try {
+				p.bind(1, driveId);
+				p.bind(2, id);
+				p.exec();
+			} catch (SqliteException exception) {
+				detailSQLErrorMessage(exception);
+			}
+		}
+	}
+
+	// All persisted deferrals as [driveId, id, eTag]
+	string[3][] selectOnDemandDeferred() {
+		synchronized(databaseLock) {
+			string[3][] rows;
+			auto p = db.prepare("SELECT driveId, id, eTag FROM ondemand_deferred");
+			scope(exit) p.finalise();
+			try {
+				auto res = p.exec();
+				while (!res.empty) {
+					rows ~= [res.front[0].idup, res.front[1].idup, res.front[2].idup];
+					res.step();
+				}
+			} catch (SqliteException exception) {
+				detailSQLErrorMessage(exception);
+			}
+			return rows;
 		}
 	}
 

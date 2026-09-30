@@ -2192,6 +2192,13 @@ class OneDriveApi {
 			curlEngine.addRequestHeader(k, v);
 		}
 		curlEngine.connect(method, url);
+		// On-demand: let the owner of this instance abort any request (not only downloads). libcurl
+		// calls the progress callback regularly, also while connecting or waiting for a response.
+		if (transferAbortFlag !is null) {
+			curlEngine.http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) {
+				return transferAbortRequested() ? 1 : 0;
+			};
+		}
 	}
 
 	private void performDelete(const(char)[] url, string[string] requestHeaders=null, string callingFunction=__FUNCTION__, int lineno=__LINE__) {

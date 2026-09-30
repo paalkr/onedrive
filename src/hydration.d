@@ -169,28 +169,64 @@ private TransientState[string] transientStatesSnapshot() {
 struct DeferredOnlineChange {
 	string driveId;
 	string id;
-	JSONValue onlineItem;
+	// eTag of the online version that was deferred
+	string eTag;
 	bool ignoreDataPreservationCheck;
 }
 
 private __gshared Mutex deferredOnlineChangeMutex;
 private __gshared DeferredOnlineChange[string] deferredOnlineChanges;
 private __gshared DeferredOnlineChange[] readyDeferredOnlineChanges;
-private shared bool onlineChangeDeferredThisCycle;
 // Called (on a FUSE thread) when a deferred item's last handle closes; wakes the main thread
 private __gshared void delegate() deferredOnlineChangeReadyHandler;
 
-// Record that a newer online version of an open item was not applied. Returns true the first
-// time for this item (so the caller logs once). The item shows 'pending' until it is applied.
-bool recordDeferredOnlineChange(string driveId, string id, JSONValue onlineItem, bool ignoreDataPreservationCheck) {
+// If the item is open locally, record that its newer online version (eTag) was not applied and
+// return true; 'first' is set the first time for this item (so the caller logs once). The open
+// check and the record happen under the state lock that noteClose() uses, so a close cannot fall
+// between them. The item shows 'pending' until the change is applied.
+bool deferOnlineChangeIfOpen(string driveId, string id, string eTag, bool ignoreDataPreservationCheck, out bool first) {
+	onDemandStateMutex.lock();
+	scope(exit) onDemandStateMutex.unlock();
+	if ((itemKey(driveId, id) in onDemandOpenHandles) is null) return false;
 	deferredOnlineChangeMutex.lock();
 	scope(exit) deferredOnlineChangeMutex.unlock();
 	string key = itemKey(driveId, id);
-	bool first = (key !in deferredOnlineChanges);
-	deferredOnlineChanges[key] = DeferredOnlineChange(driveId, id, onlineItem, ignoreDataPreservationCheck);
-	atomicStore(onlineChangeDeferredThisCycle, true);
+	first = (key !in deferredOnlineChanges);
+	deferredOnlineChanges[key] = DeferredOnlineChange(driveId, id, eTag, ignoreDataPreservationCheck);
 	setTransientState(driveId, id, TransientState.pending);
-	return first;
+	return true;
+}
+
+// Put a deferral back (its re-evaluation could not complete); it is retried at the next sync cycle
+void restoreDeferredOnlineChange(DeferredOnlineChange deferred) {
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	deferredOnlineChanges[itemKey(deferred.driveId, deferred.id)] = deferred;
+}
+
+// Queue a deferral for re-evaluation on the main thread (restart, or found closed at a sync cycle)
+void queueDeferredOnlineChangeForReevaluation(string driveId, string id, string eTag) {
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	deferredOnlineChanges.remove(itemKey(driveId, id));
+	readyDeferredOnlineChanges ~= DeferredOnlineChange(driveId, id, eTag, false);
+	setTransientState(driveId, id, TransientState.pending);
+}
+
+// Move every deferral whose file is no longer open to the ready list (re-check at each sync cycle)
+void readyClosedDeferredOnlineChanges() {
+	onDemandStateMutex.lock();
+	scope(exit) onDemandStateMutex.unlock();
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	string[] closed;
+	foreach (key, deferred; deferredOnlineChanges) {
+		if ((key in onDemandOpenHandles) is null) {
+			readyDeferredOnlineChanges ~= deferred;
+			closed ~= key;
+		}
+	}
+	foreach (key; closed) deferredOnlineChanges.remove(key);
 }
 
 bool hasDeferredOnlineChange(string driveId, string id) {
@@ -213,12 +249,6 @@ DeferredOnlineChange[] takeReadyDeferredOnlineChanges() {
 	DeferredOnlineChange[] ready = readyDeferredOnlineChanges;
 	readyDeferredOnlineChanges = null;
 	return ready;
-}
-
-// Was any online change deferred since the last call? The caller then keeps the delta
-// checkpoint so the deferred change is seen again (also after a restart).
-bool takeOnlineChangeDeferredFlag() {
-	return cas(&onlineChangeDeferredThisCycle, true, false);
 }
 
 void setDeferredOnlineChangeReadyHandler(void delegate() handler) {
