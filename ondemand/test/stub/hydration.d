@@ -255,6 +255,8 @@ final class HydrationService
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
+		if (openCount.get(key(driveId, id), 0) > 0)
+			throw new HydrationError(errno.EBUSY, "refused to free open " ~ id);
 		if (stateLocked(driveId, id) != HydrationState.hydrated)
 			return false;
 		string target = targetOf(driveId, id);
@@ -289,7 +291,8 @@ final class HydrationService
 		itemDB.setHydration(driveId, id, absent ? "O" : "H");
 	}
 
-	/* Open handles through the mount; free refuses an open file (EBUSY) */
+	/* Open handles through the mount (engine R1): cheap, never throw; while
+	   an item is open dehydrate() and a single-file free throw EBUSY */
 	void noteOpen(string driveId, string id)
 	{
 		lock.lock();
