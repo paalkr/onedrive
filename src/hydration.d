@@ -509,6 +509,12 @@ final class HydrationService {
 		}
 		if (actionWorkerRunning) {
 			addLogEntry("WARNING: On-demand: the action worker did not stop within 30 seconds");
+		} else if (actionWorker !is null) {
+			// The worker has left its loop; reap the thread
+			serviceMutex.unlock();
+			actionWorker.join(false);
+			serviceMutex.lock();
+			actionWorker = null;
 		}
 		if (inFlight.length > 0) {
 			addLogEntry("WARNING: On-demand: " ~ to!string(inFlight.length) ~ " hydration(s) did not stop within 30 seconds; they will not update the database");

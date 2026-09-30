@@ -126,7 +126,15 @@ final class ThumbnailService {
 		while (workerRunning && (MonoTime.currTime < deadline)) {
 			serviceCondition.wait(dur!"msecs"(200));
 		}
-		if (workerRunning) addLogEntry("WARNING: On-demand: the thumbnail worker did not stop within 30 seconds");
+		if (workerRunning) {
+			addLogEntry("WARNING: On-demand: the thumbnail worker did not stop within 30 seconds");
+		} else if (worker !is null) {
+			// The worker has left its loop (and released its API instance); reap the thread
+			serviceMutex.unlock();
+			worker.join(false);
+			serviceMutex.lock();
+			worker = null;
+		}
 	}
 
 	private bool isShuttingDown() {

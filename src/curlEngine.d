@@ -13,6 +13,8 @@ import std.stdio;
 import std.range;
 import std.string : indexOf, toLower;
 import core.sys.posix.signal;
+import core.atomic;
+import core.memory : GC;
 // Required for WebSocket Support
 import core.stdc.stdlib : getenv;
 import core.stdc.string : strcmp;
@@ -52,6 +54,8 @@ extern(C) void curl_slist_free_all(curl_slist* list);
 
 // Shared pool of CurlEngine instances accessible across all threads
 __gshared CurlEngine[] curlEnginePool; // __gshared is used to declare a variable that is shared across all threads
+// Number of CurlEngine instances constructed and not yet destroyed (diagnostics)
+private shared long curlEnginesAlive = 0;
 
 private __gshared {
 	void*                 _curlLib;
@@ -600,11 +604,19 @@ class CurlEngine {
 		http = HTTP();   // Directly initializes HTTP using its default constructor
 		response = null; // Initialize as null
 		internalThreadId = generateAlphanumericString(); // Give this CurlEngine instance a unique ID
+		atomicOp!"+="(curlEnginesAlive, 1);
 		if ((debugLogging) && (debugHTTPSResponse)) {addLogEntry("Created new CurlEngine instance id: " ~ to!string(internalThreadId), ["debug"]);}
 	}
 
 	// The destructor should only clean up resources owned directly by this CurlEngine instance
 	~this() {
+		atomicOp!"-="(curlEnginesAlive, 1);
+		// When run by the GC as a finaliser (for example the final collection at process exit,
+		// after libcurl may already be unloaded) do not call into libcurl or touch other GC
+		// objects: the HTTP handle and response may already be finalised
+		if (GC.inFinalizer()) {
+			return;
+		}
 		// Is the file still open?
 		if (uploadFile.isOpen()) {
 			uploadFile.close();
@@ -1201,6 +1213,8 @@ CurlEngine getCurlInstance() {
 			if (curlEngine.http.isStopped) {
 				// return a new curl engine as a stopped one cannot be used
 				if ((debugLogging) && (debugHTTPSResponse)) {addLogEntry("CurlEngine was in a stopped state (not usable) - constructing a new CurlEngine instance", ["debug"]);}
+				// Destroy the discarded engine now, while libcurl is loaded, rather than leaving it to a GC finaliser
+				object.destroy(curlEngine);
 				return new CurlEngine;  // Constructs a new CurlEngine with a fresh HTTP instance
 			} else {
 				// When was this engine last used?
@@ -1224,6 +1238,8 @@ CurlEngine getCurlInstance() {
 					
 					curlEngine.cleanup(true); // Cleanup instance by resetting values and flushing cookie cache
 					curlEngine.shutdownCurlHTTPInstance();  // Assume proper cleanup of any resources used by HTTP
+					// Destroy the discarded engine now, while libcurl is loaded, rather than leaving it to a GC finaliser
+					object.destroy(curlEngine);
 					if ((debugLogging) && (debugHTTPSResponse)) {addLogEntry("Returning NEW curlEngine instance", ["debug"]);}
 					return new CurlEngine;  // Constructs a new CurlEngine with a fresh HTTP instance
 				} else {
@@ -1273,6 +1289,11 @@ void releaseAllCurlInstances() {
 	}
 	// Log that all curl engines have been released
 	if ((debugLogging) && (debugHTTPSResponse)) {addLogEntry("CurlEngine releaseAllCurlInstances() completed", ["debug"]);}
+}
+
+// Number of CurlEngine instances constructed and not yet destroyed
+long curlEngineInstancesAlive() {
+	return atomicLoad(curlEnginesAlive);
 }
 
 // Return how many curl engines there are

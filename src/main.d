@@ -3149,6 +3149,12 @@ void performSynchronisedExitProcess(string scopeCaller = null) {
 			// Release all CurlEngine instances
 			releaseAllCurlInstances();
 
+			// On-demand: every on-demand service is down now; report CurlEngine instances not yet destroyed
+			// (still held by an API object, or leaked to a GC finaliser)
+			if ((appConfig !is null) && appConfig.getValueBool("on_demand")) {
+				addLogEntry("On-demand: CurlEngine instances still alive at shutdown: " ~ to!string(curlEngineInstancesAlive()));
+			}
+
 			// Shutdown the client side filtering objects
 			shutdownSelectiveSync();
 
