@@ -189,7 +189,10 @@ class ExtensionTest(unittest.TestCase):
             callback(self.answer)
         self.x = ext.OneDriveOnDemandExtension(mounts=ext.MountTable(self.mounts_file),
                                                notifier=lambda t, b: self.notes.append((t, b)),
-                                               confirmer=confirmer)
+                                               confirmer=confirmer,
+                                               launcher=self.fake_launch)
+        self.launched = []
+        self.launch_error = None
         self.file = os.path.join(self.mount, "doc.txt")
         with open(self.file, "w"):
             pass
@@ -219,6 +222,8 @@ class ExtensionTest(unittest.TestCase):
     def tearDown(self):
         builtins.open, os.open = self._open, self._osopen
         ext.os.getxattr = self._getxattr
+        if self.x.transient_source is not None:
+            GLib.source_remove(self.x.transient_source)
         if self.x.refresh_source is not None:
             GLib.source_remove(self.x.refresh_source)
 
@@ -235,7 +240,7 @@ class ExtensionTest(unittest.TestCase):
         f = FakeFileInfo(self.file)
         self.x.update_file_info(f)
         self.assertEqual(f.emblems, ["weather-overcast-symbolic"])
-        self.assertEqual(f.attrs[ext.STATE_ATTRIBUTE], "Online only")
+        self.assertEqual(f.attrs[ext.STATE_ATTRIBUTE], "Available when online")
         # Folder: nothing known at first, async read, invalidate, then shown.
         d = FakeFileInfo(self.folder)
         self.x.update_file_info(d)
@@ -264,20 +269,20 @@ class ExtensionTest(unittest.TestCase):
     def test_menu_labels(self):
         items = menu_items(self.x.get_file_items([FakeFileInfo(self.file)])[0])
         self.assertEqual([item_label(i) for i in items],
-                         ["Download now", "Always keep on this device", "Free up space"])
+                         ["View online", "Download now", "Always keep on this device", "Free up space"])
         d = FakeFileInfo(self.folder)
         items = menu_items(self.x.get_file_items([d])[0])
-        self.assertEqual(item_label(items[1]), "Always keep on this device")  # state unknown yet
+        self.assertEqual(item_label(items[2]), "Always keep on this device")  # state unknown yet
         self.x.update_file_info(d)
         self.assertTrue(run_loop_until(lambda: d.invalidated == 1))
         items = menu_items(self.x.get_file_items([d])[0])
-        self.assertEqual(item_label(items[1]), "Stop keeping on this device")
+        self.assertEqual(item_label(items[2]), "Stop keeping on this device")
         bg = menu_items(self.x.get_background_items(FakeFileInfo(self.folder))[0])
-        self.assertEqual(len(bg), 3)
+        self.assertEqual(len(bg), 4)
 
     def test_mount_root_menu_only_download(self):
         bg = menu_items(self.x.get_background_items(FakeFileInfo(self.mount))[0])
-        self.assertEqual([item_label(i) for i in bg], ["Download now"])
+        self.assertEqual([item_label(i) for i in bg], ["View online", "Download now"])
         sel = menu_items(self.x.get_file_items([FakeFileInfo(self.mount + "/"),
                                                 FakeFileInfo(self.file)])[0])
         self.assertEqual([item_label(i) for i in sel], ["Download now"])
@@ -286,20 +291,20 @@ class ExtensionTest(unittest.TestCase):
         d = FakeFileInfo(self.folder)
         os.setxattr(self.folder, "user.onedrive.action", b"none")
         self.answer = False
-        activate(menu_items(self.x.get_background_items(d)[0])[2])
+        activate(menu_items(self.x.get_background_items(d)[0])[3])
         self.assertEqual(len(self.questions), 1)
         self.assertIn("Folder", self.questions[0])
         run_loop_until(lambda: False, timeout=0.2)
         self.assertEqual(self._getxattr(self.folder, "user.onedrive.action"), b"none")
         self.answer = True
-        activate(menu_items(self.x.get_file_items([d])[0])[2])
+        activate(menu_items(self.x.get_file_items([d])[0])[3])
         self.assertTrue(run_loop_until(lambda: d.invalidated == 1))
         self.assertEqual(self._getxattr(self.folder, "user.onedrive.action"), b"free")
         self.assertEqual(len(self.questions), 2)
 
     def test_free_file_no_question(self):
         f = FakeFileInfo(self.file)
-        activate(menu_items(self.x.get_file_items([f])[0])[2])
+        activate(menu_items(self.x.get_file_items([f])[0])[3])
         self.assertTrue(run_loop_until(lambda: f.invalidated == 1))
         self.assertEqual(self.questions, [])
         self.assertEqual(os.getxattr(self.file, "user.onedrive.action"), b"free")
@@ -314,10 +319,10 @@ class ExtensionTest(unittest.TestCase):
             self.assertEqual(got, [expected], program)
 
     def test_actions_write_xattr(self):
-        for target, index, expected in ((self.file, 0, b"download"),
-                                        (self.file, 1, b"pin"),
-                                        (self.folder, 1, b"unpin"),
-                                        (self.folder, 2, b"free")):
+        for target, index, expected in ((self.file, 1, b"download"),
+                                        (self.file, 2, b"pin"),
+                                        (self.folder, 2, b"unpin"),
+                                        (self.folder, 3, b"free")):
             f = FakeFileInfo(target)
             if f.is_directory() and f.get_uri() not in self.x.tracked:  # let the async read land
                 self.x.update_file_info(f)
@@ -360,6 +365,92 @@ class ExtensionTest(unittest.TestCase):
         self.x._refresh()
         run_loop_until(lambda: False, timeout=0.3)
         self.assertEqual(f.invalidated, 1)
+
+    def fake_launch(self, uri, callback, data):
+        self.launched.append(uri)
+        callback(self.launch_error, data)
+
+    def test_new_states(self):
+        for state, emblem, label in (
+                ("syncing", "emblem-synchronizing-symbolic", "Syncing"),
+                ("pending", "emblem-synchronizing-symbolic", "Waiting to sync"),
+                ("error", "dialog-error-symbolic", "Sync error"),
+                ("hydrated", "emblem-ok-symbolic", "Available on this device"),
+                ("pinned", "emblem-default-symbolic", "Always available on this device"),
+                ("local", "emblem-synchronizing-symbolic", "Not uploaded yet")):
+            os.setxattr(self.file, ext.STATE_XATTR, state.encode())
+            f = FakeFileInfo(self.file)
+            self.x.update_file_info(f)
+            self.assertEqual(f.emblems, [emblem], state)
+            self.assertEqual(f.attrs[ext.STATE_ATTRIBUTE], label, state)
+
+    def test_transient_refresh_until_settled(self):
+        os.setxattr(self.file, ext.STATE_XATTR, b"online-only")
+        f = FakeFileInfo(self.file)
+        self.x.update_file_info(f)
+        self.assertIsNone(self.x.transient_source)  # settled: no fast refresh
+        os.setxattr(self.file, ext.STATE_XATTR, b"syncing")
+        self.x.update_file_info(f)
+        self.assertIsNotNone(self.x.transient_source)
+        os.setxattr(self.file, ext.STATE_XATTR, b"pending")
+        self.assertEqual(self.x._refresh_transient(), GLib.SOURCE_CONTINUE)
+        self.assertTrue(run_loop_until(lambda: f.invalidated == 1))
+        os.setxattr(self.file, ext.STATE_XATTR, b"hydrated")
+        self.x._refresh_transient()
+        self.assertTrue(run_loop_until(lambda: f.invalidated == 2))
+        self.assertEqual(self.x._refresh_transient(), GLib.SOURCE_REMOVE)
+        self.x.transient_source = None
+        # a folder turning syncing (read async) also starts the fast refresh
+        os.setxattr(self.folder, ext.STATE_XATTR, b"syncing")
+        d = FakeFileInfo(self.folder)
+        self.x.update_file_info(d)
+        self.assertTrue(run_loop_until(lambda: d.invalidated == 1))
+        self.assertIsNotNone(self.x.transient_source)
+
+    def test_view_online_single_only(self):
+        items = menu_items(self.x.get_file_items([FakeFileInfo(self.file),
+                                                  FakeFileInfo(self.folder)])[0])
+        self.assertNotIn("View online", [item_label(i) for i in items])
+
+    def test_view_online_opens_url(self):
+        url = b"https://contoso-my.sharepoint.com/personal/a/Documents/doc%20x.txt?web=1"
+        os.setxattr(self.file, "user.onedrive.weburl", url)
+        activate(menu_items(self.x.get_file_items([FakeFileInfo(self.file)])[0])[0])
+        self.assertTrue(run_loop_until(lambda: self.launched))
+        self.assertEqual(self.launched, [url.decode()])
+        self.assertEqual(self.notes, [])
+        # folder, background menu
+        os.setxattr(self.folder, "user.onedrive.weburl", b"https://example.com/f")
+        activate(menu_items(self.x.get_background_items(FakeFileInfo(self.folder))[0])[0])
+        self.assertTrue(run_loop_until(lambda: len(self.launched) == 2))
+
+    def test_view_online_errors_notify(self):
+        # no weburl xattr: what GIO reports for ENODATA and EIO alike
+        activate(menu_items(self.x.get_file_items([FakeFileInfo(self.file)])[0])[0])
+        self.assertTrue(run_loop_until(lambda: self.notes))
+        self.assertIn("No web link", self.notes[0][1])
+        self.assertEqual(self.launched, [])
+        self.notes.clear()
+        os.setxattr(self.file, "user.onedrive.weburl", b"https://example.com/x")
+        self.launch_error = "no browser"
+        self.x.view_online(FakeFileInfo(self.file), self.file)
+        self.assertTrue(run_loop_until(lambda: self.notes))
+        self.assertIn("no browser", self.notes[0][1])
+        self.notes.clear()
+        gone = os.path.join(self.mount, "gone.txt")
+        self.x.view_online(FakeFileInfo(gone), gone)
+        self.assertTrue(run_loop_until(lambda: self.notes))
+
+    def test_launch_uri_reports_errors(self):
+        # An unknown scheme has no handler, so nothing is opened for real.
+        got = []
+        ext.launch_uri("x-onedrive-test-nohandler://x", lambda err, d: got.append((err, d)), 7)
+        self.assertTrue(run_loop_until(lambda: got))
+        self.assertIsNotNone(got[0][0])
+        self.assertEqual(got[0][1], 7)
+
+    def test_unescape_gio_string(self):
+        self.assertEqual(ext.unescape_gio_string("https://x/a\\x5cb\\xc3\\xa6"), "https://x/a\\bæ")
 
     def test_columns(self):
         cols = self.x.get_columns()
