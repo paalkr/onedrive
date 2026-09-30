@@ -2,8 +2,8 @@
 #
 # Shows the on-demand state of files and folders inside an onedrive
 # on-demand mount (fstype fuse.onedrive) and adds a "OneDrive" submenu to
-# the context menu: Download now, Always keep on this device / Stop keeping
-# on this device, Free up space.
+# the context menu: View online, Download now, Always keep on this device /
+# Stop keeping on this device, Free up space.
 #
 # Everything goes through extended attributes on the mount path
 # (user.onedrive.state to read, user.onedrive.action to act). The extension
@@ -35,6 +35,7 @@
 # zenity it is refused). The mount root only offers "Download now".
 
 import os
+import re
 import shutil
 import sys
 from collections import OrderedDict
@@ -50,10 +51,14 @@ STATE_XATTR = "user.onedrive.state"
 # GIO spelling of user.onedrive.action, used for async writes.
 ACTION_GIO_ATTR = "xattr::onedrive.action"
 STATE_GIO_ATTR = "xattr::onedrive.state"
+WEBURL_GIO_ATTR = "xattr::onedrive.weburl"
 STATE_ATTRIBUTE = "onedrive_state"
 
 MOUNT_CACHE_SECONDS = 2.0
 REFRESH_SECONDS = 5
+# Items in a transient state are re-read this often until they settle.
+TRANSIENT_REFRESH_SECONDS = 2
+TRANSIENT_STATES = ("syncing", "pending")
 # A folder's state is a subtree walk in the client; do not re-query a folder
 # more often than this when Nautilus asks again (e.g. after an invalidate).
 DIR_QUERY_MIN_SECONDS = 1.0
@@ -64,13 +69,20 @@ EMBLEMS = {
     "hydrated": "emblem-ok-symbolic",
     "pinned": "emblem-default-symbolic",
     "local": "emblem-synchronizing-symbolic",
+    "syncing": "emblem-synchronizing-symbolic",
+    "pending": "emblem-synchronizing-symbolic",
+    "error": "dialog-error-symbolic",
 }
 
+# Column text, in the Windows client's wording where it has one.
 LABELS = {
-    "online-only": "Online only",
+    "online-only": "Available when online",
     "hydrated": "Available on this device",
-    "pinned": "Always available",
+    "pinned": "Always available on this device",
     "local": "Not uploaded yet",
+    "syncing": "Syncing",
+    "pending": "Waiting to sync",
+    "error": "Sync error",
 }
 
 
@@ -200,7 +212,28 @@ def confirm_with_zenity(title, text, ok_label, callback, program="zenity"):
         callback(False)
 
 
+def launch_uri(uri, callback, data):
+    """Open uri with the default handler without blocking; callback(error
+    message or None, data)."""
+    def done(_source, result):
+        try:
+            Gio.AppInfo.launch_default_for_uri_finish(result)
+            callback(None, data)
+        except GLib.Error as e:
+            callback(e.message, data)
+
+    Gio.AppInfo.launch_default_for_uri_async(uri, None, None, done)
+
+
+def unescape_gio_string(value):
+    """GIO escapes backslashes and non-printable bytes in xattr strings as \\xNN."""
+    raw = re.sub(rb"\\x([0-9a-fA-F]{2})", lambda m: bytes([int(m.group(1), 16)]),
+                 value.encode("utf-8"))
+    return raw.decode("utf-8", "replace")
+
+
 ACTION_TITLES = {
+    "view": "View online",
     "download": "Download now",
     "pin": "Always keep on this device",
     "unpin": "Stop keeping on this device",
@@ -213,8 +246,10 @@ class OneDriveOnDemandExtension(GObject.GObject,
                                 Nautilus.MenuProvider,
                                 Nautilus.ColumnProvider):
 
-    def __init__(self, mounts=None, notifier=notify, confirmer=confirm_with_zenity):
+    def __init__(self, mounts=None, notifier=notify, confirmer=confirm_with_zenity,
+                 launcher=None):
         super().__init__()
+        self.launcher = launcher or launch_uri
         self.mounts = mounts or MountTable()
         self.notifier = notifier
         self.confirmer = confirmer
@@ -223,6 +258,7 @@ class OneDriveOnDemandExtension(GObject.GObject,
         # the last value read asynchronously.
         self.tracked = OrderedDict()
         self.refresh_source = None
+        self.transient_source = None
         self.pending = set()  # uris with a state query in flight
         self.fetched = {}  # uri -> monotonic time of the last async read
 
@@ -249,6 +285,24 @@ class OneDriveOnDemandExtension(GObject.GObject,
             self.tracked.popitem(last=False)
         if self.refresh_source is None:
             self.refresh_source = GLib.timeout_add_seconds(REFRESH_SECONDS, self._refresh)
+        self._watch_transient(state)
+
+    def _watch_transient(self, state):
+        if state in TRANSIENT_STATES and self.transient_source is None:
+            self.transient_source = GLib.timeout_add_seconds(TRANSIENT_REFRESH_SECONDS,
+                                                             self._refresh_transient)
+
+    def _refresh_transient(self):
+        """Re-read syncing/pending items; stops once none are left."""
+        busy = False
+        for uri, (file, path, state) in list(self.tracked.items()):
+            if state in TRANSIENT_STATES and not file.is_gone():
+                busy = True
+                self._query_async(uri, path)
+        if not busy:
+            self.transient_source = None
+            return GLib.SOURCE_REMOVE
+        return GLib.SOURCE_CONTINUE
 
     def _refresh(self):
         """Re-read the state of tracked files asynchronously (getxattr in a
@@ -291,6 +345,7 @@ class OneDriveOnDemandExtension(GObject.GObject,
             new_state = new_state.strip()
         if new_state != state:
             self.tracked[uri] = (file, path, new_state)
+            self._watch_transient(new_state)
             file.invalidate_extension_info()
 
     # ---- InfoProvider ----------------------------------------------------
@@ -376,13 +431,15 @@ class OneDriveOnDemandExtension(GObject.GObject,
         if not targets:
             return []
 
+        # "View online" first, as in the Windows client, for one item only.
+        actions = ("view",) if len(targets) == 1 else ()
         if any_root:
             # Pinning or freeing the whole drive is one click too easy.
-            actions = ("download",)
+            actions += ("download",)
         else:
             states = [self._known_state(file, path) for file, path in targets]
             pin_action = "unpin" if all(s == "pinned" for s in states) else "pin"
-            actions = ("download", pin_action, "free")
+            actions += ("download", pin_action, "free")
 
         top = Nautilus.MenuItem(name=name_prefix + "::menu", label="OneDrive",
                                 tip="OneDrive Files On-Demand", icon="")
@@ -396,6 +453,9 @@ class OneDriveOnDemandExtension(GObject.GObject,
         return [top]
 
     def _on_activate(self, _item, action, targets):
+        if action == "view":
+            self.view_online(*targets[0])
+            return
         try:
             folders = [path for file, path in targets if file.is_directory()]
         except Exception as e:
@@ -426,6 +486,46 @@ class OneDriveOnDemandExtension(GObject.GObject,
             self.confirmer("Free up space", text, "Free up space", answered)
         except Exception as e:
             log("confirmation failed: %s" % e)
+
+    def view_online(self, file, path):
+        """Read user.onedrive.weburl (a network call in the client, may take
+        seconds) in GIO's thread pool, then open it in the default browser."""
+        try:
+            Gio.File.new_for_path(path).query_info_async(
+                WEBURL_GIO_ATTR, Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_DEFAULT,
+                None, self._weburl_done, path)
+        except Exception as e:
+            self._view_failed(path, str(e))
+
+    def _view_failed(self, path, reason):
+        self.notifier("OneDrive: View online",
+                      "%s: %s" % (os.path.basename(path.rstrip("/")) or path, reason))
+
+    def _weburl_done(self, gfile, result, path):
+        try:
+            info = gfile.query_info_finish(result)
+            url = info.get_attribute_as_string(WEBURL_GIO_ATTR)
+        except GLib.Error as e:
+            self._view_failed(path, describe_error("view", e))
+            return
+        except Exception as e:
+            log("weburl query failed: %s" % e)
+            return
+        # GIO drops the attribute on any getxattr failure, so ENODATA (not
+        # uploaded yet) and EIO (offline) both end up here.
+        url = unescape_gio_string(url).strip() if url else ""
+        if not url.startswith(("https://", "http://")):
+            self._view_failed(path, "No web link available. The item may not be "
+                                    "uploaded yet, or OneDrive is offline.")
+            return
+        try:
+            self.launcher(url, self._launch_done, path)
+        except Exception as e:
+            self._view_failed(path, str(e))
+
+    def _launch_done(self, error, path):
+        if error is not None:
+            self._view_failed(path, "Could not open the browser: %s" % error)
 
     def run_action(self, file, path, action):
         """setxattr(user.onedrive.action) via GIO's thread pool, so a file
