@@ -3432,6 +3432,16 @@ class SyncEngine {
 					// There are elements to download
 					addLogEntry("Number of items to download from Microsoft OneDrive: " ~ to!string(fileJSONItemsToDownload.length));
 					downloadOneDriveItems();
+
+					// On-demand: an online change deferred because the file is open must be seen again by
+					// the next sync (also after a restart), so do not advance the delta checkpoint
+					if (onDemand && takeOnlineChangeDeferredFlag()) {
+						if (verboseLogging) {addLogEntry("On-demand: retaining the previous deltaLink because an online change was deferred for an open file", ["verbose"]);}
+						deltaLinkCache.driveId = null;
+						deltaLinkCache.itemId = null;
+						deltaLinkCache.latestDeltaLink = null;
+						latestDeltaLink = null;
+					}
 				}
 
 				// Cleanup array memory
@@ -4269,6 +4279,11 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
+		// On-demand: an error state is cleared when the item changes online
+		if (onDemand && (transientStateOfItem(existingDatabaseItem.driveId, existingDatabaseItem.id) == TransientState.error)) {
+			setTransientState(existingDatabaseItem.driveId, existingDatabaseItem.id, TransientState.none);
+		}
+
 		// On-demand: hold the state lock from the online-only check to the database write, so a
 		// hydration commit cannot land in between (DB metadata of one version with bytes of another)
 		Mutex onDemandLock = onDemand ? onDemandStateLock() : null;
@@ -4706,6 +4721,26 @@ class SyncEngine {
 			return;
 		}
 		canonicalFileExistedBeforeDownload = exists(newItemPath);
+
+		// On-demand: never replace a local file that is open. Defer the newer online version;
+		// it is re-evaluated when the last handle closes, and at every sync cycle while it stays open.
+		if (onDemand && canonicalFileExistedBeforeDownload && onDemandItemIsOpen(downloadDriveId, downloadItemId)) {
+			if (recordDeferredOnlineChange(downloadDriveId, downloadItemId, onedriveJSONItem, ignoreDataPreservationCheck)) {
+				addLogEntry("On-demand: " ~ newItemPath ~ " is open locally; the newer online version will be applied when it is closed");
+			}
+			return;
+		}
+		bool onDemandDownloadSucceeded = false;
+		if (onDemand) {
+			clearDeferredOnlineChange(downloadDriveId, downloadItemId);
+			setTransientState(downloadDriveId, downloadItemId, TransientState.syncing);
+		}
+		scope(exit) {
+			// A download deferred at commit time keeps its 'pending' state
+			if (onDemand && !hasDeferredOnlineChange(downloadDriveId, downloadItemId)) {
+				setTransientState(downloadDriveId, downloadItemId, (onDemandDownloadSucceeded || exitHandlerTriggered) ? TransientState.none : TransientState.error);
+			}
+		}
 		if (canonicalFileExistedBeforeDownload && ignoreDataPreservationCheck) {
 			// SharePoint enrichment downloads intentionally replace the file just uploaded.
 			// Capture its content now so a genuine user edit made during the replacement
@@ -4993,6 +5028,14 @@ class SyncEngine {
 							}
 						} // end of (!disableDownloadValidation)
 
+						// On-demand: the file may have been opened during the transfer; do not replace it
+						if (onDemand && exists(newItemPath) && onDemandItemIsOpen(downloadDriveId, downloadItemId)) {
+							if (recordDeferredOnlineChange(downloadDriveId, downloadItemId, onedriveJSONItem, ignoreDataPreservationCheck)) {
+								addLogEntry("On-demand: " ~ newItemPath ~ " was opened locally; the newer online version will be applied when it is closed");
+							}
+							return false;
+						}
+
 						// The completed download has passed integrity inspection. Re-evaluate the
 						// canonical path now, before onedrive.d is allowed to promote its private
 						// staging file. This preserves the transactional safeBackup behaviour.
@@ -5195,6 +5238,7 @@ class SyncEngine {
 			if (!downloadFailed) {
 				// Download did not fail
 				addLogEntry("Downloading file: " ~ newItemPath ~ " ... done", fileTransferNotifications());
+				onDemandDownloadSucceeded = true;
 
 				// As no download failure, calculate transfer metrics in a consistent manner
 				displayTransferMetrics(newItemPath, jsonFileSize, downloadTransferStartTime, downloadTransferEndTime, downloadWorkflowStartTime, Clock.currTime());
@@ -5751,6 +5795,48 @@ class SyncEngine {
 		if ((item.type != ItemType.dir) && (item.type != ItemType.root) && !((item.type == ItemType.remote) && (item.remoteType == ItemType.dir))) return false;
 		if (item.type == ItemType.remote) return subtreeHasOnlineOnlyItems(itemDB, item.remoteDriveId, item.remoteId);
 		return subtreeHasOnlineOnlyItems(itemDB, item.driveId, item.id);
+	}
+
+	// On-demand: apply online changes deferred while their file was open, now that it is closed.
+	// downloadFileItem() compares the local file with the database baseline at commit: an unchanged
+	// file is replaced; a locally changed file is preserved once as a safeBackup, then replaced.
+	void onDemandApplyReadyDeferredOnlineChanges() {
+		if (!onDemand) return;
+		foreach (deferred; takeReadyDeferredOnlineChanges()) {
+			addLogEntry("On-demand: applying the online change deferred while the file was open: " ~ deferred.onlineItem["name"].str);
+			try {
+				downloadFileItem(deferred.onlineItem, deferred.ignoreDataPreservationCheck);
+			} catch (Exception e) {
+				addLogEntry("On-demand: unable to apply a deferred online change: " ~ e.msg);
+			}
+		}
+	}
+
+	// On-demand: retry uploads refused because the item was checked out or locked online
+	void onDemandRetryDueLockedUploads() {
+		if (!onDemand) return;
+		foreach (retry; takeDueLockedUploads()) {
+			if (!exists(retry.localPath)) {
+				clearLockedUploadRetry(retry.driveId, retry.id);
+				setTransientState(retry.driveId, retry.id, TransientState.none);
+				continue;
+			}
+			addLogEntry("On-demand: retrying the upload of " ~ retry.localPath ~ " (checked out or locked online), attempt " ~ to!string(retry.attempts + 2));
+			try {
+				// Uploads only if the local file still differs from the database baseline
+				handleLocalFileTrigger([retry.localPath]);
+			} catch (Exception e) {
+				addLogEntry("On-demand: retrying the upload failed: " ~ e.msg);
+			}
+			// A new refusal re-registered the retry with a later due time; otherwise it is done
+			// (for example the local file already matches the database, so nothing was uploaded)
+			if (lockedUploadRetryAwaitingResult(retry.driveId, retry.id)) {
+				clearLockedUploadRetry(retry.driveId, retry.id);
+				if (transientStateOfItem(retry.driveId, retry.id) == TransientState.pending) {
+					setTransientState(retry.driveId, retry.id, TransientState.none);
+				}
+			}
+		}
 	}
 
 	// On-demand: record an existing item as online-only if its file is absent from the backing directory
@@ -6777,6 +6863,12 @@ class SyncEngine {
 
 		// What is the source of this item data?
 		string itemSource = "database";
+
+		// On-demand: an item with a deferred online change is open locally; it is handled when it is closed
+		if (onDemand && hasDeferredOnlineChange(dbItem.driveId, dbItem.id)) {
+			if (verboseLogging) {addLogEntry("On-demand: skipping consistency check for an open file with a deferred online change: " ~ localFilePath, ["verbose"]);}
+			return;
+		}
 
 		// On-demand: take a consistent snapshot of backing-file presence and the current database
 		// record, so a concurrent hydration or dehydration is never misread as a local change
@@ -8257,6 +8349,29 @@ class SyncEngine {
 		// Flag for if space is available online
 		bool spaceAvailableOnline = false;
 
+		// On-demand: 'syncing' while uploading; afterwards 'pending' when a locked-online retry is
+		// scheduled, 'error' when the upload failed, otherwise cleared
+		int lockedAttemptsBefore = -1;
+		if (onDemand) {
+			lockedAttemptsBefore = lockedUploadAttempts(changedItemDriveId, changedItemId);
+			setTransientState(changedItemDriveId, changedItemId, TransientState.syncing);
+		}
+		scope(exit) {
+			if (onDemand) {
+				int lockedAttemptsAfter = lockedUploadAttempts(changedItemDriveId, changedItemId);
+				bool lockedAgain = (lockedAttemptsAfter >= 0) && ((lockedAttemptsBefore < 0) || (lockedAttemptsAfter > lockedAttemptsBefore));
+				if (lockedAgain) {
+					setTransientState(changedItemDriveId, changedItemId, TransientState.pending);
+				} else if (uploadFailed || skippedMaxSize || skippedExceptionError) {
+					clearLockedUploadRetry(changedItemDriveId, changedItemId);
+					setTransientState(changedItemDriveId, changedItemId, TransientState.error);
+				} else {
+					clearLockedUploadRetry(changedItemDriveId, changedItemId);
+					setTransientState(changedItemDriveId, changedItemId, TransientState.none);
+				}
+			}
+		}
+
 		// Capture workflow and transfer timing for this upload
 		SysTime uploadStartTime = Clock.currTime();
 		SysTime uploadTransferStartTime = uploadStartTime;
@@ -8916,6 +9031,8 @@ class SyncEngine {
 						// The file is currently checked out or locked for editing by another user
 						// We cant upload this file at this time
 						addLogEntry("Unable to upload this modified file as this is currently checked out or locked for editing by another user: " ~ localFilePath);
+						// On-demand: retry soon (30 s, 60 s, 120 s, then the monitor interval)
+						if (onDemand) recordLockedUpload(dbItem.driveId, dbItem.id, localFilePath, dur!"seconds"(appConfig.getValueLong("monitor_interval")));
 					} else {
 						// Handle all other HTTP status codes
 						// - 408,429,503,504 errors are handled as a retry within uploadFileOneDriveApiInstance
@@ -8959,6 +9076,8 @@ class SyncEngine {
 						// The file is currently checked out or locked for editing by another user
 						// We cant upload this file at this time
 						addLogEntry("Unable to upload this modified file as this is currently checked out or locked for editing by another user: " ~ localFilePath);
+						// On-demand: retry soon (30 s, 60 s, 120 s, then the monitor interval)
+						if (onDemand) recordLockedUpload(dbItem.driveId, dbItem.id, localFilePath, dur!"seconds"(appConfig.getValueLong("monitor_interval")));
 						uploadFileOneDriveApiInstance.releaseCurlEngine();
 						uploadFileOneDriveApiInstance = null;
 						return uploadResponse;

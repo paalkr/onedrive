@@ -1746,6 +1746,11 @@ int main(string[] cliArgs) {
 					auto nextCheckTime = lastCheckTime + nextMonitorCheckInterval;
 					currentTime = MonoTime.currTime();
 					auto sleepTime = nextCheckTime - currentTime;
+					// On-demand: wake for the next locked-online upload retry
+					if (onDemandMountActive) {
+						Duration nextLockedRetry = nextLockedUploadDueIn();
+						if (nextLockedRetry < sleepTime) sleepTime = nextLockedRetry;
+					}
 					if (debugLogging) {addLogEntry("Sleep for " ~ to!string(sleepTime), ["debug"]);}
 					
 					bool websocketSupportActiveOrRetryable = !appConfig.getValueBool("upload_only") &&
@@ -2304,6 +2309,12 @@ void applyPendingLocalChanges(string invocationSource) {
 		syncEngineInstance.handleLocalFileTrigger(changedLocalFilesToUploadToOneDrive);
 		if (verboseLogging) {addLogEntry("[M] Total number of local file(s) added or changed: " ~ to!string(changedLocalFilesToUploadToOneDrive.length), ["verbose"]);}
 	}
+
+	// On-demand: online changes deferred while a file was open, and due locked-online upload retries
+	if (onDemandMountActive) {
+		syncEngineInstance.onDemandApplyReadyDeferredOnlineChanges();
+		syncEngineInstance.onDemandRetryDueLockedUploads();
+	}
 }
 
 void captureAndApplyInotifyEvents(string invocationSource) {
@@ -2430,6 +2441,9 @@ bool startOnDemand() {
 	itemDB.enableTransactionSerialisation();
 
 	onDemandChangeQueue = new OnDemandChangeQueue();
+	// The last close of a file with a deferred online change wakes the main thread to apply it
+	Tid mainThreadTid = thisTid;
+	setDeferredOnlineChangeReadyHandler(delegate() { send(mainThreadTid, OnDemandWake()); });
 	onDemandHydrationService = new HydrationService(appConfig, itemDB, backingDir);
 
 	addLogEntry("Starting Files On-Demand mount of " ~ mountPoint ~ " (backing directory: " ~ backingDir ~ ") ...");
@@ -2501,6 +2515,7 @@ void deferOnDemandDeletionIfNotApplied(string path) {
 	if (!itemDB.selectByPath(path, appConfig.defaultDriveId, item)) return;
 	addLogEntry("On-demand: the local deletion of " ~ path ~ " was not applied online; it will be retried on the next sync");
 	deferredOnDemandDeletions ~= DeferredOnDemandDeletion(path, item.driveId, item.id, item.eTag, 0);
+	setTransientState(item.driveId, item.id, TransientState.pending);
 }
 
 // On-demand: retry deferred local deletions. An entry is dropped when the item at its path is gone,
@@ -2542,6 +2557,12 @@ void retryDeferredOnDemandDeletions() {
 			continue;
 		}
 		stillDeferred ~= deletion;
+	}
+	// Deletions no longer deferred are no longer pending
+	foreach (deletion; deferredOnDemandDeletions) {
+		if (!stillDeferred.canFind!(kept => (kept.driveId == deletion.driveId) && (kept.id == deletion.id))) {
+			setTransientState(deletion.driveId, deletion.id, TransientState.none);
+		}
 	}
 	deferredOnDemandDeletions = stillDeferred;
 }
@@ -3217,6 +3238,7 @@ void shutdownFilesystemMonitor() {
 }
 
 void shutdownOnDemand() {
+	setDeferredOnlineChangeReadyHandler(null);
 	if (onDemandThumbnailService !is null) {
 		if (debugLogging) {addLogEntry("Shutting down on-demand thumbnail service", ["debug"]);}
 		onDemandThumbnailService.shutdown();
