@@ -326,6 +326,8 @@ class SyncEngine {
 	string debugLogBreakType2 = "===========================================================================================================";
 
 	private void notifyExpectedLocalDirectoryCreate(string path) {
+		// On-demand: the engine created this in the backing directory; report it to the mount
+		if (onDemand) reportBackingChange(path, OnDemandChangeKind.createDir, null, true);
 		if (recordExpectedLocalDirectoryCreate is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -336,6 +338,7 @@ class SyncEngine {
 	}
 
 	private void notifyExpectedLocalMove(string from, string to) {
+		if (onDemand) reportBackingChange(to, OnDemandChangeKind.moved, from, exists(to) && isDir(to));
 		if (recordExpectedLocalMove is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -356,6 +359,7 @@ class SyncEngine {
 	}
 
 	private void notifyExpectedLocalFileArrival(string path) {
+		if (onDemand) reportBackingChange(path, OnDemandChangeKind.changed);
 		if (recordExpectedLocalFileArrival is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -396,6 +400,7 @@ class SyncEngine {
 	}
 
 	private void notifyExpectedLocalFileDownload(string path, bool removedAfterDownload) {
+		if (onDemand) reportBackingChange(path, removedAfterDownload ? OnDemandChangeKind.deleted : OnDemandChangeKind.changed);
 		if ((recordExpectedLocalMove is null) &&
 			(recordExpectedLocalFileArrival is null) &&
 			(!removedAfterDownload || recordExpectedLocalRemoval is null)) {
@@ -418,7 +423,8 @@ class SyncEngine {
 		}
 	}
 
-	private void notifyExpectedLocalRemoval(string path) {
+	private void notifyExpectedLocalRemoval(string path, bool isDirectory = false) {
+		if (onDemand) reportBackingChange(path, OnDemandChangeKind.deleted, null, isDirectory);
 		if (recordExpectedLocalRemoval is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -6158,7 +6164,7 @@ class SyncEngine {
 							}
 						}
 						if (!exists(path)) {
-							notifyExpectedLocalRemoval(path);
+							notifyExpectedLocalRemoval(path, item.type != ItemType.file);
 						}
 					}
 				}
@@ -6227,7 +6233,7 @@ class SyncEngine {
 						// must remain intact until this operation succeeds.
 						recycleBinMoveSucceeded = movePathToRecycleBin(path);
 						if (recycleBinMoveSucceeded && !exists(path)) {
-							notifyExpectedLocalRemoval(path);
+							notifyExpectedLocalRemoval(path, item.type != ItemType.file);
 						}
 					}
 				}
@@ -7225,6 +7231,9 @@ class SyncEngine {
 				// holds online-only files is recreated rather than treated as a local deletion, which
 				// would delete those files online.
 				addLogEntry("On-demand: recreating missing backing directory that contains online-only files: " ~ localFilePath);
+				scope(success) {
+					if (exists(localFilePath)) reportBackingChange(localFilePath, OnDemandChangeKind.createDir, null, true);
+				}
 				try {
 					mkdirRecurse(localFilePath);
 					if (!appConfig.getValueBool("disable_permission_set")) {
