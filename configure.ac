@@ -349,11 +349,11 @@ AS_IF([test "x$enable_fuse" = "xyes"], [
   PKG_PROG_PKG_CONFIG
 
   # Require FUSE3 by default
-  PKG_CHECK_MODULES([FUSE], [fuse3], [
+  PKG_CHECK_MODULES([FUSE], [fuse3 >= 3.12], [
     have_fuse=yes
     AC_DEFINE([HAVE_FUSE], [1], [Define if FUSE support is enabled])
   ], [
-	AC_MSG_ERROR([libfuse3 development files not found. Please install fuse3-devel (Red Hat | Fedora | CentOS), libfuse3-dev (Debian | Ubuntu), fuse3 (Arch | Manjaro) or rerun with --disable-fuse])
+	AC_MSG_ERROR([libfuse3 (3.12 or newer) development files not found. Please install fuse3-devel (Red Hat | Fedora | CentOS), libfuse3-dev (Debian | Ubuntu), fuse3 (Arch | Manjaro) or rerun with --disable-fuse])
   ])
 ])
 
