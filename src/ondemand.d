@@ -58,7 +58,12 @@ enum uint onDemandMaxWorkerThreads = 64;
 private struct Pretend {
 	bool present;        // false: does not exist yet (create, mkdir, rename target)
 	stat_t st;           // attributes shown while present (a deleted or moved-away entry)
+	ulong seq;           // the touch that needs it; dropped once that touch has run
+	MonoTime since;
 }
+
+// Backstop: a pretend entry older than this is dropped even if its touch never reported back
+private enum pretendExpiry = dur!"seconds"(10);
 
 // The database item that was at a path when it was moved away or replaced
 private struct StalePath {
@@ -482,6 +487,18 @@ final class OnDemandFs : Operations
 		synchronized (touchLock) pretend.remove(path.idup);
 	}
 
+	// Caller holds touchLock. Drops entries whose touch has run (whether or not the kernel
+	// asked us: it may answer mkdir with EEXIST or O_CREAT with an open from a dentry it
+	// cached again) or that are too old.
+	private void purgePretendLocked() {
+		ulong completed = mount.completedTouches();
+		auto cutoff = MonoTime.currTime - pretendExpiry;
+		string[] done;
+		foreach (path, entry; pretend)
+			if (entry.seq <= completed || entry.since < cutoff) done ~= path;
+		foreach (path; done) pretend.remove(path);
+	}
+
 	private stat_t presentAs(string mountPath, bool isDirectory) {
 		stat_t st;
 		if (lstatPath(backingPath(mountPath), st)) return st;
@@ -490,6 +507,33 @@ final class OnDemandFs : Operations
 		st.st_uid = getuid();
 		st.st_gid = getgid();
 		return st;
+	}
+
+	private bool touchQueueFullLogged;
+
+	// Caller holds touchLock. Queues a touch; pretends are the entries it needs
+	private void queueTouchLocked(Touch kind, string path, string oldPath, long mtime,
+			string backingCheck, Pretend[string] pretends) {
+		auto now = MonoTime.currTime;
+		// Recorded before the touch can run; its seq is known only once it is queued
+		foreach (p, entry; pretends) {
+			entry.seq = ulong.max;
+			entry.since = now;
+			pretend[p] = entry;
+		}
+		bool dropped;
+		ulong seq = mount.queueTouch(kind, path, oldPath, mtime, backingCheck, dropped);
+		foreach (p, _; pretends) {
+			if (seq == 0) pretend.remove(p);
+			else pretend[p].seq = seq;
+		}
+		if (dropped && !touchQueueFullLogged) {
+			addLogEntry("On-demand: more than " ~ to!string(BackgroundFuse.maxQueuedTouches)
+				~ " file manager notifications queued, dropping the oldest");
+			touchQueueFullLogged = true;
+		} else if (!dropped) {
+			touchQueueFullLogged = false;
+		}
 	}
 
 	// See notifyBackingChange()
@@ -504,46 +548,47 @@ final class OnDemandFs : Operations
 		stat_t st;
 		bool exists = lstatPath(backingPath(p), st);
 		bool dir = exists ? (st.st_mode & S_IFMT) == S_IFDIR : isDirectory;
-		final switch (kind) {
-			case OnDemandChangeKind.changed:
-			case OnDemandChangeKind.createDir:
-				if (!exists) return;
-				synchronized (touchLock) pretend[p] = Pretend(false);
-				if (dir) {
-					mount.queueTouch(Touch.mkdir, p);
-				} else {
-					// Reported as created, which a file manager also takes as "reload this file",
-					// then with its attributes so a replaced file shows its new size and time
-					mount.queueTouch(Touch.create, p);
-					mount.queueTouch(Touch.attrib, p, null, st.st_mtime);
-				}
-				break;
-			case OnDemandChangeKind.deleted:
-				if (exists) return;
-				// Freed (dehydrated) or not downloaded: the file is gone from the backing dir but
-				// still in the mount as online-only; report a change, not a delete
-				stat_t visible;
-				bool stillShown = true;
-				try getattr(p, visible);
-				catch (FuseException e) stillShown = false;
-				if (stillShown) {
-					mount.queueTouch(Touch.attrib, p, null, visible.st_mtime);
+		// Freed (dehydrated) or not downloaded: the file is gone from the backing dir but still
+		// in the mount as online-only; report a change, not a delete
+		stat_t visible;
+		bool stillShown = false;
+		if (kind == OnDemandChangeKind.deleted && !exists) {
+			stillShown = true;
+			try getattr(p, visible);
+			catch (FuseException e) stillShown = false;
+		}
+		synchronized (touchLock) {
+			purgePretendLocked();
+			final switch (kind) {
+				case OnDemandChangeKind.changed:
+				case OnDemandChangeKind.createDir:
+					if (!exists) return;
+					if (dir) {
+						queueTouchLocked(Touch.mkdir, p, null, 0, null, [p: Pretend(false)]);
+					} else {
+						// Reported as created, which a file manager also takes as "reload this
+						// file", then with its attributes so a replaced file shows its new size
+						queueTouchLocked(Touch.create, p, null, 0, null, [p: Pretend(false)]);
+						queueTouchLocked(Touch.attrib, p, null, st.st_mtime, null, null);
+					}
 					break;
-				}
-				synchronized (touchLock) pretend[p] = Pretend(true, presentAs(p, isDirectory));
-				mount.queueTouch(dir ? Touch.rmdir : Touch.unlink, p);
-				break;
-			case OnDemandChangeKind.moved:
-				if (!exists || oldPath is null) return;
-				string o = mountPath(oldPath);
-				synchronized (touchLock) {
-					pretend[o] = Pretend(true, st);
-					pretend[p] = Pretend(false);
-				}
-				mount.queueTouch(Touch.rename, p, o);
-				// The kernel keeps the attributes it was shown for the old name; refresh them
-				if (!dir) mount.queueTouch(Touch.attrib, p, null, st.st_mtime);
-				break;
+				case OnDemandChangeKind.deleted:
+					if (exists) return;
+					if (stillShown) {
+						queueTouchLocked(Touch.attrib, p, null, visible.st_mtime, null, null);
+						break;
+					}
+					queueTouchLocked(dir ? Touch.rmdir : Touch.unlink, p, null, 0, backingPath(p),
+						[p: Pretend(true, presentAs(p, isDirectory))]);
+					break;
+				case OnDemandChangeKind.moved:
+					if (!exists || oldPath is null) return;
+					string o = mountPath(oldPath);
+					queueTouchLocked(Touch.rename, p, o, 0, null, [o: Pretend(true, st), p: Pretend(false)]);
+					// The kernel keeps the attributes it was shown for the old name; refresh them
+					if (!dir) queueTouchLocked(Touch.attrib, p, null, st.st_mtime, null, null);
+					break;
+			}
 		}
 	}
 
@@ -554,6 +599,7 @@ final class OnDemandFs : Operations
 			Pretend p;
 			bool found;
 			synchronized (touchLock) {
+				purgePretendLocked();
 				if (auto q = path in pretend) {
 					p = *q;
 					found = true;
@@ -648,6 +694,14 @@ final class OnDemandFs : Operations
 		if (isEnginePartial(path)) fail(ENOENT);
 		auto h = new Handle();
 		h.flags = fi.flags;
+		if (isTouchRequest()) {
+			// A touch create answered from a dentry the kernel cached again: no side effects
+			h.touch = true;
+			h.fd = core.sys.posix.fcntl.open(toStringz(backingPath(path)), O_RDONLY | O_NOFOLLOW);
+			if (h.fd == -1) fail(ENOENT);
+			addHandle(fi, h);
+			return;
+		}
 		bool truncating = (fi.flags & O_TRUNC) && (fi.flags & O_ACCMODE) != O_RDONLY;
 		if (!existsPath(backingPath(path))) {
 			Item item;
@@ -678,10 +732,13 @@ final class OnDemandFs : Operations
 		auto h = new Handle();
 		h.flags = fi.flags;
 		if (isTouchRequest()) {
-			// The file is already in the backing dir; this open only makes the kernel report it
+			// The file is already in the backing dir; this open only makes the kernel report it.
+			// Never create one: a touch that outlived its file must not leave an empty file
+			// behind for the engine to upload.
 			endPretend(path);
 			h.touch = true;
-			h.fd = core.sys.posix.fcntl.open(toStringz(backingPath(path)), O_RDONLY);
+			h.fd = core.sys.posix.fcntl.open(toStringz(backingPath(path)), O_RDONLY | O_NOFOLLOW);
+			if (h.fd == -1) fail(EIO);
 			addHandle(fi, h);
 			return;
 		}
@@ -762,13 +819,15 @@ final class OnDemandFs : Operations
 			h.fd = -1;
 		}
 		if (h.touch) return;
+		// The change first: the last noteClose lets the engine apply an online change it
+		// deferred while the file was open, and it must already know about the local edit.
+		// A null path means the file was unlinked while open; the delete was already reported.
+		if (h.written && path !is null) emit(OnDemandChangeKind.changed, path);
 		// The item recorded at open, even if it has been moved or deleted since
 		if (h.openId.length) {
 			try hydration.noteClose(h.openDriveId, h.openId);
 			catch (HydrationError e) addLogEntry("On-demand: noteClose failed for " ~ h.openId ~ ": " ~ e.msg);
 		}
-		// A null path means the file was unlinked while open; the delete was already reported
-		if (h.written && path !is null) emit(OnDemandChangeKind.changed, path);
 	}
 
 	override void mkdir(const(char)[] path, uint mode) {
@@ -1097,7 +1156,8 @@ void startOnDemandMount(ItemDatabase itemDB, HydrationService hydration, OnDeman
 	// Downloads and web URL lookups block their worker thread; with libfuse's default of 10
 	// workers ten of them would stall every other request (ls, stat) on the mount
 	mount.start(fs, "onedrive", mountPoint, ["fsname=onedrive", "subtype=onedrive", "default_permissions"], onDemandMaxWorkerThreads);
-	mount.startNotifier();
+	if (!mount.startNotifier())
+		addLogEntry("WARNING: On-demand: could not start the file manager notification thread; changes made by the client will not show in file managers until they reload");
 	activeFs = fs;
 	activeMount = mount;
 	addLogEntry("On-demand filesystem mounted: " ~ mountPoint);
