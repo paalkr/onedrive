@@ -2490,6 +2490,11 @@ bool startOnDemand() {
 	}
 	onDemandMountActive = true;
 	addLogEntry("Files On-Demand mount is active: " ~ mountPoint);
+	// Changes the engine makes directly in the backing directory are repeated on the mount for its
+	// inotify watchers (file managers). Wired when the FUSE layer provides the call.
+	static if (__traits(compiles, &ondemand.notifyBackingChange)) {
+		setBackingChangeNotifier(&ondemand.notifyBackingChange);
+	}
 	if (appConfig.getValueBool("on_demand_thumbnails")) {
 		onDemandThumbnailService = ThumbnailService.create(appConfig, itemDB, mountPoint);
 		if (onDemandThumbnailService !is null) {
@@ -3264,6 +3269,7 @@ void shutdownFilesystemMonitor() {
 }
 
 void shutdownOnDemand() {
+	setBackingChangeNotifier(null);
 	setDeferredOnlineChangeReadyHandler(null);
 	if (itemDB !is null) itemDB.itemDeletedHandler = null;
 	if (onDemandThumbnailService !is null) {

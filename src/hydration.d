@@ -44,6 +44,30 @@ class HydrationError : Exception {
 	}
 }
 
+// Reports a change the engine or HydrationService made directly in the backing directory to the
+// mount, so inotify watchers of the mount (file managers) see it. Set by main.d to the FUSE layer's
+// notifyBackingChange; null (no-op) when no mount runs. Never call it for a change that came
+// through the mount.
+alias BackingChangeNotifier = void function(string path, OnDemandChangeKind kind, string oldPath, bool isDirectory);
+private __gshared BackingChangeNotifier backingChangeNotifier;
+
+void setBackingChangeNotifier(BackingChangeNotifier notifier) {
+	backingChangeNotifier = notifier;
+}
+
+// 'path' and 'oldPath' are relative to the backing directory ("a/b" or "./a/b")
+void reportBackingChange(string path, OnDemandChangeKind kind, string oldPath = null, bool isDirectory = false) {
+	BackingChangeNotifier notifier = backingChangeNotifier;
+	if (notifier is null) return;
+	notifier(backingRelativeChangePath(path), kind, oldPath.empty ? null : backingRelativeChangePath(oldPath), isDirectory);
+}
+
+private string backingRelativeChangePath(string path) {
+	string normalised = buildNormalizedPath(path);
+	if ((normalised == ".") || startsWith(normalised, "./")) return normalised;
+	return "./" ~ normalised;
+}
+
 // Actions requested through the mount (user.onedrive.action) or the CLI
 enum OnDemandAction { download, pin, unpin, free }
 
@@ -704,6 +728,7 @@ final class HydrationService {
 			addLogEntry("On-demand: unable to free up space for " ~ backingPath ~ ": " ~ e.msg);
 			throw new HydrationError(EIO, "Unable to remove the backing file: " ~ e.msg);
 		}
+		reportBackingChange(relativePath(backingPath, backingDir), OnDemandChangeKind.deleted);
 		if (verboseLogging) {addLogEntry("On-demand: freed up space for " ~ backingPath, ["verbose"]);}
 		return true;
 	}
@@ -1317,6 +1342,7 @@ final class HydrationService {
 		} catch (FileException e) {
 			throw new HydrationError(EIO, "Unable to move hydrated file into the backing directory: " ~ e.msg);
 		}
+		reportBackingChange(relativePath(backingPath, backingDir), OnDemandChangeKind.changed);
 
 		bool pinned = (currentItem.hydration == hydrationPinned) || isPinnedOrHasPinnedAncestor(itemDB, driveId, id);
 		itemDB.setHydration(driveId, id, pinned ? hydrationPinned : hydrationHydrated);

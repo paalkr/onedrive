@@ -326,6 +326,8 @@ class SyncEngine {
 	string debugLogBreakType2 = "===========================================================================================================";
 
 	private void notifyExpectedLocalDirectoryCreate(string path) {
+		// On-demand: the engine created this in the backing directory; report it to the mount
+		if (onDemand) reportBackingChange(path, OnDemandChangeKind.createDir, null, true);
 		if (recordExpectedLocalDirectoryCreate is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -336,6 +338,7 @@ class SyncEngine {
 	}
 
 	private void notifyExpectedLocalMove(string from, string to) {
+		if (onDemand) reportBackingChange(to, OnDemandChangeKind.moved, from, exists(to) && isDir(to));
 		if (recordExpectedLocalMove is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -356,6 +359,7 @@ class SyncEngine {
 	}
 
 	private void notifyExpectedLocalFileArrival(string path) {
+		if (onDemand) reportBackingChange(path, OnDemandChangeKind.changed);
 		if (recordExpectedLocalFileArrival is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -396,6 +400,7 @@ class SyncEngine {
 	}
 
 	private void notifyExpectedLocalFileDownload(string path, bool removedAfterDownload) {
+		if (onDemand) reportBackingChange(path, removedAfterDownload ? OnDemandChangeKind.deleted : OnDemandChangeKind.changed);
 		if ((recordExpectedLocalMove is null) &&
 			(recordExpectedLocalFileArrival is null) &&
 			(!removedAfterDownload || recordExpectedLocalRemoval is null)) {
@@ -418,7 +423,8 @@ class SyncEngine {
 		}
 	}
 
-	private void notifyExpectedLocalRemoval(string path) {
+	private void notifyExpectedLocalRemoval(string path, bool isDirectory = false) {
+		if (onDemand) reportBackingChange(path, OnDemandChangeKind.deleted, null, isDirectory);
 		if (recordExpectedLocalRemoval is null) return;
 		expectedLocalEffectMutex.lock();
 		try {
@@ -6158,7 +6164,7 @@ class SyncEngine {
 							}
 						}
 						if (!exists(path)) {
-							notifyExpectedLocalRemoval(path);
+							notifyExpectedLocalRemoval(path, item.type != ItemType.file);
 						}
 					}
 				}
@@ -6227,7 +6233,7 @@ class SyncEngine {
 						// must remain intact until this operation succeeds.
 						recycleBinMoveSucceeded = movePathToRecycleBin(path);
 						if (recycleBinMoveSucceeded && !exists(path)) {
-							notifyExpectedLocalRemoval(path);
+							notifyExpectedLocalRemoval(path, item.type != ItemType.file);
 						}
 					}
 				}
@@ -7225,6 +7231,9 @@ class SyncEngine {
 				// holds online-only files is recreated rather than treated as a local deletion, which
 				// would delete those files online.
 				addLogEntry("On-demand: recreating missing backing directory that contains online-only files: " ~ localFilePath);
+				scope(success) {
+					if (exists(localFilePath)) reportBackingChange(localFilePath, OnDemandChangeKind.createDir, null, true);
+				}
 				try {
 					mkdirRecurse(localFilePath);
 					if (!appConfig.getValueBool("disable_permission_set")) {
@@ -8449,12 +8458,15 @@ class SyncEngine {
 		// On-demand: 'syncing' while uploading; afterwards 'pending' when a locked-online retry is
 		// scheduled, 'error' when the upload failed, otherwise cleared
 		int lockedAttemptsBefore = -1;
+		// On-demand: set when the upload was skipped for a newer online version (the apply of that
+		// version then owns the transient state)
+		bool onDemandConflictHandled = false;
 		if (onDemand) {
 			lockedAttemptsBefore = lockedUploadAttempts(changedItemDriveId, changedItemId);
 			setTransientState(changedItemDriveId, changedItemId, TransientState.syncing);
 		}
 		scope(exit) {
-			if (onDemand) {
+			if (onDemand && !onDemandConflictHandled) {
 				int lockedAttemptsAfter = lockedUploadAttempts(changedItemDriveId, changedItemId);
 				bool lockedAgain = (lockedAttemptsAfter >= 0) && ((lockedAttemptsBefore < 0) || (lockedAttemptsAfter > lockedAttemptsBefore));
 				if (lockedAgain || hasDeferredOnlineChange(changedItemDriveId, changedItemId)) {
@@ -8652,7 +8664,20 @@ class SyncEngine {
 			if (thisFileSizeLocal <= maxUploadFileSize) {
 				// Attempt to upload the modified file
 				// Error handling is in performModifiedFileUpload(), and the JSON that is responded with - will either be null or a valid JSON object containing the upload result
-				uploadResponse = performModifiedFileUpload(dbItem, localFilePath, thisFileSizeLocal, simpleUploadUsed, uploadTransferStartTime, uploadTransferEndTime);
+				string onDemandConflictCopy;
+				uploadResponse = performModifiedFileUpload(dbItem, localFilePath, thisFileSizeLocal, simpleUploadUsed, uploadTransferStartTime, uploadTransferEndTime, onDemandConflictCopy);
+
+				// On-demand: the upload was deliberately not performed because the online version is newer;
+				// the local version was kept as a conflict copy. This is not a failed upload.
+				if (!onDemandConflictCopy.empty) {
+					onDemandConflictHandled = true;
+					clearLockedUploadRetry(changedItemDriveId, changedItemId);
+					if (transientStateOfItem(changedItemDriveId, changedItemId) == TransientState.syncing) {
+						setTransientState(changedItemDriveId, changedItemId, TransientState.none);
+					}
+					addLogEntry("Not uploading modified file: " ~ localFilePath ~ ": the online version is newer; the local version was kept as " ~ onDemandConflictCopy, ["info", "notify"]);
+					return;
+				}
 
 				// Evaluate the returned JSON uploadResponse
 				// If there was an error uploading the file, uploadResponse should be empty and invalid
@@ -8935,7 +8960,7 @@ class SyncEngine {
 	}
 
 	// Perform the upload of a locally modified file to OneDrive
-	JSONValue performModifiedFileUpload(Item dbItem, string localFilePath, long thisFileSizeLocal, out bool simpleUploadUsed, out SysTime uploadTransferStartTime, out SysTime uploadTransferEndTime) {
+	JSONValue performModifiedFileUpload(Item dbItem, string localFilePath, long thisFileSizeLocal, out bool simpleUploadUsed, out SysTime uploadTransferStartTime, out SysTime uploadTransferEndTime, out string onDemandConflictCopy) {
 		// Function Start Time
 		SysTime functionStartTime;
 		string logKey;
@@ -9034,6 +9059,7 @@ class SyncEngine {
 							return uploadResponse;
 						}
 						uploadNewFile(backupPath);
+						onDemandConflictCopy = backupPath;
 						// The deferral (if any) is resolved by applying the current online version now
 						onDemandForgetDeferral(dbItem.driveId, dbItem.id);
 						downloadFileItem(currentOnlineJSONData, true);
