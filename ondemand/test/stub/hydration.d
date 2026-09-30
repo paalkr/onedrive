@@ -89,6 +89,7 @@ final class HydrationService
 	private bool[string] inFlight;
 	private bool stopping;
 	private uint[string] downloads;
+	private uint[string] openCount;
 
 	this(ApplicationConfig appConfig, ItemDatabase itemDB, string backingDir)
 	{
@@ -254,6 +255,8 @@ final class HydrationService
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
+		if (openCount.get(key(driveId, id), 0) > 0)
+			throw new HydrationError(errno.EBUSY, "refused to free open " ~ id);
 		if (stateLocked(driveId, id) != HydrationState.hydrated)
 			return false;
 		string target = targetOf(driveId, id);
@@ -288,6 +291,37 @@ final class HydrationService
 		itemDB.setHydration(driveId, id, absent ? "O" : "H");
 	}
 
+	/* Open handles through the mount (engine R1): cheap, never throw; while
+	   an item is open dehydrate() and a single-file free throw EBUSY */
+	void noteOpen(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		openCount[key(driveId, id)] = openCount.get(key(driveId, id), 0) + 1;
+		stderr.writeln("STUB noteOpen ", id, " ", openCount[key(driveId, id)]);
+	}
+
+	void noteClose(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		auto k = key(driveId, id);
+		if (openCount.get(k, 0) == 0)
+		{
+			stderr.writeln("STUB noteClose UNBALANCED ", id);
+			return;
+		}
+		if (--openCount[k] == 0) openCount.remove(k);
+		stderr.writeln("STUB noteClose ", id, " ", openCount.get(k, 0));
+	}
+
+	private bool isOpen(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		return openCount.get(key(driveId, id), 0) > 0;
+	}
+
 	/* Iteration 2 action API (engine 8e826fa). Unlike the engine, file
 	   download/pin and directory actions run synchronously in the caller
 	   instead of on a background worker, so tests can check the result at
@@ -312,6 +346,8 @@ final class HydrationService
 				case OnDemandAction.pin: pin(driveId, id); break;
 				case OnDemandAction.unpin: unpin(driveId, id); break;
 				case OnDemandAction.free:
+					if (isOpen(driveId, id))
+						throw new HydrationError(errno.EBUSY, "refused to free open " ~ id);
 					if (pinnedOrPinnedAncestor(driveId, id))
 						throw new HydrationError(errno.EBUSY, "refused to free pinned " ~ id);
 					if (stateOf(driveId, id) == HydrationState.onlineOnly) {
