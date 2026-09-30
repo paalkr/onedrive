@@ -50,6 +50,9 @@ __gshared uint onDemandPendingMoveWaitSeconds = 30;
 // expire: showing them again would let a read download to the old path (see resolveSettled).
 __gshared uint onDemandPendingExpirySeconds = 300;
 
+// Most FUSE worker threads at once
+enum uint onDemandMaxWorkerThreads = 64;
+
 // The database item that was at a path when it was moved away or replaced
 private struct StalePath {
 	string key;
@@ -70,6 +73,7 @@ private string generationOf(const ref Item item) {
 private enum pinXattr = "user.onedrive.pin";
 private enum stateXattr = "user.onedrive.state";
 private enum actionXattr = "user.onedrive.action";
+private enum weburlXattr = "user.onedrive.weburl";
 private enum FUSE_CAP_ATOMIC_O_TRUNC = 1 << 3;
 private enum fileMode = octal!600;
 private enum dirMode = octal!700;
@@ -790,10 +794,21 @@ final class OnDemandFs : Operations
 			getattr(path, st);   // ENOENT if the path does not exist at all
 			return "local";
 		}
-		// For a directory stateOf() aggregates: pinned if it is pinned, else online-only
-		// if any file below it is, else hydrated
 		string driveId = item.type == ItemType.remote ? item.remoteDriveId : item.driveId;
 		string id = item.type == ItemType.remote ? item.remoteId : item.id;
+		// An upload or download in progress, a queued or retried change, or a failure takes
+		// precedence over the stored state. The engine aggregates directories.
+		TransientState transient;
+		try transient = hydration.transientStateOf(driveId, id);
+		catch (HydrationError e) return "local";
+		final switch (transient) {
+			case TransientState.syncing: return "syncing";
+			case TransientState.pending: return "pending";
+			case TransientState.error: return "error";
+			case TransientState.none: break;
+		}
+		// For a directory stateOf() aggregates: pinned if it is pinned, else online-only
+		// if any file below it is, else hydrated
 		HydrationState state;
 		try state = hydration.stateOf(driveId, id);
 		catch (HydrationError e) return "local";
@@ -849,6 +864,7 @@ final class OnDemandFs : Operations
 		if (name == pinXattr) return cast(const(ubyte)[]) (stateName(path) == "pinned" ? "1" : "0");
 		// Write-only
 		if (name == actionXattr) fail(ENODATA);
+		if (name == weburlXattr) return cast(const(ubyte)[]) webUrl(path);
 		string target = backingPath(path);
 		if (!existsPath(target)) fail(ENODATA);
 		auto size = lgetxattr(toStringz(target), toStringz(name), null, 0);
@@ -859,8 +875,25 @@ final class OnDemandFs : Operations
 		return value[0 .. size];
 	}
 
+	// user.onedrive.weburl: the item's OneDrive web URL. The lookup may take a network round
+	// trip; it blocks only this request's worker thread (see onDemandMaxWorkerThreads).
+	private string webUrl(const(char)[] path) {
+		Item item;
+		if (!resolve(path, item)) {
+			stat_t st;
+			getattr(path, st);   // ENOENT if the path does not exist at all
+			fail(ENODATA);       // not uploaded yet: no URL
+		}
+		try {
+			return hydration.webUrlOf(item.driveId, item.id);
+		} catch (HydrationError e) {
+			fail(e.errnoCode ? e.errnoCode : EIO);
+			assert(0);
+		}
+	}
+
 	override void setxattr(const(char)[] path, const(char)[] name, in ubyte[] value, int flags) {
-		if (name == stateXattr) fail(EPERM);
+		if (name == stateXattr || name == weburlXattr) fail(EPERM);
 		auto v = cast(const(char)[]) value;
 		if (name == actionXattr) {
 			OnDemandAction action;
@@ -880,7 +913,8 @@ final class OnDemandFs : Operations
 	}
 
 	// Lists user.onedrive.state only: action is write-only and pin a legacy alias, and
-	// listing them would make "getfattr -d" fail or show a duplicate of the state
+	// listing them would make "getfattr -d" fail or show a duplicate of the state.
+	// weburl is not listed because reading it costs a network request.
 	override string[] listxattr(const(char)[] path) {
 		stat_t st;
 		getattr(path, st);
@@ -902,7 +936,7 @@ final class OnDemandFs : Operations
 	}
 
 	override void removexattr(const(char)[] path, const(char)[] name) {
-		if (name == stateXattr || name == pinXattr || name == actionXattr) fail(EPERM);
+		if (name == stateXattr || name == pinXattr || name == actionXattr || name == weburlXattr) fail(EPERM);
 		string target = backingPath(path);
 		if (!existsPath(target)) fail(ENODATA);
 		check(lremovexattr(toStringz(target), toStringz(name)));
@@ -920,7 +954,9 @@ void startOnDemandMount(ItemDatabase itemDB, HydrationService hydration, OnDeman
 	if (activeMount !is null && activeMount.mounted()) throw new Exception("On-demand filesystem is already mounted");
 	auto fs = new OnDemandFs(itemDB, hydration, changes, mainTid, backingDir, rootDriveId, rootId);
 	auto mount = new BackgroundFuse();
-	mount.start(fs, "onedrive", mountPoint, ["fsname=onedrive", "subtype=onedrive", "default_permissions"]);
+	// Downloads and web URL lookups block their worker thread; with libfuse's default of 10
+	// workers ten of them would stall every other request (ls, stat) on the mount
+	mount.start(fs, "onedrive", mountPoint, ["fsname=onedrive", "subtype=onedrive", "default_permissions"], onDemandMaxWorkerThreads);
 	activeFs = fs;
 	activeMount = mount;
 	addLogEntry("On-demand filesystem mounted: " ~ mountPoint);

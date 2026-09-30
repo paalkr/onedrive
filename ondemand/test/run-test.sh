@@ -52,7 +52,7 @@ BIGSIZE=$(stat -c %s "$R/docs/big.txt")
 ok "stat size of online-only file = remote size ($BIGSIZE)" '[ "$(t stat -c %s "$M/docs/big.txt")" = "$BIGSIZE" ]'
 ok "stat mtime of online-only file from DB (1704164645)" '[ "$(t stat -c %Y "$M/docs/big.txt")" = 1704164645 ]'
 ok "stat mode of online-only file is 0600 regular" '[ "$(t stat -c %A "$M/docs/big.txt")" = "-rw-------" ]'
-ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply docs dst3.txt emptydir etag held.txt hold lib local.txt one.txt pinned.xlsx report.xlsx shared src3.txt thumb.jpg write-me.txt " ]'
+ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply deferred.txt docs dst3.txt emptydir etag held.txt hold lib local.txt offline.txt one.txt pinned.xlsx report.xlsx shared src3.txt syncdir thumb.jpg write-me.txt " ]'
 ok "online-only file not in backing dir" '[ ! -e "$B/docs/big.txt" ]'
 ok "state xattr online-only" '[ "$(xget "$M/docs/big.txt" user.onedrive.state)" = online-only ]'
 ok "open+close without read does not hydrate" 't python3 -c "import os; os.close(os.open(\"$M/docs/pin-me.txt\", os.O_RDONLY))" && [ "$(downloads docs/pin-me.txt)" = 0 ]'
@@ -272,6 +272,54 @@ ok "RO replace expires: dst3 item (pinned) shown, source path stays hidden" '[ "
 for i in $(seq 1 30); do grep -q "rename over ./dst3.txt not processed" "$LOG" && break; sleep 0.1; done
 ok "RO expiry logged" 'grep -q "rename over ./dst3.txt not processed by the engine in time" "$LOG"'
 
+ctl() {
+	local n; n=$(grep -cx "CTL $1" "$LOG")
+	touch "$W/ctl/$1"
+	for i in $(seq 1 30); do [ "$(grep -cx "CTL $1" "$LOG")" -gt "$n" ] && return; sleep 0.1; done
+	echo "   ctl $1 not seen"
+}
+mkdir -p "$W/ctl"
+
+echo "== I3 transient states"
+ctl "transient~f-s1~syncing"
+ok "I3 file syncing" '[ "$(xget "$M/syncdir/s1.txt" user.onedrive.state)" = syncing ]'
+ok "I3 directory syncing when a file below is" '[ "$(xget "$M/syncdir" user.onedrive.state)" = syncing ]'
+ctl "transient~f-s1~none"; ctl "transient~f-s2~pending"
+ok "I3 file pending, directory pending" '[ "$(xget "$M/syncdir/s2.txt" user.onedrive.state)" = pending ] && [ "$(xget "$M/syncdir" user.onedrive.state)" = pending ] && [ "$(xget "$M/syncdir/s1.txt" user.onedrive.state)" = hydrated ]'
+ctl "transient~f-s1~error"
+ok "I3 pending beats error in a directory" '[ "$(xget "$M/syncdir" user.onedrive.state)" = pending ] && [ "$(xget "$M/syncdir/s1.txt" user.onedrive.state)" = error ]'
+ctl "transient~f-s2~none"
+ok "I3 directory error" '[ "$(xget "$M/syncdir" user.onedrive.state)" = error ]'
+ctl "transient~f-s1~none"
+ok "I3 cleared: stored state again" '[ "$(xget "$M/syncdir" user.onedrive.state)" = hydrated ] && [ "$(xget "$M/syncdir/s1.txt" user.onedrive.state)" = hydrated ]'
+
+echo "== I3 user.onedrive.weburl"
+ok "I3 weburl of a file" '[ "$(xget "$M/one.txt" user.onedrive.weburl)" = "https://onedrive.example/drive1/f-one" ]'
+ok "I3 weburl of a directory" '[ "$(xget "$M/syncdir" user.onedrive.weburl)" = "https://onedrive.example/drive1/d-sync" ]'
+ok "I3 weburl of an item not in DB: ENODATA" 'xget "$M/new.txt" user.onedrive.weburl | grep -q "No data available"'
+ok "I3 weburl offline: EIO" 'xget "$M/offline.txt" user.onedrive.weburl | grep -q "Input/output error"'
+ok "I3 weburl is read-only" 'xset "$M/one.txt" user.onedrive.weburl x | grep -q "Operation not permitted"'
+ok "I3 weburl not listed" '! t python3 -c "import os,sys; print(os.listxattr(sys.argv[1]))" "$M/one.txt" | grep -q weburl'
+ok "I3 weburl did not hydrate" '[ ! -e "$B/offline.txt" ]'
+URLS=
+for i in $(seq 1 16); do (xget "$M/syncdir" user.onedrive.weburl >/dev/null) & URLS="$URLS $!"; done
+sleep 0.3
+S0=$(date +%s%N); t stat "$M/local.txt" >/dev/null; S1=$(date +%s%N)
+wait $URLS
+echo "   (stat during 16 slow weburl lookups: $(( (S1 - S0) / 1000000 )) ms)"
+ok "I3 16 slow weburl lookups do not block other requests" '[ $(( (S1 - S0) / 1000000 )) -lt 500 ]'
+
+echo "== I3 deferred online change re-evaluated on the last close"
+exec 5<"$M/deferred.txt"
+exec 6<"$M/deferred.txt"
+ctl "defer~f-deferred"
+exec 5<&-
+sleep 0.5
+ok "I3 not re-evaluated while another handle is open" '! grep -q "reevaluate deferred f-deferred" "$LOG"'
+exec 6<&-
+for i in $(seq 1 20); do grep -q "reevaluate deferred f-deferred" "$LOG" && break; sleep 0.05; done
+ok "I3 re-evaluated promptly on the last close, once" '[ "$(grep -c "reevaluate deferred f-deferred" "$LOG")" = 1 ]'
+
 echo "== events seen"
 grep '^EVENT' "$LOG"
 
@@ -285,7 +333,7 @@ ok "STOPPED printed" 'grep -q STOPPED "$LOG"'
 ok "no mount left" '! grep -q " $M fuse" /proc/mounts'
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|EVENT|APPLIED|CHANGED|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|EVENT|APPLIED|CHANGED|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"

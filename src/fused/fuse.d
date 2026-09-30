@@ -864,10 +864,19 @@ private:
     Thread loopThread;
     string mountpoint;
     int loopResult;
+    uint maxThreads;
 
     void runLoop()
     {
-        loopResult = fuse_loop_mt_31(f, 0);
+        if (maxThreads == 0)
+        {
+            loopResult = fuse_loop_mt_31(f, 0);
+            return;
+        }
+        auto config = fuse_loop_cfg_create();
+        scope(exit) fuse_loop_cfg_destroy(config);
+        fuse_loop_cfg_set_max_threads(config, maxThreads);
+        loopResult = fuse_loop_mt_312(f, config);
     }
 
 public:
@@ -878,9 +887,11 @@ public:
      * Params:
      *   fsname     = argv[0] for libfuse and the source shown in /proc/mounts
      *   mountopts  = options passed as -o (e.g. "default_permissions")
+     *   maxThreads = most worker threads handling requests at once; 0 keeps
+     *                the libfuse default (10)
      */
     void start(Operations ops, string fsname, string mountpoint,
-        string[] mountopts)
+        string[] mountopts, uint maxThreads = 0)
     {
         import std.exception : enforce;
         enforce(f is null, "already mounted");
@@ -893,6 +904,7 @@ public:
 
         this.ops = ops;
         this.mountpoint = mountpoint;
+        this.maxThreads = maxThreads;
         fops = makeOperations();
         f = fuse_new_31(&fargs, &fops, fuse_operations.sizeof, &this.ops);
         enforce(f !is null, "fuse_new failed for " ~ mountpoint);
