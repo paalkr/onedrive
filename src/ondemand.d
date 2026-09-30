@@ -1157,7 +1157,7 @@ void startOnDemandMount(ItemDatabase itemDB, HydrationService hydration, OnDeman
 	// workers ten of them would stall every other request (ls, stat) on the mount
 	mount.start(fs, "onedrive", mountPoint, ["fsname=onedrive", "subtype=onedrive", "default_permissions"], onDemandMaxWorkerThreads);
 	if (!mount.startNotifier())
-		addLogEntry("WARNING: On-demand: could not start the file manager notification thread; changes made by the client will not show in file managers until they reload");
+		addLogEntry("WARNING: On-demand: the file manager notification thread did not start; changes made by the client will not show in file managers until they reload");
 	activeFs = fs;
 	activeMount = mount;
 	addLogEntry("On-demand filesystem mounted: " ~ mountPoint);

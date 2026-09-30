@@ -151,6 +151,13 @@ void main(string[] args)
 	setTimes(buildPath(backing, "local.txt"), mtime, mtime);
 	svc.setStateForTest(driveId, "f-local", "local.txt", HydrationState.hydrated);
 
+	// ODTEST_NOTIFIER_START_DELAY=<ms>: the replay thread reports its id late (1 s timeout)
+	import std.process : environment;
+	if (auto delayMs = environment.get("ODTEST_NOTIFIER_START_DELAY")) {
+		import fused.fuse : notifierStartTimeoutMsecs, touchTestStartDelayMsecs;
+		touchTestStartDelayMsecs = delayMs.to!uint;
+		notifierStartTimeoutMsecs = 1000;
+	}
 	auto queue = new OnDemandChangeQueue();
 	startOnDemandMount(db, svc, queue, thisTid, mnt, backing, driveId, "root");
 	writeln("READY");

@@ -926,8 +926,10 @@ public:
     /**
      * Starts the touch thread (see queueTouch). Its requests to the mount
      * carry its thread id, notifierTid(), so the filesystem can recognise
-     * them. Returns false if the thread could not be started; queueTouch()
-     * then does nothing.
+     * them. Returns false if the thread could not be started or did not
+     * report its thread id in time; queueTouch() then does nothing, because
+     * a touch the filesystem does not recognise would run as a real
+     * operation.
      */
     bool startNotifier()
     {
@@ -944,11 +946,16 @@ public:
             free(n);
             return false;
         }
-        /* Wait for its thread id: requests it sends must be recognised */
-        foreach (i; 0 .. 1000)
-        {
-            if (atomicLoad(n.tid) != 0) break;
+        /* No touch may be queued before its thread id is known */
+        auto deadline = MonoTime.currTime + dur!"msecs"(notifierStartTimeoutMsecs);
+        while (atomicLoad(n.tid) == 0 && MonoTime.currTime < deadline)
             Thread.sleep(dur!"msecs"(1));
+        if (atomicLoad(n.tid) == 0)
+        {
+            /* Fail closed: stop it (it exits as soon as it runs) */
+            notifier = n;
+            stopNotifier();
+            return false;
         }
         replayTid = atomicLoad(n.tid);
         notifier = n;
@@ -988,7 +995,7 @@ public:
     {
         import core.stdc.stdlib : calloc, free;
         import core.sys.posix.string : strdup;
-        if (notifier is null) return 0;
+        if (notifier is null || replayTid == 0) return 0;
         auto job = cast(TouchJob*) calloc(1, TouchJob.sizeof);
         job.kind = kind;
         job.path = strdup(toStringz(mountpoint ~ path));
@@ -1230,6 +1237,10 @@ private struct Notifier
 
 /// Test knob: pause between dropping the cached dentry and the touch
 __gshared uint touchTestDelayMsecs;
+/// Test knob: delay before the touch thread reports its thread id
+__gshared uint touchTestStartDelayMsecs;
+/// How long startNotifier() waits for the touch thread's id
+__gshared uint notifierStartTimeoutMsecs = 10_000;
 
 private extern(C) int gettid() nothrow;
 private extern(C) int pthread_timedjoin_np(pthread_t thread, void** retval, const(timespec)* abstime) nothrow;
@@ -1270,6 +1281,11 @@ private extern(C) void* runNotifier(void* arg) nothrow
     import core.stdc.stdio : rename;
     import core.sys.posix.sys.stat : mkdir, utimensat, UTIME_OMIT;
     auto n = cast(Notifier*) arg;
+    if (touchTestStartDelayMsecs)
+    {
+        import core.sys.posix.unistd : usleep;
+        usleep(touchTestStartDelayMsecs * 1000);
+    }
     atomicStore(n.tid, gettid());
     while (true)
     {
