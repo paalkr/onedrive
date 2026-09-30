@@ -39,6 +39,7 @@ import intune;
 import socketio;
 import hydration;
 import ondemand;
+import ondemandcli;
 
 // Native stack trace support for fatal signal diagnostics.
 // On OpenBSD this is provided by libexecinfo; on Linux this is provided by glibc.
@@ -312,6 +313,12 @@ int main(string[] cliArgs) {
 	
 	// Update the current runtime application configuration (default or 'config' file read in options) from any passed in command line arguments
 	appConfig.updateFromArgs(cliArgs);
+	
+	// On-demand CLI commands act on a running mount through extended attributes only: no database,
+	// no authentication, so they run before anything else and work while a monitor process runs
+	if (onDemandCommandRequested(appConfig)) {
+		return runOnDemandCommand(appConfig);
+	}
 	
 	// Set the default thread pool value based on configuration or maximum logical CPUs
 	setDefaultApplicationThreads();

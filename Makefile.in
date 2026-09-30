@@ -95,6 +95,7 @@ SOURCES = \
 	src/curlWebsockets.d \
 	src/localAuth.d \
 	src/hydration.d \
+	src/ondemandcli.d \
 	src/ondemand.d \
 	src/c/fuse/common.d \
 	src/c/fuse/fuse.d \
