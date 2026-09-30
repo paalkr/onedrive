@@ -95,9 +95,235 @@ final class OnDemandChangeQueue {
 // DB hydration state, between the main-thread sync engine and HydrationService (FUSE threads).
 // Lock order: this mutex first, then the ItemDatabase lock. Never held across network I/O.
 private __gshared Mutex onDemandStateMutex;
+// Open file handles per item ("driveId/id"), reported by the FUSE layer; guarded by onDemandStateMutex
+private __gshared int[string] onDemandOpenHandles;
 
 shared static this() {
 	onDemandStateMutex = new Mutex();
+	transientStateMutex = new Mutex();
+	deferredOnlineChangeMutex = new Mutex();
+	lockedUploadRetryMutex = new Mutex();
+}
+
+private string itemKey(string driveId, string id) {
+	return driveId ~ "/" ~ id;
+}
+
+// Does the FUSE layer hold an open handle on this item?
+bool onDemandItemIsOpen(string driveId, string id) {
+	onDemandStateMutex.lock();
+	scope(exit) onDemandStateMutex.unlock();
+	return (itemKey(driveId, id) in onDemandOpenHandles) !is null;
+}
+
+// Transient sync states (user.onedrive.state: syncing, pending, error), per item
+enum TransientState { none, syncing, pending, error }
+
+private __gshared Mutex transientStateMutex;
+private __gshared TransientState[string] transientStates;
+private shared ulong transientStateWrites;
+
+// Set (or with 'none' clear) the transient state of an item. Thread-safe.
+void setTransientState(string driveId, string id, TransientState state) {
+	transientStateMutex.lock();
+	scope(exit) transientStateMutex.unlock();
+	string key = itemKey(driveId, id);
+	if (state == TransientState.none) {
+		if (key !in transientStates) return;
+		transientStates.remove(key);
+	} else {
+		if (auto current = key in transientStates) {
+			if (*current == state) return;
+		}
+		transientStates[key] = state;
+	}
+	atomicOp!"+="(transientStateWrites, 1);
+}
+
+// Clear the transient state of an item unless it is the given state
+void clearTransientStateUnless(string driveId, string id, TransientState keep) {
+	transientStateMutex.lock();
+	scope(exit) transientStateMutex.unlock();
+	string key = itemKey(driveId, id);
+	if (auto current = key in transientStates) {
+		if (*current == keep) return;
+		transientStates.remove(key);
+		atomicOp!"+="(transientStateWrites, 1);
+	}
+}
+
+TransientState transientStateOfItem(string driveId, string id) {
+	transientStateMutex.lock();
+	scope(exit) transientStateMutex.unlock();
+	if (auto state = itemKey(driveId, id) in transientStates) return *state;
+	return TransientState.none;
+}
+
+private TransientState[string] transientStatesSnapshot() {
+	transientStateMutex.lock();
+	scope(exit) transientStateMutex.unlock();
+	return transientStates.dup;
+}
+
+// Online changes not applied because the local file was open (see recordDeferredOnlineChange)
+struct DeferredOnlineChange {
+	string driveId;
+	string id;
+	JSONValue onlineItem;
+	bool ignoreDataPreservationCheck;
+}
+
+private __gshared Mutex deferredOnlineChangeMutex;
+private __gshared DeferredOnlineChange[string] deferredOnlineChanges;
+private __gshared DeferredOnlineChange[] readyDeferredOnlineChanges;
+private shared bool onlineChangeDeferredThisCycle;
+// Called (on a FUSE thread) when a deferred item's last handle closes; wakes the main thread
+private __gshared void delegate() deferredOnlineChangeReadyHandler;
+
+// Record that a newer online version of an open item was not applied. Returns true the first
+// time for this item (so the caller logs once). The item shows 'pending' until it is applied.
+bool recordDeferredOnlineChange(string driveId, string id, JSONValue onlineItem, bool ignoreDataPreservationCheck) {
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	string key = itemKey(driveId, id);
+	bool first = (key !in deferredOnlineChanges);
+	deferredOnlineChanges[key] = DeferredOnlineChange(driveId, id, onlineItem, ignoreDataPreservationCheck);
+	atomicStore(onlineChangeDeferredThisCycle, true);
+	setTransientState(driveId, id, TransientState.pending);
+	return first;
+}
+
+bool hasDeferredOnlineChange(string driveId, string id) {
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	return (itemKey(driveId, id) in deferredOnlineChanges) !is null;
+}
+
+// Forget a deferral (the change was applied or superseded)
+void clearDeferredOnlineChange(string driveId, string id) {
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	deferredOnlineChanges.remove(itemKey(driveId, id));
+}
+
+// Deferred changes whose file is no longer open, for re-evaluation on the main thread
+DeferredOnlineChange[] takeReadyDeferredOnlineChanges() {
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	DeferredOnlineChange[] ready = readyDeferredOnlineChanges;
+	readyDeferredOnlineChanges = null;
+	return ready;
+}
+
+// Was any online change deferred since the last call? The caller then keeps the delta
+// checkpoint so the deferred change is seen again (also after a restart).
+bool takeOnlineChangeDeferredFlag() {
+	return cas(&onlineChangeDeferredThisCycle, true, false);
+}
+
+void setDeferredOnlineChangeReadyHandler(void delegate() handler) {
+	deferredOnlineChangeMutex.lock();
+	scope(exit) deferredOnlineChangeMutex.unlock();
+	deferredOnlineChangeReadyHandler = handler;
+}
+
+// The last handle of an item closed: hand a deferred change to the main thread
+private void deferredItemClosed(string driveId, string id) {
+	void delegate() handler;
+	{
+		deferredOnlineChangeMutex.lock();
+		scope(exit) deferredOnlineChangeMutex.unlock();
+		string key = itemKey(driveId, id);
+		auto deferred = key in deferredOnlineChanges;
+		if (deferred is null) return;
+		readyDeferredOnlineChanges ~= *deferred;
+		deferredOnlineChanges.remove(key);
+		handler = deferredOnlineChangeReadyHandler;
+	}
+	if (handler !is null) handler();
+}
+
+// Uploads refused because the item is checked out or locked online, retried on a short schedule
+struct LockedUploadRetry {
+	string driveId;
+	string id;
+	string localPath;
+	int attempts;
+	MonoTime due;
+}
+
+private __gshared Mutex lockedUploadRetryMutex;
+private __gshared LockedUploadRetry[string] lockedUploadRetries;
+private immutable int[] lockedUploadRetrySeconds = [30, 60, 120];
+
+// Record a locked-online upload refusal; schedules the next attempt (30 s, 60 s, 120 s, then the monitor interval)
+void recordLockedUpload(string driveId, string id, string localPath, Duration monitorInterval) {
+	lockedUploadRetryMutex.lock();
+	scope(exit) lockedUploadRetryMutex.unlock();
+	string key = itemKey(driveId, id);
+	int attempts = 0;
+	if (auto existing = key in lockedUploadRetries) attempts = existing.attempts + 1;
+	Duration delay = (attempts < lockedUploadRetrySeconds.length) ? dur!"seconds"(lockedUploadRetrySeconds[attempts]) : monitorInterval;
+	lockedUploadRetries[key] = LockedUploadRetry(driveId, id, localPath, attempts, MonoTime.currTime + delay);
+	setTransientState(driveId, id, TransientState.pending);
+}
+
+// Number of locked-online refusals recorded for the item so far, or -1 if none is registered
+int lockedUploadAttempts(string driveId, string id) {
+	lockedUploadRetryMutex.lock();
+	scope(exit) lockedUploadRetryMutex.unlock();
+	if (auto retry = itemKey(driveId, id) in lockedUploadRetries) return retry.attempts;
+	return -1;
+}
+
+// Is a retry of this item taken by takeDueLockedUploads() without a new refusal since?
+bool lockedUploadRetryAwaitingResult(string driveId, string id) {
+	lockedUploadRetryMutex.lock();
+	scope(exit) lockedUploadRetryMutex.unlock();
+	if (auto retry = itemKey(driveId, id) in lockedUploadRetries) return retry.due == MonoTime.max;
+	return false;
+}
+
+bool hasLockedUploadRetry(string driveId, string id) {
+	lockedUploadRetryMutex.lock();
+	scope(exit) lockedUploadRetryMutex.unlock();
+	return (itemKey(driveId, id) in lockedUploadRetries) !is null;
+}
+
+void clearLockedUploadRetry(string driveId, string id) {
+	lockedUploadRetryMutex.lock();
+	scope(exit) lockedUploadRetryMutex.unlock();
+	lockedUploadRetries.remove(itemKey(driveId, id));
+}
+
+// Retries that are due now. They stay registered (not due again) until the attempt records a
+// new refusal or the caller clears them.
+LockedUploadRetry[] takeDueLockedUploads() {
+	lockedUploadRetryMutex.lock();
+	scope(exit) lockedUploadRetryMutex.unlock();
+	LockedUploadRetry[] due;
+	MonoTime now = MonoTime.currTime;
+	foreach (key, ref retry; lockedUploadRetries) {
+		if (retry.due <= now) {
+			due ~= retry;
+			retry.due = MonoTime.max;
+		}
+	}
+	return due;
+}
+
+// Time until the next locked-upload retry is due, or Duration.max if none
+Duration nextLockedUploadDueIn() {
+	lockedUploadRetryMutex.lock();
+	scope(exit) lockedUploadRetryMutex.unlock();
+	Duration next = Duration.max;
+	MonoTime now = MonoTime.currTime;
+	foreach (retry; lockedUploadRetries) {
+		if (retry.due == MonoTime.max) continue;
+		Duration remaining = (retry.due > now) ? (retry.due - now) : Duration.zero;
+		if (remaining < next) next = remaining;
+	}
+	return next;
 }
 
 Mutex onDemandStateLock() {
@@ -176,8 +402,6 @@ final class HydrationService {
 	private int databaseUsers;
 	// Set by shutdown(); aborts in-progress transfers of this service's OneDriveApi instances
 	private shared bool abortTransfers;
-	// Open file handles per item (driveId/id), reported by the FUSE layer; guarded by onDemandStateMutex
-	private int[string] openHandles;
 	// Directory states computed by stateOf(), valid for a short time and until any hydration write
 	private struct CachedDirectoryState {
 		HydrationState state;
@@ -188,6 +412,17 @@ final class HydrationService {
 	private Mutex directoryStateCacheMutex;
 	private enum directoryStateCacheTtl = dur!"seconds"(2);
 	private enum directoryStateCacheLimit = 10_000;
+	private struct CachedTransientState {
+		TransientState state;
+		ulong generation;
+		MonoTime computedAt;
+	}
+	private CachedTransientState[string] transientDirectoryCache;
+	private struct CachedWebUrl {
+		string eTag;
+		string url;
+	}
+	private CachedWebUrl[string] webUrlCache;
 	// Background worker for requestAction(); started on first use
 	private enum actionQueueLimit = 10_000;
 	private OnDemandActionRequest[] actionQueue;
@@ -215,21 +450,27 @@ final class HydrationService {
 	void noteOpen(string driveId, string id) {
 		onDemandStateMutex.lock();
 		scope(exit) onDemandStateMutex.unlock();
-		openHandles[driveId ~ "/" ~ id]++;
+		onDemandOpenHandles[itemKey(driveId, id)]++;
 	}
 
 	// The release of a handle counted by noteOpen(). An unmatched call is ignored.
 	void noteClose(string driveId, string id) {
-		onDemandStateMutex.lock();
-		scope(exit) onDemandStateMutex.unlock();
-		string key = driveId ~ "/" ~ id;
-		if (auto count = key in openHandles) {
-			if (*count <= 1) {
-				openHandles.remove(key);
-			} else {
-				(*count)--;
+		bool lastClose = false;
+		{
+			onDemandStateMutex.lock();
+			scope(exit) onDemandStateMutex.unlock();
+			string key = itemKey(driveId, id);
+			if (auto count = key in onDemandOpenHandles) {
+				if (*count <= 1) {
+					onDemandOpenHandles.remove(key);
+					lastClose = true;
+				} else {
+					(*count)--;
+				}
 			}
 		}
+		// An online change deferred while the file was open is re-evaluated on the main thread
+		if (lastClose) deferredItemClosed(driveId, id);
 	}
 
 	// File: its database state. Directory: pinned if it is pinned, otherwise online-only if any
@@ -387,7 +628,7 @@ final class HydrationService {
 		if (item.hydration == hydrationPinned) return false;
 		if (isPinnedOrHasPinnedAncestor(itemDB, driveId, id)) return false;
 		// An open handle may be reading or writing the backing file
-		if ((driveId ~ "/" ~ id) in openHandles) {
+		if (itemKey(driveId, id) in onDemandOpenHandles) {
 			throw new HydrationError(EBUSY, "The file is open");
 		}
 
@@ -708,12 +949,149 @@ final class HydrationService {
 	}
 
 	private void performHydrate(string driveId, string id) {
-		// A concurrent online change can alter the item while it downloads; retry a bounded number of times
-		foreach (attempt; 0 .. 3) {
-			if (performHydrateAttempt(driveId, id)) return;
-			if (debugLogging) {addLogEntry("On-demand: database item changed during hydration, retrying: " ~ driveId ~ " " ~ id, ["debug"]);}
+		setTransientState(driveId, id, TransientState.syncing);
+		try {
+			// A concurrent online change can alter the item while it downloads; retry a bounded number of times
+			foreach (attempt; 0 .. 3) {
+				if (performHydrateAttempt(driveId, id)) {
+					setTransientState(driveId, id, TransientState.none);
+					return;
+				}
+				if (debugLogging) {addLogEntry("On-demand: database item changed during hydration, retrying: " ~ driveId ~ " " ~ id, ["debug"]);}
+			}
+			throw new HydrationError(EIO, "Item changed repeatedly during hydration");
+		} catch (HydrationError e) {
+			// Offline, not ready yet or shutting down are not errors of the item
+			bool transientFailure = (e.errnoCode == ENETUNREACH) || (e.errnoCode == EAGAIN) || isShuttingDown();
+			setTransientState(driveId, id, transientFailure ? TransientState.none : TransientState.error);
+			throw e;
+		} catch (Exception e) {
+			setTransientState(driveId, id, TransientState.error);
+			throw e;
 		}
-		throw new HydrationError(EIO, "Item changed repeatedly during hydration");
+	}
+
+	// Transient state of a file, or for a directory the most significant transient state of any
+	// file below it (syncing, then pending, then error). Never throws, never uses the network.
+	TransientState transientStateOf(string driveId, string id) {
+		try {
+			Item item;
+			if (!itemDB.selectById(driveId, id, item)) return TransientState.none;
+			if ((item.type != ItemType.dir) && (item.type != ItemType.root)) return transientStateOfItem(driveId, id);
+
+			string key = "transient:" ~ itemKey(driveId, id);
+			ulong generation = itemDB.hydrationGeneration() + atomicLoad(transientStateWrites);
+			MonoTime now = MonoTime.currTime;
+			directoryStateCacheMutex.lock();
+			if (auto cached = key in transientDirectoryCache) {
+				if ((cached.generation == generation) && (now - cached.computedAt < directoryStateCacheTtl)) {
+					TransientState state = cached.state;
+					directoryStateCacheMutex.unlock();
+					return state;
+				}
+			}
+			directoryStateCacheMutex.unlock();
+
+			TransientState result = TransientState.none;
+			foreach (entryKey, state; transientStatesSnapshot()) {
+				if (transientRank(state) <= transientRank(result)) continue;
+				auto separator = indexOf(entryKey, '/');
+				if (separator < 0) continue;
+				if (isBelow(entryKey[0 .. separator], entryKey[separator + 1 .. $], driveId, id)) result = state;
+			}
+
+			directoryStateCacheMutex.lock();
+			if (transientDirectoryCache.length >= directoryStateCacheLimit) transientDirectoryCache = null;
+			transientDirectoryCache[key] = CachedTransientState(result, generation, now);
+			directoryStateCacheMutex.unlock();
+			return result;
+		} catch (Exception e) {
+			return TransientState.none;
+		}
+	}
+
+	private static int transientRank(TransientState state) {
+		final switch (state) {
+			case TransientState.none: return 0;
+			case TransientState.error: return 1;
+			case TransientState.pending: return 2;
+			case TransientState.syncing: return 3;
+		}
+	}
+
+	// Is the item driveId/id below the directory directoryDriveId/directoryId?
+	private bool isBelow(string driveId, string id, string directoryDriveId, string directoryId) {
+		string currentId = id;
+		foreach (depth; 0 .. 4096) {
+			Item item;
+			if (!itemDB.selectById(driveId, currentId, item)) return false;
+			if (item.parentId.empty) return false;
+			if ((driveId == directoryDriveId) && (item.parentId == directoryId)) return true;
+			currentId = item.parentId;
+		}
+		return false;
+	}
+
+	// The item's OneDrive web URL (Graph webUrl). Never hydrates. Cached per item and eTag.
+	// Throws HydrationError(ENODATA) for an item not in the database, (EIO) when offline or on failure.
+	string webUrlOf(string driveId, string id) {
+		if (isShuttingDown()) throw new HydrationError(EIO, "Hydration service is shutting down");
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) {
+			throw new HydrationError(ENODATA, "Item is not in the local database");
+		}
+		string key = itemKey(driveId, id);
+		directoryStateCacheMutex.lock();
+		if (auto cached = key in webUrlCache) {
+			if (cached.eTag == item.eTag) {
+				string url = cached.url;
+				directoryStateCacheMutex.unlock();
+				return url;
+			}
+		}
+		directoryStateCacheMutex.unlock();
+
+		auto probe = probeMicrosoftService(appConfig, false);
+		if (!probe.reachable) throw new HydrationError(EIO, "Microsoft OneDrive is not reachable");
+
+		// Bound the request to about 10 seconds: a watchdog aborts the transfer through the API abort flag
+		shared bool requestAbort = false;
+		shared bool requestDone = false;
+		auto watchdog = new Thread({
+			MonoTime deadline = MonoTime.currTime + dur!"seconds"(10);
+			while (!atomicLoad(requestDone) && (MonoTime.currTime < deadline) && !atomicLoad(abortTransfers)) {
+				Thread.sleep(dur!"msecs"(100));
+			}
+			if (!atomicLoad(requestDone)) atomicStore(requestAbort, true);
+		});
+		watchdog.isDaemon = true;
+		watchdog.start();
+
+		OneDriveApi api = new OneDriveApi(appConfig);
+		scope(exit) {
+			atomicStore(requestDone, true);
+			api.releaseCurlEngine();
+			api = null;
+			watchdog.join(false);
+		}
+		JSONValue onlineItem;
+		try {
+			api.initialise();
+			api.setTransferAbortFlag(&requestAbort);
+			onlineItem = api.getPathDetailsById(driveId, id);
+		} catch (Exception e) {
+			throw new HydrationError(EIO, "Unable to query the online item: " ~ e.msg);
+		}
+		if (atomicLoad(requestAbort)) throw new HydrationError(EIO, "Timed out querying the online item");
+		if ((onlineItem.type != JSONType.object) || !("webUrl" in onlineItem) || (onlineItem["webUrl"].type != JSONType.string) || onlineItem["webUrl"].str.empty) {
+			throw new HydrationError(EIO, "Microsoft OneDrive returned no web URL for the item");
+		}
+		string url = onlineItem["webUrl"].str;
+		directoryStateCacheMutex.lock();
+		if (webUrlCache.length >= directoryStateCacheLimit) webUrlCache = null;
+		webUrlCache[key] = CachedWebUrl(item.eTag, url);
+		directoryStateCacheMutex.unlock();
+		return url;
 	}
 
 	// Returns false when the database item changed during the download and the attempt should be repeated
