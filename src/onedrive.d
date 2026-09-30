@@ -1205,6 +1205,14 @@ class OneDriveApi {
 		return get(url);
 	}
 
+	// Return the thumbnail sets of the specified item
+	// https://learn.microsoft.com/en-us/graph/api/driveitem-list-thumbnails
+	JSONValue getThumbnailsById(string driveId, string id) {
+		string url;
+		url = driveByIdUrl ~ driveId ~ "/items/" ~ id ~ "/thumbnails";
+		return get(url);
+	}
+
 	// Return a JSON structure simulating the depreciated 'sharedWithMe' API response data
 	JSONValue getSharedWithMe() {
 		addLogEntry("Using Microsoft Graph Search API to enumerate OneDrive Business Shared Files", ["verbose"]);
