@@ -25,6 +25,8 @@ import itemdb;
 
 enum HydrationState { onlineOnly, hydrated, pinned }
 
+enum OnDemandAction { download, pin, unpin, free }
+
 class HydrationError : Exception
 {
 	int errnoCode;
@@ -251,6 +253,39 @@ final class HydrationService
 		scope(exit) lock.unlock();
 		if (stateLocked(driveId, id) == HydrationState.pinned)
 			itemDB.setHydration(driveId, id, "H");
+	}
+
+	/* Iteration 2 action API. Unlike the engine, directory actions run
+	   synchronously in the caller so tests can check the result at once. */
+	void requestAction(string driveId, string id, OnDemandAction action)
+	{
+		Item item;
+		if (!itemDB.selectById(driveId, id, item))
+			throw new HydrationError(errno.ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		stderr.writeln("STUB action ", action, " ", itemDB.computePath(driveId, id));
+		if (item.type == ItemType.file) {
+			final switch (action)
+			{
+				case OnDemandAction.download: hydrate(driveId, id); break;
+				case OnDemandAction.pin: pin(driveId, id); break;
+				case OnDemandAction.unpin: unpin(driveId, id); break;
+				case OnDemandAction.free:
+					if (stateOf(driveId, id) == HydrationState.onlineOnly) break;
+					if (!dehydrate(driveId, id))
+						throw new HydrationError(errno.EBUSY, "refused to free " ~ id);
+					break;
+			}
+			return;
+		}
+		// free: unpin the whole subtree first, then dehydrate what can be
+		if (action == OnDemandAction.free) requestAction(driveId, id, OnDemandAction.unpin);
+		if (action == OnDemandAction.pin) itemDB.setHydration(driveId, id, "P");
+		if (action == OnDemandAction.unpin) itemDB.setHydration(driveId, id, "H");
+		foreach (child; itemDB.selectChildren(driveId, id))
+		{
+			try requestAction(child.driveId, child.id, action);
+			catch (HydrationError e) stderr.writeln("STUB action refused ", e.msg);
+		}
 	}
 
 	void shutdown()

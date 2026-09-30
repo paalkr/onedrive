@@ -89,6 +89,17 @@ void main(string[] args)
 	add("d-hold", "root", "hold", ItemType.dir);
 	add("d-hold1", "d-hold", "d1", ItemType.dir);
 	onlineFile("f-hold", "d-hold1", "hold/d1/g.txt", "held move\n");
+	// Iteration 2: directory actions
+	foreach (d; ["lib/sub"]) {
+		mkdirRecurse(buildPath(remote, d));
+		mkdirRecurse(buildPath(backing, d));
+	}
+	add("d-lib", "root", "lib", ItemType.dir);
+	add("d-libsub", "d-lib", "sub", ItemType.dir);
+	onlineFile("f-a", "d-lib", "lib/a.txt", "aaaa\n");
+	onlineFile("f-b", "d-lib", "lib/b.txt", "bbbbbbbb\n");
+	onlineFile("f-c", "d-libsub", "lib/sub/c.txt", "cccccccccccc\n");
+	onlineFile("f-one", "root", "one.txt", "single file action\n");
 	// V-partial: a database item whose real name ends in .partial
 	onlineFile("f-keep", "d-docs", "docs/keep.partial", "not an engine partial\n");
 	// V2: a shared folder from another drive
