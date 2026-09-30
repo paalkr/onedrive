@@ -360,6 +360,18 @@ mark; ctl "backing~deleted~.%notify%nd~dir"; E=$(since); echo "   rmdir: $E"
 ok "N directory delete: IN_DELETE|IN_ISDIR" 'echo "$E" | grep -q "IN_DELETE|IN_ISDIR nd"'
 ok "N no local change events from the touches" '[ "$(grep -c "^EVENT " "$LOG")" = "$EVENTS0" ]'
 ok "N backing dir untouched by the touches" '[ "$(ls "$NB" | tr "\n" " ")" = "n1.txt " ] && [ "$(cat "$NB/n1.txt")" = "replaced with longer content" ]'
+echo "== N engine reports from the stub (download commit, free)"
+kill $WATCH 2>/dev/null; wait $WATCH 2>/dev/null
+timeout 60 python3 "$(dirname "$0")/inotify-watch.py" "$M" > "$EV" 2>&1 &
+WATCH=$!
+for i in $(seq 1 30); do grep -q WATCHING "$EV" && break; sleep 0.1; done
+ok "N one.txt is hydrated, not pinned" '[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
+mark; act "$M/one.txt" free; E=$(since); echo "   free: $E"
+ok "N free reported as a change, not a delete" 'echo "$E" | grep -q "IN_MODIFY one.txt" && ! echo "$E" | grep -q "IN_DELETE"'
+ok "N freed file still listed, online-only" 't ls "$M" | grep -qx one.txt && [ "$(xget "$M/one.txt" user.onedrive.state)" = online-only ]'
+mark; act "$M/one.txt" download; E=$(since); echo "   download: $E"
+ok "N download commit reported (IN_CREATE one.txt)" 'echo "$E" | grep -q "IN_CREATE one.txt"'
+ok "N downloaded file hydrated" '[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
 sleep 1; kill $WATCH $GIOMON 2>/dev/null; wait $WATCH $GIOMON 2>/dev/null
 sed "s|$M/notify/||g; s|$M/notify: ||" "$T/gio" | sed "s/^/   gio: /"
 ok "N GIO reports created, renamed/moved and deleted" 'grep -q "n1.txt: created" "$T/gio" && grep -q "n3.txt: deleted" "$T/gio" && grep -Eq "n2.txt: (renamed|moved)|n2.txt: deleted" "$T/gio"'
