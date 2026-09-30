@@ -1019,6 +1019,14 @@ class ApplicationConfig {
 				case "force_http_2":
 					addLogEntry("The option '" ~ key ~ "' has been deprecated and will be ignored. Please read the updated documentation and update your client configuration to remove this option.");
 					continue;
+				case "on_demand_cli_download":
+				case "on_demand_cli_pin":
+				case "on_demand_cli_unpin":
+				case "on_demand_cli_free":
+				case "on_demand_cli_status":
+					// On-demand CLI commands are command line only
+					addLogEntry("WARNING: The option '" ~ key ~ "' can only be used on the command line and is ignored in the config file.");
+					continue;
 				case "sync_business_shared_folders":
 					addLogEntry();
 					addLogEntry("The option 'sync_business_shared_folders' has been deprecated and the process for synchronising Microsoft OneDrive Business Shared Folders has changed.");

@@ -209,6 +209,8 @@ class OneDriveApi {
 	bool keepAlive = false;
 	// On-demand: when set and true, a transfer on this instance is aborted and not retried
 	private shared(bool)* transferAbortFlag = null;
+	// On-demand: redact JSON "url" values of the next responses in all diagnostic output
+	private bool redactResponseUrlValues = false;
 
 	this(ApplicationConfig appConfig) {
 		// Configure the class variable to consume the application configuration
@@ -1210,6 +1212,9 @@ class OneDriveApi {
 	JSONValue getThumbnailsById(string driveId, string id) {
 		string url;
 		url = driveByIdUrl ~ driveId ~ "/items/" ~ id ~ "/thumbnails";
+		// The response holds pre-signed thumbnail URLs; never write them to any log
+		redactResponseUrlValues = true;
+		scope(exit) redactResponseUrlValues = false;
 		return get(url);
 	}
 
@@ -2765,6 +2770,7 @@ class OneDriveApi {
 	private JSONValue oneDriveErrorHandlerWrapper(CurlResponse delegate(CurlResponse response) executer, bool validateJSONResponse, string callingFunction, int lineno) {
 		// Create a new 'curl' response
 		response = new CurlResponse();
+		response.redactUrlValues = redactResponseUrlValues;
 
 		// Other wrapper variables
 		int retryAttempts = 0;
