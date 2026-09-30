@@ -137,6 +137,7 @@ void main(string[] args)
 	localFile("f-s2", "d-sync", "syncdir/s2.txt", "s2\n", HydrationState.hydrated);
 	onlineFile("f-offline", "root", "offline.txt", "no url while offline\n");
 	localFile("f-deferred", "root", "deferred.txt", "open while changed online\n", HydrationState.hydrated);
+	localFile("f-edited", "root", "edited.txt", "edit me\n", HydrationState.hydrated);
 	// V-partial: a database item whose real name ends in .partial
 	onlineFile("f-keep", "d-docs", "docs/keep.partial", "not an engine partial\n");
 	// V2: a shared folder from another drive
@@ -185,6 +186,22 @@ void main(string[] args)
 					string p = parts[2].replace("%", "/");
 					string o = parts.length > 3 && parts[3] != "dir" ? parts[3].replace("%", "/") : null;
 					notifyBackingChange(p, parts[1].to!OnDemandChangeKind, o, parts.length > 3 && parts[3] == "dir");
+				}
+				if (parts[0] == "touchdelay") {
+					import fused.fuse : touchTestDelayMsecs;
+					touchTestDelayMsecs = parts[1].to!uint;
+				}
+				// burst~<n>: n engine downloads reported, then removed before the touches run
+				if (parts[0] == "burst") {
+					string dir = buildPath(backing, "notify", "burst");
+					mkdirRecurse(dir);
+					uint n = parts[1].to!uint;
+					foreach (i; 0 .. n) {
+						std.file.write(buildPath(dir, "b" ~ i.to!string), "x");
+						notifyBackingChange("./notify/burst/b" ~ i.to!string, OnDemandChangeKind.changed);
+					}
+					foreach (i; 0 .. n) remove(buildPath(dir, "b" ~ i.to!string));
+					writeln("BURST ", n);
 				}
 				// Notification experiments: paths use % for /
 				if (parts[0] == "ino") {

@@ -868,6 +868,7 @@ private:
     int loopResult;
     uint maxThreads;
     Notifier* notifier;
+    int replayTid;
 
     void runLoop()
     {
@@ -925,30 +926,47 @@ public:
     /**
      * Starts the touch thread (see queueTouch). Its requests to the mount
      * carry its thread id, notifierTid(), so the filesystem can recognise
-     * them.
+     * them. Returns false if the thread could not be started; queueTouch()
+     * then does nothing.
      */
-    void startNotifier()
-    {
-        import core.stdc.stdlib : calloc;
-        import core.sys.posix.string : strdup;
-        if (notifier !is null || f is null) return;
-        notifier = cast(Notifier*) calloc(1, Notifier.sizeof);
-        pthread_mutex_init(&notifier.lock, null);
-        pthread_cond_init(&notifier.wake, null);
-        notifier.session = fuse_get_session(f);
-        pthread_attr_t attr;
-        pthread_attr_init(&attr);
-        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-        pthread_create(&notifier.thread, &attr, &runNotifier, notifier);
-        pthread_attr_destroy(&attr);
-    }
-
-    /// Thread id of the touch thread, 0 before it runs
-    int notifierTid()
+    bool startNotifier()
     {
         import core.atomic : atomicLoad;
-        return notifier is null ? 0 : atomicLoad(notifier.tid);
+        import core.stdc.stdlib : calloc, free;
+        if (notifier !is null) return true;
+        if (f is null) return false;
+        auto n = cast(Notifier*) calloc(1, Notifier.sizeof);
+        pthread_mutex_init(&n.lock, null);
+        pthread_cond_init(&n.wake, null);
+        n.session = fuse_get_session(f);
+        if (pthread_create(&n.thread, null, &runNotifier, n) != 0)
+        {
+            free(n);
+            return false;
+        }
+        /* Wait for its thread id: requests it sends must be recognised */
+        foreach (i; 0 .. 1000)
+        {
+            if (atomicLoad(n.tid) != 0) break;
+            Thread.sleep(dur!"msecs"(1));
+        }
+        replayTid = atomicLoad(n.tid);
+        notifier = n;
+        return true;
     }
+
+    /**
+     * Thread id of the touch thread, 0 if none was started. It stays set
+     * after stop(), so a request that thread still has in flight is
+     * recognised until the mount is gone.
+     */
+    int notifierTid()
+    {
+        return replayTid;
+    }
+
+    /// Most queued touches; above it the oldest is dropped
+    enum maxQueuedTouches = 10_000;
 
     /**
      * Queues a system call on the mount that makes the kernel report a change
@@ -957,23 +975,76 @@ public:
      * produces one (see ondemand/test/notify-matrix.sh). The filesystem must
      * recognise the touch thread's requests and turn them into no-ops.
      * Paths are inside the mount ("/a/b"). Runs asynchronously, in order.
+     *
+     * backingPath (unlink, rmdir): the touch is skipped if it exists again
+     * when the job runs. dropped is set when the queue was full and the
+     * oldest touch was dropped.
+     *
+     * Returns: the touch's sequence number (see completedTouches), 0 if it
+     * was not queued.
      */
-    void queueTouch(Touch kind, string path, string oldPath = null, long mtimeSeconds = 0)
+    ulong queueTouch(Touch kind, string path, string oldPath, long mtimeSeconds,
+        string backingPath, out bool dropped)
     {
-        import core.stdc.stdlib : calloc;
+        import core.stdc.stdlib : calloc, free;
         import core.sys.posix.string : strdup;
-        if (notifier is null) return;
+        if (notifier is null) return 0;
         auto job = cast(TouchJob*) calloc(1, TouchJob.sizeof);
         job.kind = kind;
         job.path = strdup(toStringz(mountpoint ~ path));
         if (oldPath !is null) job.oldPath = strdup(toStringz(mountpoint ~ oldPath));
+        if (backingPath !is null) job.backingPath = strdup(toStringz(backingPath));
         job.mtime = mtimeSeconds;
         pthread_mutex_lock(&notifier.lock);
+        job.seq = ++notifier.lastSeq;
         if (notifier.tail is null) notifier.head = job;
         else notifier.tail.next = job;
         notifier.tail = job;
+        if (++notifier.queued > maxQueuedTouches)
+        {
+            auto oldest = notifier.head;
+            notifier.head = oldest.next;
+            notifier.queued--;
+            freeTouchJob(oldest);
+            dropped = true;
+        }
         pthread_cond_signal(&notifier.wake);
         pthread_mutex_unlock(&notifier.lock);
+        return job.seq;
+    }
+
+    /// Sequence number of the last touch that has finished (or was dropped)
+    ulong completedTouches()
+    {
+        import core.atomic : atomicLoad;
+        if (notifier is null) return ulong.max;
+        return atomicLoad(notifier.completed);
+    }
+
+    /* Stops the touch thread: drops what is queued, lets a touch in flight
+       finish (the loop is still running) and joins it */
+    private void stopNotifier()
+    {
+        if (notifier is null) return;
+        auto n = notifier;
+        pthread_mutex_lock(&n.lock);
+        n.stopping = 1;
+        pthread_cond_signal(&n.wake);
+        pthread_mutex_unlock(&n.lock);
+        timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += 5;
+        if (pthread_timedjoin_np(n.thread, null, &deadline) == 0)
+        {
+            import core.stdc.stdlib : free;
+            free(n);
+        }
+        else
+        {
+            /* Stuck in the mount; it exits when the unmount fails its call */
+            pthread_detach(n.thread);
+        }
+        notifier = null;
     }
 
     bool mounted()
@@ -994,16 +1065,9 @@ public:
         if (f is null)
             return true;
 
-        /* The touch thread drops what is queued and exits on its own; its
-           struct is left to it (a touch may be blocked in the mount) */
-        if (notifier !is null)
-        {
-            pthread_mutex_lock(&notifier.lock);
-            notifier.stopping = 1;
-            pthread_cond_signal(&notifier.wake);
-            pthread_mutex_unlock(&notifier.lock);
-            notifier = null;
-        }
+        /* Before the loop stops, so a touch in flight is still served; its
+           thread id stays recognised (notifierTid) */
+        stopNotifier();
 
         /* fuse_exit only sets a flag that the workers check after a
            request. Send uncached requests (a lookup of a name that does
@@ -1144,7 +1208,9 @@ private struct TouchJob
     Touch kind;
     char* path;
     char* oldPath;
+    char* backingPath;
     long mtime;
+    ulong seq;
 }
 
 private struct Notifier
@@ -1153,13 +1219,32 @@ private struct Notifier
     pthread_cond_t wake;
     TouchJob* head;
     TouchJob* tail;
+    size_t queued;
+    ulong lastSeq;
+    shared ulong completed;
     int stopping;
     shared int tid;
     fuse_session* session;
     pthread_t thread;
 }
 
+/// Test knob: pause between dropping the cached dentry and the touch
+__gshared uint touchTestDelayMsecs;
+
 private extern(C) int gettid() nothrow;
+private extern(C) int pthread_timedjoin_np(pthread_t thread, void** retval, const(timespec)* abstime) nothrow;
+
+private void freeTouchJob(TouchJob* job) nothrow
+{
+    import core.stdc.stdlib : free;
+    free(job.path); free(job.oldPath); free(job.backingPath); free(job);
+}
+
+private void testDelay() nothrow
+{
+    import core.sys.posix.unistd : usleep;
+    if (touchTestDelayMsecs) usleep(touchTestDelayMsecs * 1000);
+}
 
 /* Drops the kernel's cached dentry for path so the next lookup reaches the
    filesystem (the create and rename touches need a fresh lookup) */
@@ -1181,7 +1266,6 @@ private void invalidateEntry(fuse_session* se, const(char)* path) nothrow
 private extern(C) void* runNotifier(void* arg) nothrow
 {
     import core.atomic : atomicStore;
-    import core.stdc.stdlib : free;
     import core.sys.posix.unistd : close, rmdir, unlink;
     import core.stdc.stdio : rename;
     import core.sys.posix.sys.stat : mkdir, utimensat, UTIME_OMIT;
@@ -1197,38 +1281,47 @@ private extern(C) void* runNotifier(void* arg) nothrow
             for (auto j = n.head; j !is null; )
             {
                 auto next = j.next;
-                free(j.path); free(j.oldPath); free(j);
+                freeTouchJob(j);
                 j = next;
             }
+            n.head = n.tail = null;
+            atomicStore(n.completed, n.lastSeq);
             pthread_mutex_unlock(&n.lock);
-            /* The struct is not freed: stop() no longer references it */
             return null;
         }
         auto job = n.head;
         n.head = job.next;
         if (n.head is null) n.tail = null;
+        n.queued--;
         pthread_mutex_unlock(&n.lock);
 
+        stat_t st;
         final switch (job.kind)
         {
             case Touch.create:
                 invalidateEntry(n.session, job.path);
+                testDelay();
                 int fd = open(job.path, O_RDONLY | O_CREAT | O_NOFOLLOW, octal!600);
                 if (fd != -1) close(fd);
                 break;
             case Touch.mkdir:
                 invalidateEntry(n.session, job.path);
+                testDelay();
                 mkdir(job.path, octal!700);
                 break;
             case Touch.unlink:
-                unlink(job.path);
+                /* Recreated since: nothing to report */
+                if (job.backingPath is null || lstat(job.backingPath, &st) != 0)
+                    unlink(job.path);
                 break;
             case Touch.rmdir:
-                rmdir(job.path);
+                if (job.backingPath is null || lstat(job.backingPath, &st) != 0)
+                    rmdir(job.path);
                 break;
             case Touch.rename:
                 invalidateEntry(n.session, job.oldPath);
                 invalidateEntry(n.session, job.path);
+                testDelay();
                 rename(job.oldPath, job.path);
                 break;
             case Touch.attrib:
@@ -1238,7 +1331,9 @@ private extern(C) void* runNotifier(void* arg) nothrow
                 utimensat(AT_FDCWD, job.path, times, AT_SYMLINK_NOFOLLOW);
                 break;
         }
-        free(job.path); free(job.oldPath); free(job);
+        /* Success or not, the filesystem may drop what it prepared for it */
+        atomicStore(n.completed, job.seq);
+        freeTouchJob(job);
     }
 }
 

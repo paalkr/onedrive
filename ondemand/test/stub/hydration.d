@@ -60,6 +60,11 @@ struct OnDemandLocalChange
 	string oldPath;
 }
 
+/* Every path ever pushed, so noteClose can check the order of events */
+private __gshared bool[string] pushedPaths;
+private __gshared Object historyLock;
+shared static this() { historyLock = new Object(); }
+
 final class OnDemandChangeQueue
 {
 	private Mutex lock;
@@ -75,6 +80,7 @@ final class OnDemandChangeQueue
 		lock.lock();
 		scope(exit) lock.unlock();
 		items ~= change;
+		synchronized (historyLock) pushedPaths[change.path] = true;
 	}
 
 	OnDemandLocalChange[] drain()
@@ -331,7 +337,10 @@ final class HydrationService
 			return;
 		}
 		if (--openCount[k] == 0) openCount.remove(k);
-		stubLog("STUB noteClose ", id, " ", openCount.get(k, 0));
+		bool changeFirst;
+		string rel = "./" ~ itemDB.computePath(driveId, id);
+		synchronized (historyLock) changeFirst = (rel in pushedPaths) !is null;
+		stubLog("STUB noteClose ", id, " ", openCount.get(k, 0), " change-already-queued=", changeFirst);
 		// The engine re-evaluates a deferred online change on the last close
 		if (k !in openCount && k in deferred)
 		{

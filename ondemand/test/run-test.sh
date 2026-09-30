@@ -52,7 +52,7 @@ BIGSIZE=$(stat -c %s "$R/docs/big.txt")
 ok "stat size of online-only file = remote size ($BIGSIZE)" '[ "$(t stat -c %s "$M/docs/big.txt")" = "$BIGSIZE" ]'
 ok "stat mtime of online-only file from DB (1704164645)" '[ "$(t stat -c %Y "$M/docs/big.txt")" = 1704164645 ]'
 ok "stat mode of online-only file is 0600 regular" '[ "$(t stat -c %A "$M/docs/big.txt")" = "-rw-------" ]'
-ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply deferred.txt docs dst3.txt emptydir etag held.txt hold lib local.txt notify offline.txt one.txt pinned.xlsx report.xlsx shared src3.txt syncdir thumb.jpg write-me.txt " ]'
+ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply deferred.txt docs dst3.txt edited.txt emptydir etag held.txt hold lib local.txt notify offline.txt one.txt pinned.xlsx report.xlsx shared src3.txt syncdir thumb.jpg write-me.txt " ]'
 ok "online-only file not in backing dir" '[ ! -e "$B/docs/big.txt" ]'
 ok "state xattr online-only" '[ "$(xget "$M/docs/big.txt" user.onedrive.state)" = online-only ]'
 ok "open+close without read does not hydrate" 't python3 -c "import os; os.close(os.open(\"$M/docs/pin-me.txt\", os.O_RDONLY))" && [ "$(downloads docs/pin-me.txt)" = 0 ]'
@@ -372,6 +372,33 @@ ok "N freed file still listed, online-only" 't ls "$M" | grep -qx one.txt && [ "
 mark; act "$M/one.txt" download; E=$(since); echo "   download: $E"
 ok "N download commit reported (IN_CREATE one.txt)" 'echo "$E" | grep -q "IN_CREATE one.txt"'
 ok "N downloaded file hydrated" '[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
+echo "== F5 R3 replay answered from a re-cached dentry"
+ctl "touchdelay~1000"
+echo "r3a" > "$NB/r3a.txt"
+ctl "backing~changed~.%notify%r3a.txt"; sleep 0.3
+t stat "$M/notify/r3a.txt" >/dev/null   # caches the entry between invalidate and open(O_CREAT)
+# A mkdir replay that never reaches the filesystem: its parent is gone when it runs
+mkdir -p "$NB/gone/sub"
+ctl "backing~createDir~.%notify%gone%sub"; sleep 0.3
+rm -r "$NB/gone"
+sleep 3.5
+ctl "touchdelay~0"
+mkdir -p "$NB/gone/sub"
+ctl "backing~createDir~.%notify%gone"; sleep 0.5
+kill $WATCH 2>/dev/null; wait $WATCH 2>/dev/null
+timeout 60 python3 "$(dirname "$0")/inotify-watch.py" "$M/notify/gone/sub" > "$EV" 2>&1 &
+WATCH=$!
+for i in $(seq 1 30); do grep -q WATCHING "$EV" && break; sleep 0.1; done
+echo "x" > "$NB/gone/sub/x.txt"
+mark; ctl "backing~changed~.%notify%gone%sub%x.txt"; E=$(since); echo "   under the directory whose replay failed: $E"
+ok "F5 R3 later replays under a directory whose replay failed still produce events" 'echo "$E" | grep -q "IN_CREATE x.txt" && echo "$E" | grep -q "IN_MODIFY x.txt"'
+ok "F5 R3 re-cached file replay had no side effects" '[ "$(cat "$NB/r3a.txt")" = r3a ] && [ "$(t cat "$M/notify/r3a.txt")" = r3a ] && ! grep -q "^EVENT .*r3a" "$LOG"'
+
+echo "== F5 R2b local change queued before the last noteClose"
+t sh -c "echo edited >> '$M/edited.txt'"
+sleep 0.3
+ok "F5 R2b changed event pushed before noteClose" 'grep -q "^STUB noteClose f-edited 0 change-already-queued=true" "$LOG"'
+
 sleep 1; kill $WATCH $GIOMON 2>/dev/null; wait $WATCH $GIOMON 2>/dev/null
 sed "s|$M/notify/||g; s|$M/notify: ||" "$T/gio" | sed "s/^/   gio: /"
 ok "N GIO reports created, renamed/moved and deleted" 'grep -q "n1.txt: created" "$T/gio" && grep -q "n3.txt: deleted" "$T/gio" && grep -Eq "n2.txt: (renamed|moved)|n2.txt: deleted" "$T/gio"'
@@ -380,6 +407,9 @@ echo "== events seen"
 grep '^EVENT' "$LOG"
 
 echo "== stop"
+# F5 R1: stop with replays queued and in flight whose files are gone again
+ctl "touchdelay~20"
+ctl "burst~300"
 touch "$W/stop"
 for i in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
 ok "process exited" '! kill -0 "$PID" 2>/dev/null'
@@ -387,9 +417,11 @@ wait "$PID"; RC=$?
 ok "exit status 0 (got $RC)" '[ "$RC" = 0 ]'
 ok "STOPPED printed" 'grep -q STOPPED "$LOG"'
 ok "no mount left" '! grep -q " $M fuse" /proc/mounts'
+ok "F5 R1 stop with pending replays left no new backing files" '[ -d "$B/notify/burst" ] && [ -z "$(ls -A "$B/notify/burst")" ]'
+echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|EVENT|APPLIED|CHANGED|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"
