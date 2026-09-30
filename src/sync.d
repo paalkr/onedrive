@@ -14447,6 +14447,16 @@ class SyncEngine {
 		if (disposition == LocalMoveTargetDisposition.syncable) {
 
 			if (!itemDB.selectByPath(oldPath, appConfig.defaultDriveId, oldItem)) {
+				// On-demand: a save by rename (a temporary file renamed over the original) replaces
+				// the content of the destination. The new-data scan below only uploads paths that are
+				// not in the database, so a tracked destination would wait for the next scheduled sync.
+				// Handle the destination exactly like a changed file instead: a tracked file is uploaded
+				// as a modified file (with the usual conflict checks), an untracked one as a new file.
+				if (onDemand && exists(newPath) && isFile(newPath)) {
+					addLogEntry("Moved local item was not in the local database - uploading the destination as a new or changed file: " ~ newPath);
+					handleLocalFileTrigger([newPath]);
+					return;
+				}
 				// The old path|item is not synced with the database, upload as a new file
 				addLogEntry("Moved local item was not in-sync with local database - uploading as new item");
 				scanLocalFilesystemPathForNewData(newPath);
