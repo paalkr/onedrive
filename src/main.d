@@ -2450,6 +2450,9 @@ bool startOnDemand() {
 		return false;
 	}
 
+	// Personal drive ids appear in different letter case in Graph JSON (Issue #3336)
+	setRegistryDriveIdsCaseInsensitive(appConfig.accountType == "personal");
+
 	// Writes from HydrationService threads must never join an open engine transaction
 	itemDB.enableTransactionSerialisation();
 

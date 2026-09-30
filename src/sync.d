@@ -3835,7 +3835,7 @@ class SyncEngine {
 			case ItemType.file:
 				// On-demand: a new online file is recorded as online-only and not downloaded,
 				// unless it is inside a pinned directory
-				if (onDemand && !exists(newItemPath) && !isPinnedOrHasPinnedAncestor(itemDB, newDatabaseItem.driveId, newDatabaseItem.parentId)) {
+				if (onDemand && !exists(newItemPath) && !isPinnedOrHasPinnedAncestor(itemDB, onDemandDatabaseDriveId(newDatabaseItem.driveId), newDatabaseItem.parentId)) {
 					if (verboseLogging) {addLogEntry("On-demand: recording new online file as online-only: " ~ newItemPath, ["verbose"]);}
 					setItemHydration(newDatabaseItem, hydrationOnlineOnly);
 					itemDB.upsert(newDatabaseItem);
@@ -5766,7 +5766,8 @@ class SyncEngine {
 	void onDemandRecordPresentFile(ref Item item) {
 		if (!onDemand) return;
 		if (item.type != ItemType.file) return;
-		bool pinned = isPinnedOrHasPinnedAncestor(itemDB, item.driveId, item.id) || isPinnedOrHasPinnedAncestor(itemDB, item.driveId, item.parentId);
+		string databaseDriveId = onDemandDatabaseDriveId(item.driveId);
+		bool pinned = isPinnedOrHasPinnedAncestor(itemDB, databaseDriveId, item.id) || isPinnedOrHasPinnedAncestor(itemDB, databaseDriveId, item.parentId);
 		setItemHydration(item, pinned ? hydrationPinned : hydrationHydrated);
 	}
 
@@ -5774,6 +5775,7 @@ class SyncEngine {
 	// that is not online-only (H, P or NULL)?
 	bool onDemandPathHeldByOtherLocalItem(string driveId, string parentId, string name, string excludeId) {
 		if (!onDemand) return false;
+		driveId = onDemandDatabaseDriveId(driveId);
 		foreach (child; itemDB.selectChildren(driveId, parentId)) {
 			if ((child.name == name) && (child.id != excludeId) && (child.hydration != hydrationOnlineOnly)) return true;
 		}
@@ -5794,7 +5796,9 @@ class SyncEngine {
 		driveId = onDemandDatabaseDriveId(driveId);
 		string eTag = hasETag(onlineItem) ? onlineItem["eTag"].str : null;
 		bool first;
-		if (!deferOnlineChangeIfOpen(driveId, id, eTag, ignoreDataPreservationCheck, first)) return false;
+		// Always re-apply with the normal data-preservation check: the file may be saved locally
+		// before it is closed, and that edit must be kept as a conflict copy, not replaced
+		if (!deferOnlineChangeIfOpen(driveId, id, eTag, false, first)) return false;
 		itemDB.addOnDemandDeferred(driveId, id, eTag);
 		if (first) addLogEntry("On-demand: " ~ localPath ~ " is open locally; the newer online version will be applied when it is closed");
 		return true;
@@ -5944,6 +5948,7 @@ class SyncEngine {
 
 	// On-demand: record an existing item as online-only if its file is absent from the backing directory
 	void onDemandRecordOnlineOnly(string driveId, string id, string localPath) {
+		driveId = onDemandDatabaseDriveId(driveId);
 		auto stateLock = onDemandStateLock();
 		stateLock.lock();
 		scope(exit) stateLock.unlock();

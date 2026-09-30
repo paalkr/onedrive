@@ -130,11 +130,21 @@ shared static this() {
 	lockedUploadRetryMutex = new Mutex();
 }
 
-// Registry key of an item. Microsoft Graph reports the same drive id in different letter case
-// (Issue #3336; the database stores personal drive ids lower case), so the drive id is compared
-// case-insensitively: a state set from delta JSON must be found and cleared from database ids.
+// Registry key of an item. For personal accounts Microsoft Graph reports the same drive id in
+// different letter case (Issue #3336; the database stores them lower case), so there the drive id
+// is compared case-insensitively. Business drive ids are case-sensitive and used exactly.
+private __gshared bool registryDriveIdsCaseInsensitive = false;
+
+void setRegistryDriveIdsCaseInsensitive(bool caseInsensitive) {
+	registryDriveIdsCaseInsensitive = caseInsensitive;
+}
+
+private string registryDriveId(string driveId) {
+	return registryDriveIdsCaseInsensitive ? std.uni.toLower(driveId) : driveId;
+}
+
 private string itemKey(string driveId, string id) {
-	return std.uni.toLower(driveId) ~ "/" ~ id;
+	return registryDriveId(driveId) ~ "/" ~ id;
 }
 
 // Does the FUSE layer hold an open handle on this item?
@@ -539,7 +549,6 @@ final class HydrationService {
 			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
 		}
 		if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
-			if (item.hydration == hydrationPinned) return HydrationState.pinned;
 			string key = driveId ~ "/" ~ id;
 			ulong generation = itemDB.hydrationGeneration();
 			MonoTime now = MonoTime.currTime;
@@ -553,7 +562,15 @@ final class HydrationService {
 			}
 			directoryStateCacheMutex.unlock();
 
-			HydrationState state = subtreeHasOnlineOnlyItems(itemDB, driveId, id) ? HydrationState.onlineOnly : HydrationState.hydrated;
+			bool onlineOnlyBelow = subtreeHasOnlineOnlyItems(itemDB, driveId, id);
+			// A pinned folder with a file freed below it is only partly kept on this device: report it
+			// as hydrated rather than pinned
+			HydrationState state;
+			if (item.hydration == hydrationPinned) {
+				state = onlineOnlyBelow ? HydrationState.hydrated : HydrationState.pinned;
+			} else {
+				state = onlineOnlyBelow ? HydrationState.onlineOnly : HydrationState.hydrated;
+			}
 			directoryStateCacheMutex.lock();
 			if (directoryStateCache.length >= directoryStateCacheLimit) directoryStateCache = null;
 			directoryStateCache[key] = CachedDirectoryState(state, generation, now);
@@ -1066,8 +1083,8 @@ final class HydrationService {
 				if (transientRank(state) <= transientRank(result)) continue;
 				auto separator = indexOf(entryKey, '/');
 				if (separator < 0) continue;
-				// Keys hold the drive id in lower case; an item below this directory is on its drive
-				if (entryKey[0 .. separator] != std.uni.toLower(driveId)) continue;
+				// An item below this directory is on its drive
+				if (entryKey[0 .. separator] != registryDriveId(driveId)) continue;
 				if (isBelow(driveId, entryKey[separator + 1 .. $], driveId, id)) result = state;
 			}
 
