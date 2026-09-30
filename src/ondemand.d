@@ -45,6 +45,27 @@ import log;
 
 // How long a download or O_TRUNC waits for the engine to apply a pending move. Tests lower it.
 __gshared uint onDemandPendingMoveWaitSeconds = 30;
+// How long the database item replaced by a rename over it stays hidden if the engine neither
+// applies the move nor writes the item. Tests lower it. Deletes and moved-away paths do not
+// expire: showing them again would let a read download to the old path (see resolveSettled).
+__gshared uint onDemandPendingExpirySeconds = 300;
+
+// The database item that was at a path when it was moved away or replaced
+private struct StalePath {
+	string key;
+	string generation;   // eTag, hash and mtime; a change means the engine has written the item since
+	MonoTime since;
+	bool replaced;       // the destination of a rename over it (expires), not a moved-away source
+}
+
+private struct Redirect {
+	string oldPath;
+	MonoTime since;
+}
+
+private string generationOf(const ref Item item) {
+	return item.eTag ~ "|" ~ item.quickXorHash ~ "|" ~ item.sha256Hash ~ "|" ~ item.mtime.toISOExtString();
+}
 
 private enum pinXattr = "user.onedrive.pin";
 private enum stateXattr = "user.onedrive.state";
@@ -126,9 +147,9 @@ final class OnDemandFs : Operations
 
 	// Local deletes and moves not yet reflected in the database
 	private Mutex pendingLock;
-	private bool[string] deletedItems;     // item key of a local delete
-	private string[string] stalePaths;     // "./a" -> key of the item there before a move away or over it
-	private string[string] movedFrom;      // new "./b" -> old "./a"
+	private bool[string] deletedItems;      // item key of a local delete
+	private StalePath[string] stalePaths;   // "./a" -> the item there before a move away or over it
+	private Redirect[string] movedFrom;     // new "./b" -> old "./a"
 
 	this(ItemDatabase itemDB, HydrationService hydration, OnDemandChangeQueue changes,
 			Tid mainTid, string backingDir, string rootDriveId, string rootId) {
@@ -190,11 +211,12 @@ final class OnDemandFs : Operations
 		if (viaRedirect) return false;
 		string[] applied;
 		bool stale = false;
-		foreach (path, pathKey; stalePaths) {
+		foreach (path, entry; stalePaths) {
 			if (!underPath(rel, path)) continue;
 			Item current;
-			if (rawSelect(path, current) && itemKey(current) == pathKey) stale = true;
-			// The engine has applied it (or something else is there now)
+			if (rawSelect(path, current) && itemKey(current) == entry.key && generationOf(current) == entry.generation) stale = true;
+			// The engine has applied it, written the item since (it treated the move as a
+			// change of the destination), or something else is there now
 			else applied ~= path;
 		}
 		foreach (path; applied) stalePaths.remove(path);
@@ -207,12 +229,13 @@ final class OnDemandFs : Operations
 	private bool resolve(const(char)[] path, out Item item, out bool redirected) {
 		string rel = dbPath(path);
 		synchronized (pendingLock) {
+			expirePending();
 			string oldPrefix;
 			string newPrefix;
-			foreach (newPath, oldPath; movedFrom) {
+			foreach (newPath, redirect; movedFrom) {
 				if (underPath(rel, newPath) && newPath.length > newPrefix.length) {
 					newPrefix = newPath;
-					oldPrefix = oldPath;
+					oldPrefix = redirect.oldPath;
 				}
 			}
 			if (rawSelect(rel, item) && !isStale(rel, item, false)) {
@@ -250,6 +273,18 @@ final class OnDemandFs : Operations
 				fail(EAGAIN);
 			}
 			Thread.sleep(dur!"msecs"(100));
+		}
+	}
+
+	// Caller holds pendingLock. Stops hiding a database item replaced by a rename over it when
+	// the engine has done nothing with it within onDemandPendingExpirySeconds.
+	private void expirePending() {
+		auto cutoff = MonoTime.currTime - dur!"seconds"(onDemandPendingExpirySeconds);
+		string[] expired;
+		foreach (path, entry; stalePaths) if (entry.replaced && entry.since < cutoff) expired ~= path;
+		foreach (path; expired) {
+			stalePaths.remove(path);
+			addLogEntry("On-demand: rename over " ~ path ~ " not processed by the engine in time, showing its database item again");
 		}
 	}
 
@@ -692,16 +727,22 @@ final class OnDemandFs : Operations
 			// A move of something that was itself moved resolves to the original
 			string source = oldRel;
 			if (auto p = oldRel in movedFrom) {
-				source = *p;
+				source = p.oldPath;
 				movedFrom.remove(oldRel);
 			}
-			movedFrom[newRel] = source;
+			auto now = MonoTime.currTime;
 			if (movesDatabaseItem) {
+				movedFrom[newRel] = Redirect(source, now);
 				Item atOld;
-				if (rawSelect(oldRel, atOld)) stalePaths[oldRel] = itemKey(atOld);
+				if (rawSelect(oldRel, atOld)) stalePaths[oldRel] = StalePath(itemKey(atOld), generationOf(atOld), now, false);
+				// The replaced destination item stays in the database until the engine applies the move
+				if (replacesDatabaseItem) stalePaths[newRel] = StalePath(itemKey(replaced), generationOf(replaced), now, true);
+			} else {
+				// A new local file (e.g. an editor's temp file saved over the original) has no database
+				// item to redirect to: the destination item is simply overwritten and keeps its identity
+				movedFrom.remove(newRel);
+				stalePaths.remove(newRel);
 			}
-			// The replaced destination item stays in the database until the engine applies the move
-			if (replacesDatabaseItem) stalePaths[newRel] = itemKey(replaced);
 		}
 		emit(OnDemandChangeKind.moved, dest, orig);
 	}

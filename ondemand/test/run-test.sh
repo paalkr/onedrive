@@ -52,7 +52,7 @@ BIGSIZE=$(stat -c %s "$R/docs/big.txt")
 ok "stat size of online-only file = remote size ($BIGSIZE)" '[ "$(t stat -c %s "$M/docs/big.txt")" = "$BIGSIZE" ]'
 ok "stat mtime of online-only file from DB (1704164645)" '[ "$(t stat -c %Y "$M/docs/big.txt")" = 1704164645 ]'
 ok "stat mode of online-only file is 0600 regular" '[ "$(t stat -c %A "$M/docs/big.txt")" = "-rw-------" ]'
-ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply docs emptydir held.txt hold lib local.txt one.txt shared thumb.jpg write-me.txt " ]'
+ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply docs dst3.txt emptydir etag held.txt hold lib local.txt one.txt pinned.xlsx report.xlsx shared src3.txt thumb.jpg write-me.txt " ]'
 ok "online-only file not in backing dir" '[ ! -e "$B/docs/big.txt" ]'
 ok "state xattr online-only" '[ "$(xget "$M/docs/big.txt" user.onedrive.state)" = online-only ]'
 ok "open+close without read does not hydrate" 't python3 -c "import os; os.close(os.open(\"$M/docs/pin-me.txt\", os.O_RDONLY))" && [ "$(downloads docs/pin-me.txt)" = 0 ]'
@@ -247,6 +247,31 @@ grep "not downloading ./thumb.jpg" "$LOG" | sed "s/^/   /"
 ok "R5 an ordinary reader still hydrates" '[ "$(t cat "$M/thumb.jpg")" = "not really a jpeg" ] && [ "$(downloads thumb.jpg)" = 1 ]'
 ok "R5 thumbnailer may read a hydrated file" '[ "$(t "$T/bin/gdk-pixbuf-thumbnailer" "$M/thumb.jpg")" = "not really a jpeg" ]'
 
+echo "== RO rename-over from a file not in the database (editor save)"
+t sh -c "echo saved report > '$M/lu3535390rjnugi.tmp'"
+ok "RO rename tmp over hydrated file" '[ "$(ren "$M/lu3535390rjnugi.tmp" "$M/report.xlsx")" = OK ] && event "moved ./lu3535390rjnugi.tmp -> ./report.xlsx"'
+ok "RO state hydrated at once, not local" '[ "$(xget "$M/report.xlsx" user.onedrive.state)" = hydrated ] && [ "$(t cat "$M/report.xlsx")" = "saved report" ]'
+t sh -c "echo saved pinned > '$M/lu9999.tmp'"
+ok "RO rename tmp over pinned file" '[ "$(ren "$M/lu9999.tmp" "$M/pinned.xlsx")" = OK ]'
+ok "RO state pinned at once" '[ "$(xget "$M/pinned.xlsx" user.onedrive.state)" = pinned ]'
+for i in $(seq 1 30); do grep -q "^CHANGED ./pinned.xlsx" "$LOG" && break; sleep 0.1; done
+ok "RO after the engine processed it: still hydrated / pinned" 'grep -q "^CHANGED ./report.xlsx" "$LOG" && grep -q "^CHANGED ./pinned.xlsx" "$LOG" && [ "$(xget "$M/report.xlsx" user.onedrive.state)" = hydrated ] && [ "$(xget "$M/pinned.xlsx" user.onedrive.state)" = pinned ]'
+ok "RO listed once, content kept" '[ "$(t ls "$M" | grep -cx pinned.xlsx)" = 1 ] && [ "$(t cat "$M/pinned.xlsx")" = "saved pinned" ]'
+
+echo "== RO rename of a DB file over a DB file, destination changed by the engine"
+ok "RO rename src2 over pinned dst2" '[ "$(ren "$M/etag/src2.txt" "$M/etag/dst2.txt")" = OK ]'
+ok "RO while pending: shows the moved item (hydrated)" '[ "$(xget "$M/etag/dst2.txt" user.onedrive.state)" = hydrated ]'
+for i in $(seq 1 30); do grep -q "^CHANGED ./etag/dst2.txt" "$LOG" && break; sleep 0.1; done
+ok "RO destination eTag changed: pending replace cleared, dst2 item (pinned) shown" '[ "$(xget "$M/etag/dst2.txt" user.onedrive.state)" = pinned ]'
+
+echo "== RO rename over a DB file that the engine never processes"
+ok "RO rename src3 over pinned dst3" '[ "$(ren "$M/src3.txt" "$M/dst3.txt")" = OK ]'
+ok "RO while pending: shows the moved item (hydrated)" '[ "$(xget "$M/dst3.txt" user.onedrive.state)" = hydrated ]'
+sleep 16   # onDemandPendingExpirySeconds is 15 in odtest
+ok "RO replace expires: dst3 item (pinned) shown, source path stays hidden" '[ "$(xget "$M/dst3.txt" user.onedrive.state)" = pinned ] && ! t ls "$M" | grep -qx src3.txt'
+for i in $(seq 1 30); do grep -q "rename over ./dst3.txt not processed" "$LOG" && break; sleep 0.1; done
+ok "RO expiry logged" 'grep -q "rename over ./dst3.txt not processed by the engine in time" "$LOG"'
+
 echo "== events seen"
 grep '^EVENT' "$LOG"
 
@@ -260,7 +285,7 @@ ok "STOPPED printed" 'grep -q STOPPED "$LOG"'
 ok "no mount left" '! grep -q " $M fuse" /proc/mounts'
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|EVENT|APPLIED|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|EVENT|APPLIED|CHANGED|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"
