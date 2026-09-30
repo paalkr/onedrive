@@ -93,3 +93,34 @@ Cache size limit and eviction, thumbnail pre-seeding, range reads (Nautilus read
 ## Branches
 
 `ondemand/main` is the integration branch. `engine` works on `ondemand/engine`, `vfs` on `ondemand/vfs`, both branched from `ondemand/main`. The orchestrator merges. `engine` touches `sync.d`, `itemdb.d`, `config.d`, `main.d`, `src/hydration.d`. `vfs` touches `src/ondemand.d`, `src/c/fuse`, `src/fused`. `Makefile.in` additions: each stream adds only its own new module line.
+
+## Iteration 2: actions, CLI, thumbnails, file manager
+
+### Action interface (vfs owns the FUSE side, engine owns HydrationService)
+
+One interface for every client (CLI, Nautilus extension, scripts): extended attributes on paths inside the mount. Nothing outside the running client opens the database.
+
+- `user.onedrive.state` (read): `online-only`, `hydrated`, `pinned`. For a directory: `pinned` if the directory is pinned, otherwise `hydrated` if every file below it is hydrated or pinned, otherwise `online-only`. Items not in the DB (new, not yet uploaded): `local`.
+- `user.onedrive.action` (write-only, value is the action):
+  - `download`: hydrate now, state becomes H. Directory: every O file below it.
+  - `pin` ("always keep on this device"): state P, hydrate. Directory: the directory and everything below it, and new online files below it later.
+  - `unpin`: P -> H (directory: recursive), no dehydration. Absent pinned files become O (engine rule from 516c3f9).
+  - `free` ("free up space"): dehydrate. Files: refused (EBUSY) if pinned, if there is a pending local change, or if the backing file does not match the DB hash; state O. Directory: unpin recursively first, then dehydrate every file below it; files that are refused stay local and are reported in the log. Returns success if the call was accepted.
+  - Directory actions run on a background worker in HydrationService, not in the FUSE request thread; the setxattr returns once the work is queued. Progress and per-file failures go to the client log.
+- `user.onedrive.pin` stays as a compatibility alias (`1` = pin, `0` = unpin).
+- `st_blocks` is 0 for online-only files so `du` shows real local usage.
+
+### CLI (engine owns)
+
+`onedrive --confdir <dir> --download <path>`, `--pin <path>`, `--unpin <path>`, `--free <path>`, `--status <path>`: path inside the mount (absolute, or relative to cwd). Implemented purely as setxattr/getxattr on the mount path, so it works while the monitor process is running and needs no database access. Errors: not inside an on-demand mount, mount not active.
+
+### Thumbnails (engine owns)
+
+Goal: the file manager never needs to read an online-only file to draw a thumbnail.
+- After each sync cycle, for O files of thumbnailable types (images, pdf, video, office documents) with no valid cached thumbnail, fetch Graph thumbnails for the item and write freedesktop thumbnails (https://specifications.freedesktop.org/thumbnail-spec/latest/) to `~/.cache/thumbnails/{normal,large}/<md5(uri)>.png` with `Thumb::URI` = the file's URI inside the MOUNT and `Thumb::MTime` = the mtime the mount reports for that file. Verified by spike: Nautilus 46 then uses the cached thumbnail and runs no thumbnailer.
+- PNG output is required. Convert with an installed tool (e.g. `gdk-pixbuf-thumbnailer`) or in D; inject the tEXt chunks in D. If no converter is available, skip thumbnails with one log line.
+- Config `on_demand_thumbnails` (bool, default true). Rate-limited, runs off the main sync path, never hydrates.
+
+### File manager (nautilus owns, new `contrib/nautilus/onedrive-ondemand.py`)
+
+nautilus-python 4.0 extension for Nautilus 46: shows the state per file and adds a context-menu submenu "OneDrive" with "Download now", "Always keep on this device" / "Stop keeping on this device", "Free up space", for files AND folders, only for paths inside an on-demand mount, all via the action xattrs above. State indication: emblems if Nautilus 46 still renders them, otherwise the best supported alternative (to be verified, not assumed).
