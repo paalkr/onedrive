@@ -52,7 +52,7 @@ BIGSIZE=$(stat -c %s "$R/docs/big.txt")
 ok "stat size of online-only file = remote size ($BIGSIZE)" '[ "$(t stat -c %s "$M/docs/big.txt")" = "$BIGSIZE" ]'
 ok "stat mtime of online-only file from DB (1704164645)" '[ "$(t stat -c %Y "$M/docs/big.txt")" = 1704164645 ]'
 ok "stat mode of online-only file is 0600 regular" '[ "$(t stat -c %A "$M/docs/big.txt")" = "-rw-------" ]'
-ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply deferred.txt docs dst3.txt emptydir etag held.txt hold lib local.txt offline.txt one.txt pinned.xlsx report.xlsx shared src3.txt syncdir thumb.jpg write-me.txt " ]'
+ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply deferred.txt docs dst3.txt emptydir etag held.txt hold lib local.txt notify offline.txt one.txt pinned.xlsx report.xlsx shared src3.txt syncdir thumb.jpg write-me.txt " ]'
 ok "online-only file not in backing dir" '[ ! -e "$B/docs/big.txt" ]'
 ok "state xattr online-only" '[ "$(xget "$M/docs/big.txt" user.onedrive.state)" = online-only ]'
 ok "open+close without read does not hydrate" 't python3 -c "import os; os.close(os.open(\"$M/docs/pin-me.txt\", os.O_RDONLY))" && [ "$(downloads docs/pin-me.txt)" = 0 ]'
@@ -319,6 +319,50 @@ ok "I3 not re-evaluated while another handle is open" '! grep -q "reevaluate def
 exec 6<&-
 for i in $(seq 1 20); do grep -q "reevaluate deferred f-deferred" "$LOG" && break; sleep 0.05; done
 ok "I3 re-evaluated promptly on the last close, once" '[ "$(grep -c "reevaluate deferred f-deferred" "$LOG")" = 1 ]'
+
+echo "== N notifyBackingChange: engine changes reach inotify watchers of the mount"
+NB="$B/notify"; EV="$T/inotify"
+timeout 120 python3 "$(dirname "$0")/inotify-watch.py" "$M/notify" > "$EV" 2>&1 &
+WATCH=$!
+timeout 120 gio monitor -d "$M/notify" > "$T/gio" 2>&1 &
+GIOMON=$!
+for i in $(seq 1 30); do grep -q WATCHING "$EV" && break; sleep 0.1; done
+sleep 0.5
+mark() { MARK=$(wc -l < "$EV"); }
+since() { sleep 0.5; tail -n +$((MARK + 1)) "$EV" | tr '\n' ' '; }
+EVENTS0=$(grep -c "^EVENT " "$LOG")
+t ls "$M/notify" >/dev/null
+mark; echo "downloaded" > "$NB/n1.txt"; sleep 0.3
+ok "N a change behind the mount alone reaches no watcher" '[ -z "$(since)" ]'
+mark; ctl "backing~changed~.%notify%n1.txt"; E=$(since); echo "   create: $E"
+ok "N create: IN_CREATE" 'echo "$E" | grep -q "IN_CREATE n1.txt"'
+ok "N create: listed, content" 't ls "$M/notify" | grep -qx n1.txt && [ "$(t cat "$M/notify/n1.txt")" = downloaded ]'
+echo "replaced with longer content" > "$NB/n1.txt"; touch -d "2021-05-05 05:05:05 UTC" "$NB/n1.txt"
+mark; ctl "backing~changed~.%notify%n1.txt"; E=$(since); echo "   replace: $E"
+# utimensat with an mtime is reported as IN_MODIFY (GIO: "changed")
+ok "N replace: IN_MODIFY" 'echo "$E" | grep -q "IN_MODIFY n1.txt"'
+echo "   (mount: $(t stat -c %s:%Y "$M/notify/n1.txt"), backing: $(stat -c %s:%Y "$NB/n1.txt"))"
+ok "N replace: new size and mtime at once" '[ "$(t stat -c %s:%Y "$M/notify/n1.txt")" = 29:1620191105 ]'
+echo "move me" > "$NB/n2.txt"; ctl "backing~changed~.%notify%n2.txt"; sleep 0.3
+mv "$NB/n2.txt" "$NB/n3.txt"
+mark; ctl "backing~moved~.%notify%n3.txt~.%notify%n2.txt"; E=$(since); echo "   rename: $E"
+ok "N rename: IN_MOVED_FROM n2 and IN_MOVED_TO n3" 'echo "$E" | grep -q "IN_MOVED_FROM n2.txt" && echo "$E" | grep -q "IN_MOVED_TO n3.txt"'
+ok "N rename: n3 with its real size, n2 gone" '[ "$(t stat -c %s "$M/notify/n3.txt")" = 8 ] && ! t stat "$M/notify/n2.txt" >/dev/null 2>&1'
+rm "$NB/n3.txt"
+mark; ctl "backing~deleted~.%notify%n3.txt"; E=$(since); echo "   delete: $E"
+ok "N delete: IN_DELETE" 'echo "$E" | grep -q "IN_DELETE n3.txt"'
+ok "N delete: gone" '! t stat "$M/notify/n3.txt" >/dev/null 2>&1 && ! t ls "$M/notify" | grep -qx n3.txt'
+mkdir "$NB/nd"
+mark; ctl "backing~createDir~.%notify%nd"; E=$(since); echo "   mkdir: $E"
+ok "N createDir: IN_CREATE|IN_ISDIR" 'echo "$E" | grep -q "IN_CREATE|IN_ISDIR nd"'
+rmdir "$NB/nd"
+mark; ctl "backing~deleted~.%notify%nd~dir"; E=$(since); echo "   rmdir: $E"
+ok "N directory delete: IN_DELETE|IN_ISDIR" 'echo "$E" | grep -q "IN_DELETE|IN_ISDIR nd"'
+ok "N no local change events from the touches" '[ "$(grep -c "^EVENT " "$LOG")" = "$EVENTS0" ]'
+ok "N backing dir untouched by the touches" '[ "$(ls "$NB" | tr "\n" " ")" = "n1.txt " ] && [ "$(cat "$NB/n1.txt")" = "replaced with longer content" ]'
+sleep 1; kill $WATCH $GIOMON 2>/dev/null; wait $WATCH $GIOMON 2>/dev/null
+sed "s|$M/notify/||g; s|$M/notify: ||" "$T/gio" | sed "s/^/   gio: /"
+ok "N GIO reports created, renamed/moved and deleted" 'grep -q "n1.txt: created" "$T/gio" && grep -q "n3.txt: deleted" "$T/gio" && grep -Eq "n2.txt: (renamed|moved)|n2.txt: deleted" "$T/gio"'
 
 echo "== events seen"
 grep '^EVENT' "$LOG"

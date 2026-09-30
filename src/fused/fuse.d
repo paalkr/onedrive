@@ -31,6 +31,8 @@ import c.fuse.fuse;
 import core.thread : Thread, thread_attachThis, thread_detachThis;
 import core.time : dur, MonoTime;
 import core.sys.posix.pthread;
+import core.sys.posix.semaphore : sem_t, sem_init, sem_timedwait;
+import core.sys.posix.time : clock_gettime, CLOCK_REALTIME;
 
 /**
  * libfuse is handling the thread creation and we cannot hook into it. However
@@ -865,6 +867,7 @@ private:
     string mountpoint;
     int loopResult;
     uint maxThreads;
+    Notifier* notifier;
 
     void runLoop()
     {
@@ -919,6 +922,60 @@ public:
         loopThread.start();
     }
 
+    /**
+     * Starts the touch thread (see queueTouch). Its requests to the mount
+     * carry its thread id, notifierTid(), so the filesystem can recognise
+     * them.
+     */
+    void startNotifier()
+    {
+        import core.stdc.stdlib : calloc;
+        import core.sys.posix.string : strdup;
+        if (notifier !is null || f is null) return;
+        notifier = cast(Notifier*) calloc(1, Notifier.sizeof);
+        pthread_mutex_init(&notifier.lock, null);
+        pthread_cond_init(&notifier.wake, null);
+        notifier.session = fuse_get_session(f);
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        pthread_create(&notifier.thread, &attr, &runNotifier, notifier);
+        pthread_attr_destroy(&attr);
+    }
+
+    /// Thread id of the touch thread, 0 before it runs
+    int notifierTid()
+    {
+        import core.atomic : atomicLoad;
+        return notifier is null ? 0 : atomicLoad(notifier.tid);
+    }
+
+    /**
+     * Queues a system call on the mount that makes the kernel report a change
+     * to inotify watchers (file managers): the kernel sends no inotify event
+     * for a change made behind the mount's back, and no FUSE notification
+     * produces one (see ondemand/test/notify-matrix.sh). The filesystem must
+     * recognise the touch thread's requests and turn them into no-ops.
+     * Paths are inside the mount ("/a/b"). Runs asynchronously, in order.
+     */
+    void queueTouch(Touch kind, string path, string oldPath = null, long mtimeSeconds = 0)
+    {
+        import core.stdc.stdlib : calloc;
+        import core.sys.posix.string : strdup;
+        if (notifier is null) return;
+        auto job = cast(TouchJob*) calloc(1, TouchJob.sizeof);
+        job.kind = kind;
+        job.path = strdup(toStringz(mountpoint ~ path));
+        if (oldPath !is null) job.oldPath = strdup(toStringz(mountpoint ~ oldPath));
+        job.mtime = mtimeSeconds;
+        pthread_mutex_lock(&notifier.lock);
+        if (notifier.tail is null) notifier.head = job;
+        else notifier.tail.next = job;
+        notifier.tail = job;
+        pthread_cond_signal(&notifier.wake);
+        pthread_mutex_unlock(&notifier.lock);
+    }
+
     bool mounted()
     {
         return f !is null;
@@ -936,6 +993,17 @@ public:
     {
         if (f is null)
             return true;
+
+        /* The touch thread drops what is queued and exits on its own; its
+           struct is left to it (a touch may be blocked in the mount) */
+        if (notifier !is null)
+        {
+            pthread_mutex_lock(&notifier.lock);
+            notifier.stopping = 1;
+            pthread_cond_signal(&notifier.wake);
+            pthread_mutex_unlock(&notifier.lock);
+            notifier = null;
+        }
 
         /* fuse_exit only sets a flag that the workers check after a
            request. Send uncached requests (a lookup of a name that does
@@ -983,4 +1051,226 @@ public:
     {
         return loopResult;
     }
+
+    /* Kernel cache notifications, see fuse_lowlevel_notify_*. Each returns
+       0 or -errno (-ENOENT: nothing cached for it, which is not an error).
+       Must not be called from a request handler. */
+    int notifyInvalEntry(ulong parentIno, const(char)[] name)
+    {
+        if (f is null) return -errno.ENOTCONN;
+        return fuse_lowlevel_notify_inval_entry(fuse_get_session(f), parentIno, name.ptr, name.length);
+    }
+
+    int notifyDelete(ulong parentIno, ulong childIno, const(char)[] name)
+    {
+        if (f is null) return -errno.ENOTCONN;
+        return fuse_lowlevel_notify_delete(fuse_get_session(f), parentIno, childIno, name.ptr, name.length);
+    }
+
+    int notifyInvalInode(ulong ino)
+    {
+        if (f is null) return -errno.ENOTCONN;
+        return fuse_lowlevel_notify_inval_inode(fuse_get_session(f), ino, 0, 0);
+    }
+
+    /// fuse_invalidate_path: inval_inode for a path the library has cached
+    int invalidatePath(string path)
+    {
+        if (f is null) return -errno.ENOTCONN;
+        return fuse_invalidate_path(f, toStringz(path));
+    }
+
+    /**
+     * The library's node id (the kernel inode number) of a path inside the
+     * mount ("/a/b"), found with an lstat through the mount. 0 if it does
+     * not exist or the lstat takes longer than timeoutMsecs. The lstat runs
+     * on a plain pthread: a D thread blocked in a request to its own mount
+     * cannot take the GC's stop-the-world signal, while this thread waits on
+     * a semaphore that can.
+     */
+    ulong inodeOf(string path, uint timeoutMsecs = 5000)
+    {
+        import core.stdc.stdlib : calloc;
+        import core.sys.posix.semaphore;
+        import core.sys.posix.string : strdup;
+        if (f is null) return 0;
+        /* C heap: a timed-out lookup may outlive this call */
+        auto job = cast(InodeJob*) calloc(1, InodeJob.sizeof);
+        job.path = strdup(toStringz(mountpoint ~ (path == "/" ? "" : path)));
+        sem_init(&job.done, 0, 0);
+        pthread_t thread;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        int rc = pthread_create(&thread, &attr, &lookupInode, job);
+        pthread_attr_destroy(&attr);
+        if (rc != 0) return 0;
+        timespec deadline;
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_sec += timeoutMsecs / 1000;
+        deadline.tv_nsec += (timeoutMsecs % 1000) * 1_000_000;
+        if (deadline.tv_nsec >= 1_000_000_000) { deadline.tv_sec++; deadline.tv_nsec -= 1_000_000_000; }
+        while (sem_timedwait(&job.done, &deadline) != 0)
+        {
+            if (errno.errno == errno.EINTR) continue;
+            /* Timed out: leave the job to the thread, which frees it */
+            import core.atomic : atomicExchange;
+            if (atomicExchange(&job.abandoned, 1) == 0) return 0;
+            /* The thread finished meanwhile and is about to post */
+            import core.sys.posix.semaphore : sem_wait;
+            while (sem_wait(&job.done) != 0) {}
+            break;
+        }
+        ulong ino = job.ino;
+        freeInodeJob(job);
+        return ino;
+    }
+}
+
+/// What queueTouch does on the mount
+enum Touch : int
+{
+    create,   /// open(O_CREAT): IN_CREATE
+    mkdir,    /// mkdir: IN_CREATE|IN_ISDIR
+    unlink,   /// unlink: IN_DELETE
+    rmdir,    /// rmdir: IN_DELETE|IN_ISDIR
+    rename,   /// rename(oldPath, path): IN_MOVED_FROM + IN_MOVED_TO
+    attrib,   /// utimensat(mtime): IN_ATTRIB
+}
+
+private struct TouchJob
+{
+    TouchJob* next;
+    Touch kind;
+    char* path;
+    char* oldPath;
+    long mtime;
+}
+
+private struct Notifier
+{
+    pthread_mutex_t lock;
+    pthread_cond_t wake;
+    TouchJob* head;
+    TouchJob* tail;
+    int stopping;
+    shared int tid;
+    fuse_session* session;
+    pthread_t thread;
+}
+
+private extern(C) int gettid() nothrow;
+
+/* Drops the kernel's cached dentry for path so the next lookup reaches the
+   filesystem (the create and rename touches need a fresh lookup) */
+private void invalidateEntry(fuse_session* se, const(char)* path) nothrow
+{
+    import core.stdc.stdlib : free;
+    import core.sys.posix.string : strdup;
+    auto copy = strdup(path);
+    scope(exit) free(copy);
+    auto slash = strrchr(copy, '/');
+    if (slash is null) return;
+    *slash = 0;
+    stat_t st;
+    if (lstat(slash == copy ? "/" : copy, &st) != 0) return;
+    auto name = slash + 1;
+    fuse_lowlevel_notify_inval_entry(se, st.st_ino, name, strlen(name));
+}
+
+private extern(C) void* runNotifier(void* arg) nothrow
+{
+    import core.atomic : atomicStore;
+    import core.stdc.stdlib : free;
+    import core.sys.posix.unistd : close, rmdir, unlink;
+    import core.stdc.stdio : rename;
+    import core.sys.posix.sys.stat : mkdir, utimensat, UTIME_OMIT;
+    auto n = cast(Notifier*) arg;
+    atomicStore(n.tid, gettid());
+    while (true)
+    {
+        pthread_mutex_lock(&n.lock);
+        while (n.head is null && !n.stopping)
+            pthread_cond_wait(&n.wake, &n.lock);
+        if (n.stopping)
+        {
+            for (auto j = n.head; j !is null; )
+            {
+                auto next = j.next;
+                free(j.path); free(j.oldPath); free(j);
+                j = next;
+            }
+            pthread_mutex_unlock(&n.lock);
+            /* The struct is not freed: stop() no longer references it */
+            return null;
+        }
+        auto job = n.head;
+        n.head = job.next;
+        if (n.head is null) n.tail = null;
+        pthread_mutex_unlock(&n.lock);
+
+        final switch (job.kind)
+        {
+            case Touch.create:
+                invalidateEntry(n.session, job.path);
+                int fd = open(job.path, O_RDONLY | O_CREAT | O_NOFOLLOW, octal!600);
+                if (fd != -1) close(fd);
+                break;
+            case Touch.mkdir:
+                invalidateEntry(n.session, job.path);
+                mkdir(job.path, octal!700);
+                break;
+            case Touch.unlink:
+                unlink(job.path);
+                break;
+            case Touch.rmdir:
+                rmdir(job.path);
+                break;
+            case Touch.rename:
+                invalidateEntry(n.session, job.oldPath);
+                invalidateEntry(n.session, job.path);
+                rename(job.oldPath, job.path);
+                break;
+            case Touch.attrib:
+                timespec[2] times;
+                times[0].tv_nsec = UTIME_OMIT;
+                times[1].tv_sec = cast(typeof(times[1].tv_sec)) job.mtime;
+                utimensat(AT_FDCWD, job.path, times, AT_SYMLINK_NOFOLLOW);
+                break;
+        }
+        free(job.path); free(job.oldPath); free(job);
+    }
+}
+
+private struct InodeJob
+{
+    char* path;
+    ulong ino;
+    sem_t done;
+    shared int abandoned;
+}
+
+private void freeInodeJob(InodeJob* job) nothrow
+{
+    import core.stdc.stdlib : free;
+    import core.sys.posix.semaphore : sem_destroy;
+    sem_destroy(&job.done);
+    free(job.path);
+    free(job);
+}
+
+private extern(C) void* lookupInode(void* arg) nothrow
+{
+    import core.atomic : atomicExchange;
+    import core.sys.posix.semaphore : sem_post;
+    auto job = cast(InodeJob*) arg;
+    stat_t st;
+    if (lstat(job.path, &st) == 0)
+        job.ino = st.st_ino;
+    /* Whoever comes second frees the job */
+    if (atomicExchange(&job.abandoned, 1) == 1)
+        freeInodeJob(job);
+    else
+        sem_post(&job.done);
+    return null;
 }
