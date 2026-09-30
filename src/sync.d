@@ -3606,6 +3606,7 @@ class SyncEngine {
 				}
 
 				// Add item to database
+				onDemandRecordPresentFile(newDatabaseItem);
 				itemDB.upsert(newDatabaseItem);
 
 				// With the 'newDatabaseItem' saved to the database, regardless of --dry-run situation - was that new database item a 'remote' item?
@@ -3721,6 +3722,7 @@ class SyncEngine {
 						if (testFileHash(newItemPath, newDatabaseItem)) {
 							if (verboseLogging) {addLogEntry("Local file content matches OneDrive; reconciling timestamp and database state without replacement", ["verbose"]);}
 							setLocalPathTimestamp(dryRun, newItemPath, newDatabaseItem.mtime);
+							onDemandRecordPresentFile(newDatabaseItem);
 							itemDB.upsert(newDatabaseItem);
 							if (appConfig.getValueBool("write_xattr_data")) {
 								writeXattrData(newItemPath, onedriveJSONItem);
@@ -3759,6 +3761,7 @@ class SyncEngine {
 							// be turned into a safeBackup/replacement transaction.
 							if (verboseLogging) {addLogEntry("The last modified timestamp online has changed however the local file content has not changed", ["verbose"]);}
 							setLocalPathTimestamp(dryRun, newItemPath, newDatabaseItem.mtime);
+							onDemandRecordPresentFile(newDatabaseItem);
 							itemDB.upsert(newDatabaseItem);
 							if (appConfig.getValueBool("write_xattr_data")) {
 								writeXattrData(newItemPath, onedriveJSONItem);
@@ -3783,6 +3786,7 @@ class SyncEngine {
 							}
 
 							// Add item to database
+							onDemandRecordPresentFile(newDatabaseItem);
 							itemDB.upsert(newDatabaseItem);
 
 							// Did the user configure to save xattr data about this file?
@@ -5709,6 +5713,15 @@ class SyncEngine {
 		Item currentItem;
 		if (!itemDB.selectById(driveId, id, currentItem)) return false;
 		return currentItem.hydration == hydrationOnlineOnly;
+	}
+
+	// On-demand: an item about to be saved for a file that is present in the backing directory is
+	// hydrated (pinned under a pinned ancestor), never NULL. Used where the local file was found in sync.
+	void onDemandRecordPresentFile(ref Item item) {
+		if (!onDemand) return;
+		if (item.type != ItemType.file) return;
+		bool pinned = isPinnedOrHasPinnedAncestor(itemDB, item.driveId, item.id) || isPinnedOrHasPinnedAncestor(itemDB, item.driveId, item.parentId);
+		setItemHydration(item, pinned ? hydrationPinned : hydrationHydrated);
 	}
 
 	// On-demand: is the path parentId/name the local copy of a database item other than excludeId

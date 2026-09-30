@@ -6,6 +6,7 @@ import core.atomic;
 import core.stdc.errno;
 import core.sync.condition;
 import core.sync.mutex;
+import core.thread;
 import std.algorithm;
 import std.conv;
 import std.datetime;
@@ -39,6 +40,16 @@ class HydrationError : Exception {
 		super(msg, file, line);
 		this.errnoCode = errnoCode;
 	}
+}
+
+// Actions requested through the mount (user.onedrive.action) or the CLI
+enum OnDemandAction { download, pin, unpin, free }
+
+// A queued action for the HydrationService background worker
+private struct OnDemandActionRequest {
+	string driveId;
+	string id;
+	OnDemandAction action;
 }
 
 // Local change kinds reported by the FUSE layer for the backing directory
@@ -164,6 +175,10 @@ final class HydrationService {
 	private int databaseUsers;
 	// Set by shutdown(); aborts in-progress transfers of this service's OneDriveApi instances
 	private shared bool abortTransfers;
+	// Background worker for requestAction(); started on first use
+	private OnDemandActionRequest[] actionQueue;
+	private Thread actionWorker;
+	private bool actionWorkerRunning;
 
 	this(ApplicationConfig appConfig, ItemDatabase itemDB, string backingDir) {
 		this.appConfig = appConfig;
@@ -181,12 +196,62 @@ final class HydrationService {
 		serviceCondition = new Condition(serviceMutex);
 	}
 
+	// File: its database state. Directory: pinned if it is pinned, otherwise online-only if any
+	// file below it is online-only, otherwise hydrated.
 	HydrationState stateOf(string driveId, string id) {
 		Item item;
 		if (!itemDB.selectById(driveId, id, item)) {
 			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
 		}
+		if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
+			if (item.hydration == hydrationPinned) return HydrationState.pinned;
+			return subtreeHasOnlineOnlyItems(itemDB, driveId, id) ? HydrationState.onlineOnly : HydrationState.hydrated;
+		}
 		return hydrationStateFromDatabase(item.hydration);
+	}
+
+	// Perform an action requested through the mount or the CLI. Never downloads in the calling
+	// thread: file download/pin and every directory action are queued to a background worker.
+	// File unpin and free run now; free throws HydrationError(EBUSY) when refused.
+	void requestAction(string driveId, string id, OnDemandAction action) {
+		if (isShuttingDown()) throw new HydrationError(EIO, "Hydration service is shutting down");
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) {
+			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		}
+		bool isDirectory = (item.type == ItemType.dir) || (item.type == ItemType.root);
+		if (!isDirectory && (item.type != ItemType.file)) {
+			throw new HydrationError(EIO, "On-demand actions are not supported for shared items");
+		}
+
+		if (!isDirectory) {
+			final switch (action) {
+				case OnDemandAction.unpin:
+					unpin(driveId, id);
+					return;
+				case OnDemandAction.free:
+					if (!dehydrate(driveId, id)) {
+						throw new HydrationError(EBUSY, "The file is pinned or has local changes that are not uploaded");
+					}
+					return;
+				case OnDemandAction.download:
+				case OnDemandAction.pin:
+					break;
+			}
+		}
+
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		if (shuttingDown) throw new HydrationError(EIO, "Hydration service is shutting down");
+		actionQueue ~= OnDemandActionRequest(driveId, id, action);
+		if (actionWorker is null) {
+			actionWorkerRunning = true;
+			actionWorker = new Thread(&actionWorkerLoop);
+			actionWorker.isDaemon = true;
+			actionWorker.start();
+		}
+		serviceCondition.notifyAll();
+		addLogEntry("On-demand: queued '" ~ to!string(action) ~ "' for " ~ item.name);
 	}
 
 	// Blocks until the file is in the backing dir with a verified hash, the backing mtime set
@@ -260,9 +325,12 @@ final class HydrationService {
 		if (item.type != ItemType.file) return false;
 		if (item.hydration == hydrationPinned) return false;
 		if (isPinnedOrHasPinnedAncestor(itemDB, driveId, id)) return false;
-		if (item.hydration == hydrationOnlineOnly) return true;
 
 		string backingPath = backingPathFor(driveId, id);
+		if (item.hydration == hydrationOnlineOnly) {
+			// An online-only file with a backing file holds a local change that is not uploaded yet
+			return !exists(backingPath);
+		}
 		if (!exists(backingPath)) {
 			// Never leave a hydrated state for an absent file: that would read as a local deletion
 			itemDB.setHydration(driveId, id, hydrationOnlineOnly);
@@ -284,7 +352,7 @@ final class HydrationService {
 		} catch (FileException e) {
 			itemDB.setHydration(driveId, id, previousState);
 			addLogEntry("On-demand: unable to free up space for " ~ backingPath ~ ": " ~ e.msg);
-			return false;
+			throw new HydrationError(EIO, "Unable to remove the backing file: " ~ e.msg);
 		}
 		if (verboseLogging) {addLogEntry("On-demand: freed up space for " ~ backingPath, ["verbose"]);}
 		return true;
@@ -371,8 +439,11 @@ final class HydrationService {
 
 		// In-progress downloads stop at their next progress callback or retry decision
 		MonoTime deadline = MonoTime.currTime + dur!"seconds"(30);
-		while ((inFlight.length > 0) && (MonoTime.currTime < deadline)) {
+		while (((inFlight.length > 0) || actionWorkerRunning) && (MonoTime.currTime < deadline)) {
 			serviceCondition.wait(dur!"msecs"(200));
+		}
+		if (actionWorkerRunning) {
+			addLogEntry("WARNING: On-demand: the action worker did not stop within 30 seconds");
 		}
 		if (inFlight.length > 0) {
 			addLogEntry("WARNING: On-demand: " ~ to!string(inFlight.length) ~ " hydration(s) did not stop within 30 seconds; they will not update the database");
@@ -403,6 +474,7 @@ final class HydrationService {
 
 	private void hydrateSubtree(string driveId, string id, ref HydrationError firstError) {
 		foreach (child; itemDB.selectChildren(driveId, id)) {
+			if (isShuttingDown()) return;
 			if (child.type == ItemType.dir) {
 				hydrateSubtree(child.driveId, child.id, firstError);
 			} else if (child.type == ItemType.file) {
@@ -416,6 +488,104 @@ final class HydrationService {
 					}
 					addLogEntry("On-demand: unable to hydrate pinned file " ~ child.name ~ ": " ~ e.msg);
 					if (firstError is null) firstError = e;
+				}
+			}
+		}
+	}
+
+	private bool isShuttingDown() {
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		return shuttingDown;
+	}
+
+	// Background worker: runs queued actions one at a time until shutdown
+	private void actionWorkerLoop() {
+		scope(exit) {
+			serviceMutex.lock();
+			actionWorkerRunning = false;
+			serviceCondition.notifyAll();
+			serviceMutex.unlock();
+		}
+		while (true) {
+			OnDemandActionRequest request;
+			serviceMutex.lock();
+			while ((actionQueue.length == 0) && !shuttingDown) {
+				serviceCondition.wait();
+			}
+			if (shuttingDown) {
+				serviceMutex.unlock();
+				return;
+			}
+			request = actionQueue[0];
+			actionQueue = actionQueue[1 .. $];
+			serviceMutex.unlock();
+
+			if (!enterDatabase()) return;
+			try {
+				performAction(request);
+			} catch (Exception e) {
+				addLogEntry("On-demand: action '" ~ to!string(request.action) ~ "' failed: " ~ e.msg);
+			}
+			leaveDatabase();
+		}
+	}
+
+	private void performAction(OnDemandActionRequest request) {
+		Item item;
+		if (!itemDB.selectById(request.driveId, request.id, item)) {
+			addLogEntry("On-demand: action '" ~ to!string(request.action) ~ "' skipped, the item is no longer in the database");
+			return;
+		}
+		string itemPath = itemDB.computePath(request.driveId, request.id);
+		bool isDirectory = (item.type == ItemType.dir) || (item.type == ItemType.root);
+		addLogEntry("On-demand: " ~ to!string(request.action) ~ " " ~ itemPath ~ " ...");
+
+		final switch (request.action) {
+			case OnDemandAction.download:
+				if (isDirectory) {
+					HydrationError firstError;
+					hydrateSubtree(request.driveId, request.id, firstError);
+				} else {
+					hydrate(request.driveId, request.id);
+				}
+				break;
+			case OnDemandAction.pin:
+				try {
+					pin(request.driveId, request.id);
+				} catch (HydrationError e) {
+					// For a directory the per-file failures were logged by hydrateSubtree
+					if (!isDirectory) throw e;
+				}
+				break;
+			case OnDemandAction.unpin:
+				unpin(request.driveId, request.id);
+				break;
+			case OnDemandAction.free:
+				if (isDirectory) {
+					unpin(request.driveId, request.id);
+					dehydrateSubtree(request.driveId, request.id);
+				} else if (!dehydrate(request.driveId, request.id)) {
+					addLogEntry("On-demand: free up space refused (pinned or local changes): " ~ itemPath);
+				}
+				break;
+		}
+		addLogEntry("On-demand: " ~ to!string(request.action) ~ " " ~ itemPath ~ " ... done");
+	}
+
+	// Free up space for every file below a directory; refused files stay local and are logged
+	private void dehydrateSubtree(string driveId, string id) {
+		foreach (child; itemDB.selectChildren(driveId, id)) {
+			if (isShuttingDown()) return;
+			if (child.type == ItemType.dir) {
+				dehydrateSubtree(child.driveId, child.id);
+			} else if (child.type == ItemType.file) {
+				try {
+					if (!dehydrate(child.driveId, child.id)) {
+						addLogEntry("On-demand: free up space refused, the file stays local (pinned or local changes): " ~ itemDB.computePath(child.driveId, child.id));
+					}
+				} catch (HydrationError e) {
+					addLogEntry("On-demand: unable to free up space for " ~ child.name ~ ": " ~ e.msg);
 				}
 			}
 		}
