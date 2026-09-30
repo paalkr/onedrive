@@ -8449,12 +8449,15 @@ class SyncEngine {
 		// On-demand: 'syncing' while uploading; afterwards 'pending' when a locked-online retry is
 		// scheduled, 'error' when the upload failed, otherwise cleared
 		int lockedAttemptsBefore = -1;
+		// On-demand: set when the upload was skipped for a newer online version (the apply of that
+		// version then owns the transient state)
+		bool onDemandConflictHandled = false;
 		if (onDemand) {
 			lockedAttemptsBefore = lockedUploadAttempts(changedItemDriveId, changedItemId);
 			setTransientState(changedItemDriveId, changedItemId, TransientState.syncing);
 		}
 		scope(exit) {
-			if (onDemand) {
+			if (onDemand && !onDemandConflictHandled) {
 				int lockedAttemptsAfter = lockedUploadAttempts(changedItemDriveId, changedItemId);
 				bool lockedAgain = (lockedAttemptsAfter >= 0) && ((lockedAttemptsBefore < 0) || (lockedAttemptsAfter > lockedAttemptsBefore));
 				if (lockedAgain || hasDeferredOnlineChange(changedItemDriveId, changedItemId)) {
@@ -8652,7 +8655,20 @@ class SyncEngine {
 			if (thisFileSizeLocal <= maxUploadFileSize) {
 				// Attempt to upload the modified file
 				// Error handling is in performModifiedFileUpload(), and the JSON that is responded with - will either be null or a valid JSON object containing the upload result
-				uploadResponse = performModifiedFileUpload(dbItem, localFilePath, thisFileSizeLocal, simpleUploadUsed, uploadTransferStartTime, uploadTransferEndTime);
+				string onDemandConflictCopy;
+				uploadResponse = performModifiedFileUpload(dbItem, localFilePath, thisFileSizeLocal, simpleUploadUsed, uploadTransferStartTime, uploadTransferEndTime, onDemandConflictCopy);
+
+				// On-demand: the upload was deliberately not performed because the online version is newer;
+				// the local version was kept as a conflict copy. This is not a failed upload.
+				if (!onDemandConflictCopy.empty) {
+					onDemandConflictHandled = true;
+					clearLockedUploadRetry(changedItemDriveId, changedItemId);
+					if (transientStateOfItem(changedItemDriveId, changedItemId) == TransientState.syncing) {
+						setTransientState(changedItemDriveId, changedItemId, TransientState.none);
+					}
+					addLogEntry("Not uploading modified file: " ~ localFilePath ~ ": the online version is newer; the local version was kept as " ~ onDemandConflictCopy, ["info", "notify"]);
+					return;
+				}
 
 				// Evaluate the returned JSON uploadResponse
 				// If there was an error uploading the file, uploadResponse should be empty and invalid
@@ -8935,7 +8951,7 @@ class SyncEngine {
 	}
 
 	// Perform the upload of a locally modified file to OneDrive
-	JSONValue performModifiedFileUpload(Item dbItem, string localFilePath, long thisFileSizeLocal, out bool simpleUploadUsed, out SysTime uploadTransferStartTime, out SysTime uploadTransferEndTime) {
+	JSONValue performModifiedFileUpload(Item dbItem, string localFilePath, long thisFileSizeLocal, out bool simpleUploadUsed, out SysTime uploadTransferStartTime, out SysTime uploadTransferEndTime, out string onDemandConflictCopy) {
 		// Function Start Time
 		SysTime functionStartTime;
 		string logKey;
@@ -9034,6 +9050,7 @@ class SyncEngine {
 							return uploadResponse;
 						}
 						uploadNewFile(backupPath);
+						onDemandConflictCopy = backupPath;
 						// The deferral (if any) is resolved by applying the current online version now
 						onDemandForgetDeferral(dbItem.driveId, dbItem.id);
 						downloadFileItem(currentOnlineJSONData, true);
