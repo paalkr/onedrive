@@ -666,19 +666,6 @@ final class OnDemandFs : Operations
 
 	// Extended attributes
 
-	// Does the database subtree of a directory hold an online-only file?
-	private bool hasOnlineOnlyBelow(string driveId, string id) {
-		foreach (child; itemDB.selectChildren(driveId, id)) {
-			if (child.type == ItemType.file && child.hydration == "O") return true;
-			if (isDirectory(child)) {
-				string childDrive = child.type == ItemType.remote ? child.remoteDriveId : child.driveId;
-				string childId = child.type == ItemType.remote ? child.remoteId : child.id;
-				if (childDrive.length && hasOnlineOnlyBelow(childDrive, childId)) return true;
-			}
-		}
-		return false;
-	}
-
 	// user.onedrive.state: online-only, hydrated, pinned; local for an item not in the database
 	private string stateName(const(char)[] path) {
 		Item item;
@@ -687,15 +674,20 @@ final class OnDemandFs : Operations
 			getattr(path, st);   // ENOENT if the path does not exist at all
 			return "local";
 		}
-		if (isDirectory(item)) {
-			if (item.hydration == "P") return "pinned";
-			string driveId = item.type == ItemType.remote ? item.remoteDriveId : item.driveId;
-			string id = item.type == ItemType.remote ? item.remoteId : item.id;
-			return hasOnlineOnlyBelow(driveId, id) ? "online-only" : "hydrated";
-		}
+		// For a directory stateOf() aggregates: pinned if it is pinned, else online-only
+		// if any file below it is, else hydrated
+		string driveId = item.type == ItemType.remote ? item.remoteDriveId : item.driveId;
+		string id = item.type == ItemType.remote ? item.remoteId : item.id;
 		HydrationState state;
-		try state = hydration.stateOf(item.driveId, item.id);
+		try state = hydration.stateOf(driveId, id);
 		catch (HydrationError e) return "local";
+		if (isDirectory(item)) {
+			final switch (state) {
+				case HydrationState.pinned: return "pinned";
+				case HydrationState.hydrated: return "hydrated";
+				case HydrationState.onlineOnly: return "online-only";
+			}
+		}
 		final switch (state) {
 			case HydrationState.pinned: return "pinned";
 			case HydrationState.hydrated: return "hydrated";

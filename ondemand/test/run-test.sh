@@ -195,6 +195,7 @@ ok "I2 file pin: pinned" '[ "$(xget "$M/one.txt" user.onedrive.state)" = pinned 
 ok "I2 free of a pinned file: EBUSY, file kept" 'act "$M/one.txt" free | grep -q "Device or resource busy" && [ -f "$B/one.txt" ]'
 act "$M/one.txt" unpin
 ok "I2 file unpin: hydrated, not dehydrated" '[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ] && [ -f "$B/one.txt" ]'
+ok "I2 free of an online-only file with an unuploaded local change: EBUSY" 'act "$M/docs/trunc.txt" free | grep -q "Device or resource busy" && [ "$(cat "$B/docs/trunc.txt")" = new ]'
 ok "I2 action on item not in DB: EOPNOTSUPP" 'act "$M/new.txt" pin | grep -q "Operation not supported"'
 
 echo "== I2 user.onedrive.action on a directory"
@@ -204,6 +205,7 @@ ok "I2 dir download hydrates every file below" '[ -f "$B/lib/a.txt" ] && [ -f "$
 ok "I2 directory state hydrated when all below are" '[ "$(xget "$M/lib" user.onedrive.state)" = hydrated ] && [ "$(xget "$M/lib/sub" user.onedrive.state)" = hydrated ]'
 act "$M/lib" pin
 ok "I2 dir pin: dir and files pinned" '[ "$(xget "$M/lib" user.onedrive.state)" = pinned ] && [ "$(xget "$M/lib/sub/c.txt" user.onedrive.state)" = pinned ]'
+ok "I2 free of a file in a pinned directory: EBUSY" 'act "$M/lib/a.txt" free | grep -q "Device or resource busy" && [ -f "$B/lib/a.txt" ]'
 act "$M/lib" unpin
 ok "I2 dir unpin: hydrated, files kept" '[ "$(xget "$M/lib" user.onedrive.state)" = hydrated ] && [ "$(xget "$M/lib/a.txt" user.onedrive.state)" = hydrated ] && [ -f "$B/lib/a.txt" ]'
 act "$M/lib" pin

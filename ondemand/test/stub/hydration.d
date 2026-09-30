@@ -133,9 +133,33 @@ final class HydrationService
 		Item item;
 		if (!itemDB.selectById(driveId, id, item))
 			throw new HydrationError(errno.ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+		if (item.type == ItemType.dir || item.type == ItemType.root) {
+			if (item.hydration == "P") return HydrationState.pinned;
+			return subtreeHasOnlineOnly(driveId, id) ? HydrationState.onlineOnly : HydrationState.hydrated;
+		}
 		if (item.hydration == "O") return HydrationState.onlineOnly;
 		if (item.hydration == "P") return HydrationState.pinned;
 		return HydrationState.hydrated;
+	}
+
+	private bool subtreeHasOnlineOnly(string driveId, string id)
+	{
+		foreach (child; itemDB.selectChildren(driveId, id)) {
+			if (child.hydration == "O") return true;
+			if (child.type == ItemType.dir && subtreeHasOnlineOnly(child.driveId, child.id)) return true;
+		}
+		return false;
+	}
+
+	private bool pinnedOrPinnedAncestor(string driveId, string id)
+	{
+		Item item;
+		while (itemDB.selectById(driveId, id, item)) {
+			if (item.hydration == "P") return true;
+			if (item.parentId.length == 0 || item.type == ItemType.root) return false;
+			id = item.parentId;
+		}
+		return false;
 	}
 
 	private string targetOf(string driveId, string id)
@@ -233,8 +257,13 @@ final class HydrationService
 		if (stateLocked(driveId, id) != HydrationState.hydrated)
 			return false;
 		string target = targetOf(driveId, id);
-		if (exists(target))
-			remove(target);
+		try
+		{
+			if (exists(target))
+				remove(target);
+		}
+		catch (FileException e)
+			throw new HydrationError(errno.EIO, e.msg);
 		itemDB.setHydration(driveId, id, "O");
 		return true;
 	}
@@ -251,18 +280,31 @@ final class HydrationService
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
-		if (stateLocked(driveId, id) == HydrationState.pinned)
-			itemDB.setHydration(driveId, id, "H");
+		if (stateLocked(driveId, id) != HydrationState.pinned)
+			return;
+		Item item;
+		itemDB.selectById(driveId, id, item);
+		bool absent = item.type == ItemType.file && !exists(targetOf(driveId, id));
+		itemDB.setHydration(driveId, id, absent ? "O" : "H");
 	}
 
-	/* Iteration 2 action API. Unlike the engine, directory actions run
-	   synchronously in the caller so tests can check the result at once. */
+	/* Iteration 2 action API (engine 8e826fa). Unlike the engine, file
+	   download/pin and directory actions run synchronously in the caller
+	   instead of on a background worker, so tests can check the result at
+	   once. Refusals follow the engine. */
 	void requestAction(string driveId, string id, OnDemandAction action)
 	{
+		lock.lock();
+		bool stopped = stopping;
+		lock.unlock();
+		if (stopped)
+			throw new HydrationError(errno.EIO, "Hydration service is shutting down");
 		Item item;
 		if (!itemDB.selectById(driveId, id, item))
 			throw new HydrationError(errno.ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
 		stderr.writeln("STUB action ", action, " ", itemDB.computePath(driveId, id));
+		if (item.type != ItemType.file && item.type != ItemType.dir && item.type != ItemType.root)
+			throw new HydrationError(errno.EIO, "On-demand actions are not supported for shared items");
 		if (item.type == ItemType.file) {
 			final switch (action)
 			{
@@ -270,7 +312,14 @@ final class HydrationService
 				case OnDemandAction.pin: pin(driveId, id); break;
 				case OnDemandAction.unpin: unpin(driveId, id); break;
 				case OnDemandAction.free:
-					if (stateOf(driveId, id) == HydrationState.onlineOnly) break;
+					if (pinnedOrPinnedAncestor(driveId, id))
+						throw new HydrationError(errno.EBUSY, "refused to free pinned " ~ id);
+					if (stateOf(driveId, id) == HydrationState.onlineOnly) {
+						// Online-only with a local file: a change not uploaded yet
+						if (exists(targetOf(driveId, id)))
+							throw new HydrationError(errno.EBUSY, "refused to free changed " ~ id);
+						break;
+					}
 					if (!dehydrate(driveId, id))
 						throw new HydrationError(errno.EBUSY, "refused to free " ~ id);
 					break;
