@@ -113,6 +113,9 @@ class FakeFileInfo:
     def is_gone(self):
         return not os.path.lexists(self.path)
 
+    def is_directory(self):
+        return os.path.isdir(self.path)
+
 
 def menu_items(top):
     if REAL_NAUTILUS:
@@ -178,8 +181,15 @@ class ExtensionTest(unittest.TestCase):
 
     def setUp(self):
         self.notes = []
+        self.questions = []
+        self.answer = True
+
+        def confirmer(title, text, ok_label, callback):
+            self.questions.append(text)
+            callback(self.answer)
         self.x = ext.OneDriveOnDemandExtension(mounts=ext.MountTable(self.mounts_file),
-                                               notifier=lambda t, b: self.notes.append((t, b)))
+                                               notifier=lambda t, b: self.notes.append((t, b)),
+                                               confirmer=confirmer)
         self.file = os.path.join(self.mount, "doc.txt")
         with open(self.file, "w"):
             pass
@@ -197,9 +207,18 @@ class ExtensionTest(unittest.TestCase):
                 return real(p, *a, **k)
             return wrapper
         builtins.open, os.open = guard(self._open), guard(self._osopen)
+        # Folder state must never be read synchronously on the main thread.
+        self._getxattr = os.getxattr
+
+        def getxattr(p, *a, **k):
+            if os.path.isdir(p):
+                raise AssertionError("synchronous getxattr on folder %s" % p)
+            return self._getxattr(p, *a, **k)
+        ext.os.getxattr = getxattr
 
     def tearDown(self):
         builtins.open, os.open = self._open, self._osopen
+        ext.os.getxattr = self._getxattr
         if self.x.refresh_source is not None:
             GLib.source_remove(self.x.refresh_source)
 
@@ -217,9 +236,21 @@ class ExtensionTest(unittest.TestCase):
         self.x.update_file_info(f)
         self.assertEqual(f.emblems, ["weather-overcast-symbolic"])
         self.assertEqual(f.attrs[ext.STATE_ATTRIBUTE], "Online only")
+        # Folder: nothing known at first, async read, invalidate, then shown.
         d = FakeFileInfo(self.folder)
         self.x.update_file_info(d)
+        self.assertEqual(d.emblems, [])
+        self.assertTrue(run_loop_until(lambda: d.invalidated == 1))
+        self.x.update_file_info(d)
         self.assertEqual(d.emblems, ["emblem-default-symbolic"])
+        # Re-asked right away: served from the cache, no new query.
+        self.assertEqual(self.x.pending, set())
+        # Mount root: no state read, not tracked for polling.
+        root = FakeFileInfo(self.mount)
+        self.x.update_file_info(root)
+        run_loop_until(lambda: False, timeout=0.2)
+        self.assertEqual((root.emblems, root.attrs, root.invalidated), ([], {}, 0))
+        self.assertNotIn(root.get_uri(), self.x.tracked)
         out = FakeFileInfo(self.outside)
         self.x.update_file_info(out)
         self.assertEqual((out.emblems, out.attrs), ([], {}))
@@ -234,10 +265,53 @@ class ExtensionTest(unittest.TestCase):
         items = menu_items(self.x.get_file_items([FakeFileInfo(self.file)])[0])
         self.assertEqual([item_label(i) for i in items],
                          ["Download now", "Always keep on this device", "Free up space"])
-        items = menu_items(self.x.get_file_items([FakeFileInfo(self.folder)])[0])
+        d = FakeFileInfo(self.folder)
+        items = menu_items(self.x.get_file_items([d])[0])
+        self.assertEqual(item_label(items[1]), "Always keep on this device")  # state unknown yet
+        self.x.update_file_info(d)
+        self.assertTrue(run_loop_until(lambda: d.invalidated == 1))
+        items = menu_items(self.x.get_file_items([d])[0])
         self.assertEqual(item_label(items[1]), "Stop keeping on this device")
-        bg = self.x.get_background_items(FakeFileInfo(self.folder))
-        self.assertEqual(len(bg), 1)
+        bg = menu_items(self.x.get_background_items(FakeFileInfo(self.folder))[0])
+        self.assertEqual(len(bg), 3)
+
+    def test_mount_root_menu_only_download(self):
+        bg = menu_items(self.x.get_background_items(FakeFileInfo(self.mount))[0])
+        self.assertEqual([item_label(i) for i in bg], ["Download now"])
+        sel = menu_items(self.x.get_file_items([FakeFileInfo(self.mount + "/"),
+                                                FakeFileInfo(self.file)])[0])
+        self.assertEqual([item_label(i) for i in sel], ["Download now"])
+
+    def test_free_folder_asks_first(self):
+        d = FakeFileInfo(self.folder)
+        os.setxattr(self.folder, "user.onedrive.action", b"none")
+        self.answer = False
+        activate(menu_items(self.x.get_background_items(d)[0])[2])
+        self.assertEqual(len(self.questions), 1)
+        self.assertIn("Folder", self.questions[0])
+        run_loop_until(lambda: False, timeout=0.2)
+        self.assertEqual(self._getxattr(self.folder, "user.onedrive.action"), b"none")
+        self.answer = True
+        activate(menu_items(self.x.get_file_items([d])[0])[2])
+        self.assertTrue(run_loop_until(lambda: d.invalidated == 1))
+        self.assertEqual(self._getxattr(self.folder, "user.onedrive.action"), b"free")
+        self.assertEqual(len(self.questions), 2)
+
+    def test_free_file_no_question(self):
+        f = FakeFileInfo(self.file)
+        activate(menu_items(self.x.get_file_items([f])[0])[2])
+        self.assertTrue(run_loop_until(lambda: f.invalidated == 1))
+        self.assertEqual(self.questions, [])
+        self.assertEqual(os.getxattr(self.file, "user.onedrive.action"), b"free")
+
+    def test_zenity_confirm_async(self):
+        # true/false stand in for zenity (they ignore the arguments).
+        for program, expected in (("true", True), ("false", False),
+                                  ("no-such-zenity-binary", False)):
+            got = []
+            ext.confirm_with_zenity("t", "q", "ok", got.append, program=program)
+            self.assertTrue(run_loop_until(lambda: got), program)
+            self.assertEqual(got, [expected], program)
 
     def test_actions_write_xattr(self):
         for target, index, expected in ((self.file, 0, b"download"),
@@ -245,10 +319,14 @@ class ExtensionTest(unittest.TestCase):
                                         (self.folder, 1, b"unpin"),
                                         (self.folder, 2, b"free")):
             f = FakeFileInfo(target)
+            if f.is_directory() and f.get_uri() not in self.x.tracked:  # let the async read land
+                self.x.update_file_info(f)
+                run_loop_until(lambda: f.invalidated == 1)
+                f.invalidated = 0
             items = menu_items(self.x.get_file_items([f])[0])
             activate(items[index])
             self.assertTrue(run_loop_until(lambda: f.invalidated == 1), item_name(items[index]))
-            self.assertEqual(os.getxattr(target, "user.onedrive.action"), expected)
+            self.assertEqual(self._getxattr(target, "user.onedrive.action"), expected)
         self.assertEqual(self.notes, [])
 
     def test_action_error_notifies(self):

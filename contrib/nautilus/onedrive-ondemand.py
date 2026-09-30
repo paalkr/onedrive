@@ -28,6 +28,11 @@
 #     the icon theme.
 #   - A "OneDrive" column for list view (enable it via the view options,
 #     "Visible Columns").
+#   The mount root shows no state: its state is a walk of the whole drive.
+#   Folder states are read asynchronously and appear shortly after the folder.
+#
+# Freeing up space in a folder asks for confirmation first (zenity; without
+# zenity it is refused). The mount root only offers "Download now".
 
 import os
 import shutil
@@ -49,6 +54,9 @@ STATE_ATTRIBUTE = "onedrive_state"
 
 MOUNT_CACHE_SECONDS = 2.0
 REFRESH_SECONDS = 5
+# A folder's state is a subtree walk in the client; do not re-query a folder
+# more often than this when Nautilus asks again (e.g. after an invalidate).
+DIR_QUERY_MIN_SECONDS = 1.0
 MAX_TRACKED = 500
 
 EMBLEMS = {
@@ -166,6 +174,32 @@ def notify(title, body):
         log("notify-send failed: %s" % e.message)
 
 
+def confirm_with_zenity(title, text, ok_label, callback, program="zenity"):
+    """Ask a yes/no question without blocking Nautilus; callback(bool).
+    No zenity, or any failure, counts as "no"."""
+    exe = shutil.which(program)
+    if not exe:
+        log("%s not found, refusing '%s' without confirmation" % (program, title))
+        callback(False)
+        return
+
+    def done(proc, result):
+        try:
+            ok = proc.wait_check_finish(result)
+        except GLib.Error:
+            ok = False  # Cancel, window closed, or zenity failed
+        callback(ok)
+
+    try:
+        proc = Gio.Subprocess.new([exe, "--question", "--title=" + title, "--text=" + text,
+                                   "--ok-label=" + ok_label, "--cancel-label=Cancel"],
+                                  Gio.SubprocessFlags.NONE)
+        proc.wait_check_async(None, done)
+    except GLib.Error as e:
+        log("%s failed: %s" % (program, e.message))
+        callback(False)
+
+
 ACTION_TITLES = {
     "download": "Download now",
     "pin": "Always keep on this device",
@@ -179,27 +213,33 @@ class OneDriveOnDemandExtension(GObject.GObject,
                                 Nautilus.MenuProvider,
                                 Nautilus.ColumnProvider):
 
-    def __init__(self, mounts=None, notifier=notify):
+    def __init__(self, mounts=None, notifier=notify, confirmer=confirm_with_zenity):
         super().__init__()
         self.mounts = mounts or MountTable()
         self.notifier = notifier
+        self.confirmer = confirmer
         # uri -> (FileInfo, path, state) of files Nautilus showed us, most
-        # recent last, for the periodic refresh.
+        # recent last, for the periodic refresh. For folders the state is
+        # the last value read asynchronously.
         self.tracked = OrderedDict()
         self.refresh_source = None
+        self.pending = set()  # uris with a state query in flight
+        self.fetched = {}  # uri -> monotonic time of the last async read
 
     # ---- helpers ---------------------------------------------------------
 
     def _path_in_mount(self, file):
+        """(path, is_mount_root) for a file inside an on-demand mount, else None."""
         try:
             if file.get_uri_scheme() != "file":
                 return None
             path = file.get_location().get_path()
         except Exception:
             return None
-        if path and self.mounts.ondemand_mount_for(path):
-            return path
-        return None
+        mountpoint = self.mounts.ondemand_mount_for(path) if path else None
+        if mountpoint is None:
+            return None
+        return path, path.rstrip("/") == mountpoint.rstrip("/")
 
     def _track(self, file, path, state):
         uri = file.get_uri()
@@ -216,16 +256,25 @@ class OneDriveOnDemandExtension(GObject.GObject,
         for uri, (file, path, state) in list(self.tracked.items()):
             if file.is_gone():
                 del self.tracked[uri]
+                self.fetched.pop(uri, None)
                 continue
-            gfile = Gio.File.new_for_path(path)
-            gfile.query_info_async(STATE_GIO_ATTR, Gio.FileQueryInfoFlags.NONE,
-                                   GLib.PRIORITY_LOW, None, self._refresh_done, uri)
+            self._query_async(uri, path)
         if not self.tracked:
             self.refresh_source = None
             return GLib.SOURCE_REMOVE
         return GLib.SOURCE_CONTINUE
 
+    def _query_async(self, uri, path):
+        if uri in self.pending:
+            return
+        self.pending.add(uri)
+        Gio.File.new_for_path(path).query_info_async(
+            STATE_GIO_ATTR, Gio.FileQueryInfoFlags.NONE, GLib.PRIORITY_LOW, None,
+            self._refresh_done, uri)
+
     def _refresh_done(self, gfile, result, uri):
+        self.pending.discard(uri)
+        self.fetched[uri] = GLib.get_monotonic_time()
         try:
             info = gfile.query_info_finish(result)
             new_state = info.get_attribute_as_string(STATE_GIO_ATTR)
@@ -248,10 +297,17 @@ class OneDriveOnDemandExtension(GObject.GObject,
 
     def update_file_info(self, file):
         try:
-            path = self._path_in_mount(file)
-            if path is None:
+            found = self._path_in_mount(file)
+            if found is None:
                 return Nautilus.OperationResult.COMPLETE
-            state = read_state(path)
+            path, is_root = found
+            if is_root:
+                # The root's state is a walk of the whole drive; not shown.
+                return Nautilus.OperationResult.COMPLETE
+            if file.is_directory():
+                state = self._dir_state(file, path)
+            else:
+                state = read_state(path)
             if state in EMBLEMS:
                 file.add_emblem(EMBLEMS[state])
             file.add_string_attribute(STATE_ATTRIBUTE, LABELS.get(state, state or ""))
@@ -259,6 +315,29 @@ class OneDriveOnDemandExtension(GObject.GObject,
         except Exception as e:
             log("update_file_info failed: %s" % e)
         return Nautilus.OperationResult.COMPLETE
+
+    def _dir_state(self, file, path):
+        """Last known state of a folder, never read on the main thread.
+
+        update_file_info_full is not used: nautilus-python 4.0 passes
+        Nautilus' uninitialised handle through unchanged, so a pending
+        request cannot be told apart from others on cancel_update. Instead
+        the folder is queried with async GIO and, when the answer differs
+        from what is shown, invalidated so Nautilus asks again and gets the
+        cached value."""
+        uri = file.get_uri()
+        entry = self.tracked.get(uri)
+        state = entry[2] if entry else None
+        last = self.fetched.get(uri)
+        if last is None or GLib.get_monotonic_time() - last > DIR_QUERY_MIN_SECONDS * 1e6:
+            self._query_async(uri, path)
+        return state
+
+    def _known_state(self, file, path):
+        if file.is_directory():
+            entry = self.tracked.get(file.get_uri())
+            return entry[2] if entry else None
+        return read_state(path)
 
     # ---- ColumnProvider --------------------------------------------------
 
@@ -286,23 +365,30 @@ class OneDriveOnDemandExtension(GObject.GObject,
 
     def _menu_for(self, files, name_prefix="OneDriveOnDemand"):
         targets = []
+        any_root = False
         for file in files:
-            path = self._path_in_mount(file)
-            if path is None:
+            found = self._path_in_mount(file)
+            if found is None:
                 # Mixed selections (inside and outside a mount) get no menu.
                 return []
-            targets.append((file, path))
+            targets.append((file, found[0]))
+            any_root = any_root or found[1]
         if not targets:
             return []
 
-        states = [read_state(path) for _, path in targets]
-        pin_action = "unpin" if all(s == "pinned" for s in states) else "pin"
+        if any_root:
+            # Pinning or freeing the whole drive is one click too easy.
+            actions = ("download",)
+        else:
+            states = [self._known_state(file, path) for file, path in targets]
+            pin_action = "unpin" if all(s == "pinned" for s in states) else "pin"
+            actions = ("download", pin_action, "free")
 
         top = Nautilus.MenuItem(name=name_prefix + "::menu", label="OneDrive",
                                 tip="OneDrive Files On-Demand", icon="")
         submenu = Nautilus.Menu()
         top.set_submenu(submenu)
-        for action in ("download", pin_action, "free"):
+        for action in actions:
             item = Nautilus.MenuItem(name="%s::%s" % (name_prefix, action),
                                      label=ACTION_TITLES[action], tip="", icon="")
             item.connect("activate", self._on_activate, action, targets)
@@ -310,8 +396,36 @@ class OneDriveOnDemandExtension(GObject.GObject,
         return [top]
 
     def _on_activate(self, _item, action, targets):
+        try:
+            folders = [path for file, path in targets if file.is_directory()]
+        except Exception as e:
+            log("is_directory failed: %s" % e)
+            return
+        if action == "free" and folders:
+            self._confirm_free(folders, targets)
+            return
         for file, path in targets:
             self.run_action(file, path, action)
+
+    def _confirm_free(self, folders, targets):
+        if len(folders) == 1:
+            what = "the folder \u201c%s\u201d" % os.path.basename(folders[0])
+        else:
+            what = "%d folders" % len(folders)
+        text = ("Free up space in %s?\n\nFiles in it will be removed from this device "
+                "and stay available online. Files kept on this device will stop being "
+                "kept. Files with changes that are not uploaded yet stay." % what)
+
+        def answered(ok):
+            if not ok:
+                return
+            for file, path in targets:
+                self.run_action(file, path, "free")
+
+        try:
+            self.confirmer("Free up space", text, "Free up space", answered)
+        except Exception as e:
+            log("confirmation failed: %s" % e)
 
     def run_action(self, file, path, action):
         """setxattr(user.onedrive.action) via GIO's thread pool, so a file
