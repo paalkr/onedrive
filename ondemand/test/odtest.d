@@ -5,7 +5,10 @@
  * change event, and stops when <work>/stop appears. Driven by run-test.sh.
  *
  * Moves under ./apply are applied to the database one second after their
- * event, as the engine would; all other changes are never applied.
+ * event, as the engine would. For a move from a "*.tmp" file or under
+ * ./etag the destination item gets a new eTag one second later instead,
+ * as when the engine treats the move as a change of the destination and
+ * uploads or re-downloads it. All other changes are never applied.
  *
  * Usage: odtest <work> <mnt> [downloadDelayMsecs]
  */
@@ -41,6 +44,7 @@ void main(string[] args)
 	}
 	mkdirRecurse(buildPath(backing, "emptydir"));
 	onDemandPendingMoveWaitSeconds = 2;
+	onDemandPendingExpirySeconds = 15;
 
 	auto db = new ItemDatabase(buildPath(work, "items.sqlite3"));
 	auto svc = new HydrationService(null, db, backing);
@@ -103,6 +107,24 @@ void main(string[] args)
 	// Fix round 3: open handles and thumbnailers
 	onlineFile("f-held", "root", "held.txt", "held open\n");
 	onlineFile("f-thumb", "root", "thumb.jpg", "not really a jpeg\n");
+	// Rename-over from a file that is not in the database (editor save)
+	void localFile(string id, string parent, string rel, string content, HydrationState state)
+	{
+		std.file.write(buildPath(backing, rel), content);
+		std.file.write(buildPath(remote, rel), content);
+		add(id, parent, baseName(rel), ItemType.file, content.length.to!string);
+		setTimes(buildPath(backing, rel), mtime, mtime);
+		svc.setStateForTest(driveId, id, rel, state);
+	}
+	localFile("f-report", "root", "report.xlsx", "original report\n", HydrationState.hydrated);
+	localFile("f-pinx", "root", "pinned.xlsx", "original pinned\n", HydrationState.pinned);
+	add("d-etag", "root", "etag", ItemType.dir);
+	mkdirRecurse(buildPath(backing, "etag"));
+	mkdirRecurse(buildPath(remote, "etag"));
+	localFile("f-src2", "d-etag", "etag/src2.txt", "source two\n", HydrationState.hydrated);
+	localFile("f-dst2", "d-etag", "etag/dst2.txt", "destination two\n", HydrationState.pinned);
+	localFile("f-src3", "root", "src3.txt", "source three\n", HydrationState.hydrated);
+	localFile("f-dst3", "root", "dst3.txt", "destination three\n", HydrationState.pinned);
 	// V-partial: a database item whose real name ends in .partial
 	onlineFile("f-keep", "d-docs", "docs/keep.partial", "not an engine partial\n");
 	// V2: a shared folder from another drive
@@ -130,7 +152,9 @@ void main(string[] args)
 			foreach (c; queue.drain()) {
 				if (c.oldPath is null) writeln("EVENT ", c.kind, " ", c.path);
 				else writeln("EVENT ", c.kind, " ", c.oldPath, " -> ", c.path);
-				if (c.kind == OnDemandChangeKind.moved && c.oldPath.length > 8 && c.oldPath[0 .. 8] == "./apply/")
+				if (c.kind == OnDemandChangeKind.moved && ((c.oldPath.length > 8 && c.oldPath[0 .. 8] == "./apply/")
+						|| (c.oldPath.length > 4 && c.oldPath[$ - 4 .. $] == ".tmp")
+						|| (c.oldPath.length > 7 && c.oldPath[0 .. 7] == "./etag/")))
 					due ~= Due(MonoTime.currTime + dur!"seconds"(1), c);
 			}
 			stdout.flush();
@@ -141,6 +165,18 @@ void main(string[] args)
 			auto c = due[0].change;
 			due = due[1 .. $];
 			Item item, parent;
+			if (c.oldPath[0 .. 7] != "./apply") {
+				// The engine uploaded the new content of the destination item
+				if (db.selectByPath(c.path, driveId, item)) {
+					item.eTag = item.eTag ~ "+";
+					db.update(item);
+					writeln("CHANGED ", c.path);
+				} else {
+					writeln("CHANGE FAILED ", c.path);
+				}
+				stdout.flush();
+				continue;
+			}
 			if (db.selectByPath(c.oldPath, driveId, item) && db.selectByPath(dirName(c.path), driveId, parent)) {
 				item.name = baseName(c.path);
 				item.parentId = parent.id;

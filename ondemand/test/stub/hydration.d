@@ -18,7 +18,16 @@ import core.time : dur;
 import errno = core.stdc.errno;
 import std.file;
 import std.path : buildNormalizedPath, buildPath, dirName;
-import std.stdio : stderr;
+import std.conv : text;
+
+/* One write(2) per line: the log is shared with the client's stdout, and
+   std.stdio's unbuffered stderr writes each argument separately */
+private void stubLog(T...)(T args)
+{
+	import core.sys.posix.unistd : write;
+	string line = text(args) ~ "\n";
+	write(2, line.ptr, line.length);
+}
 
 import config;
 import itemdb;
@@ -199,7 +208,7 @@ final class HydrationService
 		}
 		catch (FileException e)
 			throw new HydrationError(errno.EIO, e.msg);
-		stderr.writeln("STUB createEmpty ", itemDB.computePath(driveId, id));
+		stubLog("STUB createEmpty ", itemDB.computePath(driveId, id));
 		return true;
 	}
 
@@ -231,7 +240,7 @@ final class HydrationService
 		bool relocked = false;
 		scope(exit) if (!relocked) lock.lock();
 
-		stderr.writeln("STUB download ", *remote, " to ", rel);
+		stubLog("STUB download ", *remote, " to ", rel);
 		if (downloadDelayMsecs)
 			Thread.sleep(dur!"msecs"(downloadDelayMsecs));
 		if (!exists(source))
@@ -298,7 +307,7 @@ final class HydrationService
 		lock.lock();
 		scope(exit) lock.unlock();
 		openCount[key(driveId, id)] = openCount.get(key(driveId, id), 0) + 1;
-		stderr.writeln("STUB noteOpen ", id, " ", openCount[key(driveId, id)]);
+		stubLog("STUB noteOpen ", id, " ", openCount[key(driveId, id)]);
 	}
 
 	void noteClose(string driveId, string id)
@@ -308,11 +317,11 @@ final class HydrationService
 		auto k = key(driveId, id);
 		if (openCount.get(k, 0) == 0)
 		{
-			stderr.writeln("STUB noteClose UNBALANCED ", id);
+			stubLog("STUB noteClose UNBALANCED ", id);
 			return;
 		}
 		if (--openCount[k] == 0) openCount.remove(k);
-		stderr.writeln("STUB noteClose ", id, " ", openCount.get(k, 0));
+		stubLog("STUB noteClose ", id, " ", openCount.get(k, 0));
 	}
 
 	private bool isOpen(string driveId, string id)
@@ -336,7 +345,7 @@ final class HydrationService
 		Item item;
 		if (!itemDB.selectById(driveId, id, item))
 			throw new HydrationError(errno.ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
-		stderr.writeln("STUB action ", action, " ", itemDB.computePath(driveId, id));
+		stubLog("STUB action ", action, " ", itemDB.computePath(driveId, id));
 		if (item.type != ItemType.file && item.type != ItemType.dir && item.type != ItemType.root)
 			throw new HydrationError(errno.EIO, "On-demand actions are not supported for shared items");
 		if (item.type == ItemType.file) {
@@ -369,7 +378,7 @@ final class HydrationService
 		foreach (child; itemDB.selectChildren(driveId, id))
 		{
 			try requestAction(child.driveId, child.id, action);
-			catch (HydrationError e) stderr.writeln("STUB action refused ", e.msg);
+			catch (HydrationError e) stubLog("STUB action refused ", e.msg);
 		}
 	}
 
