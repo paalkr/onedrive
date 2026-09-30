@@ -16,6 +16,7 @@ import std.file;
 import std.json;
 import std.path;
 import std.string;
+import std.uni;
 
 // What other modules that we have created do we need to import?
 import config;
@@ -105,8 +106,11 @@ shared static this() {
 	lockedUploadRetryMutex = new Mutex();
 }
 
+// Registry key of an item. Microsoft Graph reports the same drive id in different letter case
+// (Issue #3336; the database stores personal drive ids lower case), so the drive id is compared
+// case-insensitively: a state set from delta JSON must be found and cleared from database ids.
 private string itemKey(string driveId, string id) {
-	return driveId ~ "/" ~ id;
+	return std.uni.toLower(driveId) ~ "/" ~ id;
 }
 
 // Does the FUSE layer hold an open handle on this item?
@@ -555,8 +559,10 @@ final class HydrationService {
 					unpin(driveId, id);
 					return;
 				case OnDemandAction.free:
-					if (!dehydrate(driveId, id)) {
-						throw new HydrationError(EBUSY, "The file is pinned or has local changes that are not uploaded");
+					// As on Windows, freeing a file removes its own pin, and also frees a file that is kept
+					// only because its folder is pinned (the folder then holds this one online-only file)
+					if (!dehydrateFile(driveId, id, true)) {
+						throw new HydrationError(EBUSY, "The file has local changes that are not uploaded");
 					}
 					return;
 				case OnDemandAction.download:
@@ -647,6 +653,12 @@ final class HydrationService {
 	// Free up space. Only if the backing file matches the DB hash and has no pending local
 	// change. Deletes the backing file, sets DB state O. Returns false if refused (dirty, pinned).
 	bool dehydrate(string driveId, string id) {
+		return dehydrateFile(driveId, id, false);
+	}
+
+	// dehydrate(); with 'explicitRequest' (free up space on this file) a pin of the file itself or of a
+	// folder above it does not refuse: the file becomes online-only (unpinned)
+	private bool dehydrateFile(string driveId, string id, bool explicitRequest) {
 		lockForStateWrite();
 		scope(exit) unlockForStateWrite();
 
@@ -655,8 +667,10 @@ final class HydrationService {
 			throw new HydrationError(ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
 		}
 		if (item.type != ItemType.file) return false;
-		if (item.hydration == hydrationPinned) return false;
-		if (isPinnedOrHasPinnedAncestor(itemDB, driveId, id)) return false;
+		if (!explicitRequest) {
+			if (item.hydration == hydrationPinned) return false;
+			if (isPinnedOrHasPinnedAncestor(itemDB, driveId, id)) return false;
+		}
 		// An open handle may be reading or writing the backing file
 		if (itemKey(driveId, id) in onDemandOpenHandles) {
 			throw new HydrationError(EBUSY, "The file is open");
@@ -1027,7 +1041,9 @@ final class HydrationService {
 				if (transientRank(state) <= transientRank(result)) continue;
 				auto separator = indexOf(entryKey, '/');
 				if (separator < 0) continue;
-				if (isBelow(entryKey[0 .. separator], entryKey[separator + 1 .. $], driveId, id)) result = state;
+				// Keys hold the drive id in lower case; an item below this directory is on its drive
+				if (entryKey[0 .. separator] != std.uni.toLower(driveId)) continue;
+				if (isBelow(driveId, entryKey[separator + 1 .. $], driveId, id)) result = state;
 			}
 
 			directoryStateCacheMutex.lock();

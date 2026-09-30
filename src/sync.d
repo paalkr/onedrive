@@ -5785,6 +5785,7 @@ class SyncEngine {
 	// On-demand: if the item is open locally, defer (and persist) its newer online version instead
 	// of replacing the file. Returns true when deferred.
 	bool onDemandDeferIfOpen(string driveId, string id, JSONValue onlineItem, bool ignoreDataPreservationCheck, string localPath) {
+		driveId = onDemandDatabaseDriveId(driveId);
 		string eTag = hasETag(onlineItem) ? onlineItem["eTag"].str : null;
 		bool first;
 		if (!deferOnlineChangeIfOpen(driveId, id, eTag, ignoreDataPreservationCheck, first)) return false;
@@ -5795,8 +5796,15 @@ class SyncEngine {
 
 	// On-demand: forget a deferral (in memory and persisted)
 	void onDemandForgetDeferral(string driveId, string id) {
+		driveId = onDemandDatabaseDriveId(driveId);
 		clearDeferredOnlineChange(driveId, id);
 		itemDB.removeOnDemandDeferred(driveId, id);
+	}
+
+	// The drive id as the database stores it: JSON from different Graph calls reports personal drive
+	// ids in different letter case, the database lower case (Issue #3336)
+	string onDemandDatabaseDriveId(string driveId) {
+		return (appConfig.accountType == "personal") ? transformToLowerCase(driveId) : driveId;
 	}
 
 	// On-demand: after a restart, re-evaluate the online changes that were deferred before it
@@ -5882,10 +5890,21 @@ class SyncEngine {
 			}
 
 			addLogEntry("On-demand: applying the online change deferred while the file was open: " ~ localPath);
+			setTransientState(dbItem.driveId, dbItem.id, TransientState.syncing);
+			bool applied = false;
 			try {
 				downloadFileItem(current, deferred.ignoreDataPreservationCheck);
+				applied = true;
 			} catch (Exception e) {
 				addLogEntry("On-demand: unable to apply a deferred online change: " ~ e.msg);
+			}
+			// Unless it was deferred again (opened meanwhile), the change is resolved: the persisted row is
+			// removed and 'pending'/'syncing' cleared ('error' is kept when the download failed)
+			if (!hasDeferredOnlineChange(dbItem.driveId, dbItem.id)) {
+				onDemandForgetDeferral(dbItem.driveId, dbItem.id);
+				Item afterApply;
+				bool downloaded = applied && itemDB.selectById(dbItem.driveId, dbItem.id, afterApply) && (afterApply.eTag == currentETag);
+				setTransientState(dbItem.driveId, dbItem.id, downloaded ? TransientState.none : TransientState.error);
 			}
 		}
 	}
