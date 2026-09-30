@@ -520,6 +520,16 @@ final class OnDemandFs : Operations
 				break;
 			case OnDemandChangeKind.deleted:
 				if (exists) return;
+				// Freed (dehydrated) or not downloaded: the file is gone from the backing dir but
+				// still in the mount as online-only; report a change, not a delete
+				stat_t visible;
+				bool stillShown = true;
+				try getattr(p, visible);
+				catch (FuseException e) stillShown = false;
+				if (stillShown) {
+					mount.queueTouch(Touch.attrib, p, null, visible.st_mtime);
+					break;
+				}
 				synchronized (touchLock) pretend[p] = Pretend(true, presentAs(p, isDirectory));
 				mount.queueTouch(dir ? Touch.rmdir : Touch.unlink, p);
 				break;

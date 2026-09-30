@@ -31,6 +31,7 @@ private void stubLog(T...)(T args)
 
 import config;
 import itemdb;
+import ondemand : notifyBackingChange;
 
 enum HydrationState { onlineOnly, hydrated, pinned }
 
@@ -263,6 +264,8 @@ final class HydrationService
 		relocked = true;
 		downloads[k] = downloads.get(k, 0) + 1;
 		itemDB.setHydration(driveId, id, "H");
+		// As the engine (cbd1508): every download commit is reported to the mount
+		notifyBackingChange("./" ~ rel, OnDemandChangeKind.changed);
 	}
 
 	bool dehydrate(string driveId, string id)
@@ -282,6 +285,8 @@ final class HydrationService
 		catch (FileException e)
 			throw new HydrationError(errno.EIO, e.msg);
 		itemDB.setHydration(driveId, id, "O");
+		// As the engine: the removed backing file is reported as deleted
+		notifyBackingChange("./" ~ itemDB.computePath(driveId, id), OnDemandChangeKind.deleted);
 		return true;
 	}
 
