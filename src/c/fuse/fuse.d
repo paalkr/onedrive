@@ -206,6 +206,18 @@ extern (System)
        handlers. Returns 0 on a clean exit. */
     int fuse_loop_mt_31(fuse* f, int clone_fd);
 
+    /* libfuse >= 3.12: the loop configuration is opaque and set through
+       these functions (all @FUSE_3.12). fuse_loop_mt_31 runs with the
+       default of at most 10 worker threads, so ten slow requests (e.g.
+       downloads) block every other request. */
+    struct fuse_loop_config;
+    fuse_loop_config* fuse_loop_cfg_create();
+    void fuse_loop_cfg_destroy(fuse_loop_config* config);
+    void fuse_loop_cfg_set_idle_threads(fuse_loop_config* config, uint value);
+    void fuse_loop_cfg_set_max_threads(fuse_loop_config* config, uint value);
+    void fuse_loop_cfg_set_clone_fd(fuse_loop_config* config, uint value);
+    int fuse_loop_mt_312(fuse* f, fuse_loop_config* config);
+
     /* Exported unversioned as fuse_main_real@@FUSE_3.0 by libfuse 3.14 */
     int fuse_main_real(int argc, char** argv, const(fuse_operations)* op,
         size_t op_size, void* private_data);

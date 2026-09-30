@@ -45,6 +45,7 @@ void main(string[] args)
 	mkdirRecurse(buildPath(backing, "emptydir"));
 	onDemandPendingMoveWaitSeconds = 2;
 	onDemandPendingExpirySeconds = 15;
+	HydrationService.webUrlDelayMsecs = 1500;
 
 	auto db = new ItemDatabase(buildPath(work, "items.sqlite3"));
 	auto svc = new HydrationService(null, db, backing);
@@ -125,6 +126,14 @@ void main(string[] args)
 	localFile("f-dst2", "d-etag", "etag/dst2.txt", "destination two\n", HydrationState.pinned);
 	localFile("f-src3", "root", "src3.txt", "source three\n", HydrationState.hydrated);
 	localFile("f-dst3", "root", "dst3.txt", "destination three\n", HydrationState.pinned);
+	// Iteration 3
+	add("d-sync", "root", "syncdir", ItemType.dir);
+	mkdirRecurse(buildPath(backing, "syncdir"));
+	mkdirRecurse(buildPath(remote, "syncdir"));
+	localFile("f-s1", "d-sync", "syncdir/s1.txt", "s1\n", HydrationState.hydrated);
+	localFile("f-s2", "d-sync", "syncdir/s2.txt", "s2\n", HydrationState.hydrated);
+	onlineFile("f-offline", "root", "offline.txt", "no url while offline\n");
+	localFile("f-deferred", "root", "deferred.txt", "open while changed online\n", HydrationState.hydrated);
 	// V-partial: a database item whose real name ends in .partial
 	onlineFile("f-keep", "d-docs", "docs/keep.partial", "not an engine partial\n");
 	// V2: a shared folder from another drive
@@ -159,6 +168,18 @@ void main(string[] args)
 			}
 			stdout.flush();
 		});
+		// Test controls: <work>/ctl/<command>-<id>[-<state>]
+		string ctl = buildPath(work, "ctl");
+		if (exists(ctl)) {
+			foreach (entry; dirEntries(ctl, SpanMode.shallow)) {
+				import std.string : split;
+				auto parts = baseName(entry.name).split("~");
+				if (parts[0] == "defer") svc.deferForTest(driveId, parts[1]);
+				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!OnDemandTransientState);
+				remove(entry.name);
+				writeln("CTL ", baseName(entry.name));
+			}
+		}
 		// The client logger writes to the same buffered stdout
 		stdout.flush();
 		while (due.length && due[0].at <= MonoTime.currTime) {
