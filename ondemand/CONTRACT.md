@@ -124,3 +124,35 @@ Goal: the file manager never needs to read an online-only file to draw a thumbna
 ### File manager (nautilus owns, new `contrib/nautilus/onedrive-ondemand.py`)
 
 nautilus-python 4.0 extension for Nautilus 46: shows the state per file and adds a context-menu submenu "OneDrive" with "Download now", "Always keep on this device" / "Stop keeping on this device", "Free up space", for files AND folders, only for paths inside an on-demand mount, all via the action xattrs above. State indication: emblems if Nautilus 46 still renders them, otherwise the best supported alternative (to be verified, not assumed).
+
+## Iteration 3: behaviour close to the Windows client
+
+Goal: the Linux experience matches the Windows OneDrive client as closely as the platform allows. Conflict copies keep upstream's naming (`<name>-<host>-safeBackup-NNNN.<ext>`).
+
+### Open locally while changed online (engine owns, vfs supplies open counts)
+
+- When the engine is about to replace a present backing file with a newer online version (changed online, H or P item) and HydrationService reports open handles for that item (`noteOpen` count > 0), it does not replace the file. It records the item as "online change deferred" and logs one line.
+- On the last `noteClose` of such an item, the engine re-evaluates it on the main thread (wake via the existing OnDemandWake/queue path): if the backing file is unchanged against the DB, download and replace as normal; if it changed locally, apply the normal conflict handling (safeBackup of the local version, then download), exactly once.
+- A deferred item that stays open is re-checked at every sync cycle; nothing is lost if the process restarts (the next sync sees the online change again).
+
+### Locked online (engine owns)
+
+- An upload refused because the item is checked out or locked for editing (HTTP 423, "resourceLocked" / the existing "checked out or locked for editing by another user" path) is retried on a short schedule instead of waiting for the next sync cycle: 30 s, 60 s, 120 s, then every monitor interval. Other failures keep today's behaviour.
+- The item shows state `pending` (see below) while it waits.
+
+### Transient sync states (engine owns the source, vfs exposes, nautilus shows)
+
+`user.onedrive.state` gains three values, which take precedence over the stored hydration state while they apply:
+- `syncing`: an upload or download (including hydration) of this item is in progress.
+- `pending`: a local change is queued or waiting for a retry (locked online, deferred online change, offline).
+- `error`: the last upload/download of this item failed with a non-transient error; cleared on the next success or when the item changes.
+The engine keeps these in a thread-safe per-item map (driveId, id) exposed through `HydrationService.transientStateOf(driveId, id)`; items not in the map report the stored state as before. Directories: `syncing` if any file below is syncing, else `pending` if any is pending, else `error` if any is error, else as before (use the existing 2 s directory cache, invalidated on transient changes too).
+
+### View online (engine + vfs + nautilus)
+
+- `user.onedrive.weburl` (read): the item's OneDrive web URL (Graph `webUrl`). The engine fetches it on demand with `getPathDetailsById` (never hydrates, 10 s timeout, cached per eTag). ENODATA for items not in the DB; EIO if offline.
+- Nautilus: "View online" in the OneDrive submenu for a single selected file or folder; opens the URL with the default browser (Gio.AppInfo.launch_default_for_uri), asynchronously.
+
+### Emblems (nautilus owns)
+
+online-only: cloud; hydrated: check; pinned: circled check; syncing and pending: sync arrows; error: an error emblem (e.g. `emblem-important` / `dialog-error-symbolic`, whichever exists in the theme); local (not yet in the DB): sync arrows. Poll interval unchanged; items in `syncing`/`pending` are refreshed every 2 s until they settle.
