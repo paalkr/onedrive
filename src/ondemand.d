@@ -48,6 +48,7 @@ __gshared uint onDemandPendingMoveWaitSeconds = 30;
 
 private enum pinXattr = "user.onedrive.pin";
 private enum stateXattr = "user.onedrive.state";
+private enum actionXattr = "user.onedrive.action";
 private enum FUSE_CAP_ATOMIC_O_TRUNC = 1 << 3;
 private enum fileMode = octal!600;
 private enum dirMode = octal!700;
@@ -369,8 +370,8 @@ final class OnDemandFs : Operations
 			st.st_mode = S_IFREG | fileMode;
 			st.st_nlink = 1;
 			st.st_size = item.size.length ? item.size.to!long : 0;
-			// Report the full allocation; st_blocks 0 makes some tools treat the file as sparse
-			st.st_blocks = (st.st_size + 511) / 512;
+			// Nothing is stored locally, so du shows real local usage
+			st.st_blocks = 0;
 		} else {
 			// Hydrated or pinned in the database but gone from the backing dir: deleted locally
 			fail(ENOENT);
@@ -665,9 +666,29 @@ final class OnDemandFs : Operations
 
 	// Extended attributes
 
-	private string stateName(const(char)[] path, out Item item) {
-		if (!resolve(path, item) || item.type != ItemType.file) return null;
-		final switch (hydration.stateOf(item.driveId, item.id)) {
+	// user.onedrive.state: online-only, hydrated, pinned; local for an item not in the database
+	private string stateName(const(char)[] path) {
+		Item item;
+		if (!resolve(path, item)) {
+			stat_t st;
+			getattr(path, st);   // ENOENT if the path does not exist at all
+			return "local";
+		}
+		// For a directory stateOf() aggregates: pinned if it is pinned, else online-only
+		// if any file below it is, else hydrated
+		string driveId = item.type == ItemType.remote ? item.remoteDriveId : item.driveId;
+		string id = item.type == ItemType.remote ? item.remoteId : item.id;
+		HydrationState state;
+		try state = hydration.stateOf(driveId, id);
+		catch (HydrationError e) return "local";
+		if (isDirectory(item)) {
+			final switch (state) {
+				case HydrationState.pinned: return "pinned";
+				case HydrationState.hydrated: return "hydrated";
+				case HydrationState.onlineOnly: return "online-only";
+			}
+		}
+		final switch (state) {
 			case HydrationState.pinned: return "pinned";
 			case HydrationState.hydrated: return "hydrated";
 			case HydrationState.onlineOnly:
@@ -676,14 +697,42 @@ final class OnDemandFs : Operations
 		}
 	}
 
-	override const(ubyte)[] getxattr(const(char)[] path, const(char)[] name) {
-		if (name == stateXattr || name == pinXattr) {
-			Item item;
-			string state = stateName(path, item);
-			if (state is null) fail(ENODATA);
-			if (name == pinXattr) return cast(const(ubyte)[]) (state == "pinned" ? "1" : "0");
-			return cast(const(ubyte)[]) state;
+	// Runs a user.onedrive.action (or pin alias) on the item at path
+	private void runAction(const(char)[] path, OnDemandAction action) {
+		Item item;
+		if (!resolve(path, item)) {
+			stat_t st;
+			getattr(path, st);
+			// Not in the database yet: nothing to download or free, pinning waits for the upload
+			fail(EOPNOTSUPP);
 		}
+		// Downloads and deletes go to the database path of the item
+		if (!resolveSettled(path, item)) fail(ENOENT);
+		try {
+			hydration.requestAction(item.driveId, item.id, action);
+		} catch (HydrationError e) {
+			addLogEntry("On-demand " ~ to!string(action) ~ " failed for " ~ dbPath(path) ~ ": " ~ e.msg);
+			fail(e.errnoCode ? e.errnoCode : EIO);
+		}
+	}
+
+	private static bool parseAction(const(char)[] value, out OnDemandAction action) {
+		import std.string : strip;
+		switch (value.strip) {
+			case "download": action = OnDemandAction.download; return true;
+			case "pin": action = OnDemandAction.pin; return true;
+			case "unpin": action = OnDemandAction.unpin; return true;
+			case "free": action = OnDemandAction.free; return true;
+			default: return false;
+		}
+	}
+
+	override const(ubyte)[] getxattr(const(char)[] path, const(char)[] name) {
+		if (name == stateXattr) return cast(const(ubyte)[]) stateName(path);
+		// Compatibility alias, readable as 1/0
+		if (name == pinXattr) return cast(const(ubyte)[]) (stateName(path) == "pinned" ? "1" : "0");
+		// Write-only
+		if (name == actionXattr) fail(ENODATA);
 		string target = backingPath(path);
 		if (!existsPath(target)) fail(ENODATA);
 		auto size = lgetxattr(toStringz(target), toStringz(name), null, 0);
@@ -696,22 +745,17 @@ final class OnDemandFs : Operations
 
 	override void setxattr(const(char)[] path, const(char)[] name, in ubyte[] value, int flags) {
 		if (name == stateXattr) fail(EPERM);
+		auto v = cast(const(char)[]) value;
+		if (name == actionXattr) {
+			OnDemandAction action;
+			if (!parseAction(v, action)) fail(EINVAL);
+			runAction(path, action);
+			return;
+		}
 		if (name == pinXattr) {
-			Item item;
-			if (stateName(path, item) is null) fail(ENOTSUP);
-			auto v = cast(const(char)[]) value;
-			try {
-				if (v == "1") {
-					// pin() downloads to the database path of the item
-					if (!resolveSettled(path, item)) fail(ENOENT);
-					hydration.pin(item.driveId, item.id);
-				}
-				else if (v == "0") hydration.unpin(item.driveId, item.id);
-				else fail(EINVAL);
-			} catch (HydrationError e) {
-				addLogEntry("On-demand pin failed for " ~ dbPath(path) ~ ": " ~ e.msg);
-				fail(e.errnoCode ? e.errnoCode : EIO);
-			}
+			if (v == "1") runAction(path, OnDemandAction.pin);
+			else if (v == "0") runAction(path, OnDemandAction.unpin);
+			else fail(EINVAL);
 			return;
 		}
 		string target = backingPath(path);
@@ -719,10 +763,12 @@ final class OnDemandFs : Operations
 		check(lsetxattr(toStringz(target), toStringz(name), value.ptr, value.length, flags));
 	}
 
+	// Lists user.onedrive.state only: action is write-only and pin a legacy alias, and
+	// listing them would make "getfattr -d" fail or show a duplicate of the state
 	override string[] listxattr(const(char)[] path) {
-		string[] names;
-		Item item;
-		if (stateName(path, item) !is null) names = [pinXattr, stateXattr];
+		stat_t st;
+		getattr(path, st);
+		string[] names = [stateXattr];
 		string target = backingPath(path);
 		if (existsPath(target)) {
 			auto size = llistxattr(toStringz(target), null, 0);
@@ -740,7 +786,7 @@ final class OnDemandFs : Operations
 	}
 
 	override void removexattr(const(char)[] path, const(char)[] name) {
-		if (name == stateXattr || name == pinXattr) fail(EPERM);
+		if (name == stateXattr || name == pinXattr || name == actionXattr) fail(EPERM);
 		string target = backingPath(path);
 		if (!existsPath(target)) fail(ENODATA);
 		check(lremovexattr(toStringz(target), toStringz(name)));

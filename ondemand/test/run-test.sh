@@ -52,7 +52,7 @@ BIGSIZE=$(stat -c %s "$R/docs/big.txt")
 ok "stat size of online-only file = remote size ($BIGSIZE)" '[ "$(t stat -c %s "$M/docs/big.txt")" = "$BIGSIZE" ]'
 ok "stat mtime of online-only file from DB (1704164645)" '[ "$(t stat -c %Y "$M/docs/big.txt")" = 1704164645 ]'
 ok "stat mode of online-only file is 0600 regular" '[ "$(t stat -c %A "$M/docs/big.txt")" = "-rw-------" ]'
-ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply docs emptydir hold local.txt shared write-me.txt " ]'
+ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply docs emptydir hold lib local.txt one.txt shared write-me.txt " ]'
 ok "online-only file not in backing dir" '[ ! -e "$B/docs/big.txt" ]'
 ok "state xattr online-only" '[ "$(xget "$M/docs/big.txt" user.onedrive.state)" = online-only ]'
 ok "open+close without read does not hydrate" 't python3 -c "import os; os.close(os.open(\"$M/docs/pin-me.txt\", os.O_RDONLY))" && [ "$(downloads docs/pin-me.txt)" = 0 ]'
@@ -90,7 +90,7 @@ ok "create event changed" 'event "changed ./new.txt"'
 t mkdir "$M/newdir"
 ok "mkdir backing dir" '[ -d "$B/newdir" ]'
 ok "mkdir event createDir" 'event "createDir ./newdir"'
-ok "state xattr absent for item not in DB" 'xget "$M/new.txt" user.onedrive.state | grep -q "No data available"'
+ok "I2 state xattr local for item not in DB" '[ "$(xget "$M/new.txt" user.onedrive.state)" = local ]'
 
 echo "== rename online-only file"
 t mv "$M/docs/move-me.txt" "$M/docs/moved.txt"
@@ -177,6 +177,46 @@ ok "pin=1 state pinned, pin xattr 1" '[ "$(xget "$M/docs/pin-me.txt" user.onedri
 xset "$M/docs/pin-me.txt" user.onedrive.pin 0
 ok "pin=0 state hydrated" '[ "$(xget "$M/docs/pin-me.txt" user.onedrive.state)" = hydrated ]'
 
+echo "== I2 st_blocks"
+ok "I2 st_blocks 0 for online-only file" '[ "$(t stat -c %b "$M/lib/a.txt")" = 0 ] && [ "$(t du -k "$M/lib/a.txt" | cut -f1)" = 0 ]'
+ok "I2 st_blocks of hydrated file from backing file" '[ "$(t stat -c %b "$M/docs/big.txt")" = "$(stat -c %b "$B/docs/big.txt")" ] && [ "$(t stat -c %b "$M/docs/big.txt")" -gt 0 ]'
+
+echo "== I2 user.onedrive.action on a file"
+act() { xset "$1" user.onedrive.action "$2"; }
+ok "I2 listxattr lists only the state" '[ "$(t python3 -c "import os,sys; print(\" \".join(os.listxattr(sys.argv[1])))" "$M/one.txt")" = user.onedrive.state ]'
+ok "I2 action is write-only (ENODATA on read)" 'xget "$M/one.txt" user.onedrive.action | grep -q "No data available"'
+ok "I2 unknown action: EINVAL" 'act "$M/one.txt" bogus | grep -q "Invalid argument"'
+act "$M/one.txt" download
+ok "I2 file download: hydrated, backing present" '[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ] && [ -f "$B/one.txt" ] && [ "$(downloads one.txt)" = 1 ]'
+act "$M/one.txt" free
+ok "I2 file free: online-only, backing gone, size kept" '[ "$(xget "$M/one.txt" user.onedrive.state)" = online-only ] && [ ! -e "$B/one.txt" ] && [ "$(t stat -c %s "$M/one.txt")" = 19 ]'
+act "$M/one.txt" pin
+ok "I2 file pin: pinned" '[ "$(xget "$M/one.txt" user.onedrive.state)" = pinned ] && [ -f "$B/one.txt" ]'
+ok "I2 free of a pinned file: EBUSY, file kept" 'act "$M/one.txt" free | grep -q "Device or resource busy" && [ -f "$B/one.txt" ]'
+act "$M/one.txt" unpin
+ok "I2 file unpin: hydrated, not dehydrated" '[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ] && [ -f "$B/one.txt" ]'
+ok "I2 free of an online-only file with an unuploaded local change: EBUSY" 'act "$M/docs/trunc.txt" free | grep -q "Device or resource busy" && [ "$(cat "$B/docs/trunc.txt")" = new ]'
+ok "I2 action on item not in DB: EOPNOTSUPP" 'act "$M/new.txt" pin | grep -q "Operation not supported"'
+
+echo "== I2 user.onedrive.action on a directory"
+ok "I2 directory state online-only while a file below is" '[ "$(xget "$M/lib" user.onedrive.state)" = online-only ]'
+act "$M/lib" download
+ok "I2 dir download hydrates every file below" '[ -f "$B/lib/a.txt" ] && [ -f "$B/lib/b.txt" ] && [ -f "$B/lib/sub/c.txt" ] && [ "$(xget "$M/lib/sub/c.txt" user.onedrive.state)" = hydrated ]'
+ok "I2 directory state hydrated when all below are" '[ "$(xget "$M/lib" user.onedrive.state)" = hydrated ] && [ "$(xget "$M/lib/sub" user.onedrive.state)" = hydrated ]'
+act "$M/lib" pin
+ok "I2 dir pin: dir and files pinned" '[ "$(xget "$M/lib" user.onedrive.state)" = pinned ] && [ "$(xget "$M/lib/sub/c.txt" user.onedrive.state)" = pinned ]'
+ok "I2 free of a file in a pinned directory: EBUSY" 'act "$M/lib/a.txt" free | grep -q "Device or resource busy" && [ -f "$B/lib/a.txt" ]'
+act "$M/lib" unpin
+ok "I2 dir unpin: hydrated, files kept" '[ "$(xget "$M/lib" user.onedrive.state)" = hydrated ] && [ "$(xget "$M/lib/a.txt" user.onedrive.state)" = hydrated ] && [ -f "$B/lib/a.txt" ]'
+act "$M/lib" pin
+act "$M/lib" free
+ok "I2 dir free (from pinned): unpins, dehydrates every file" '[ ! -e "$B/lib/a.txt" ] && [ ! -e "$B/lib/b.txt" ] && [ ! -e "$B/lib/sub/c.txt" ] && [ "$(xget "$M/lib/sub/c.txt" user.onedrive.state)" = online-only ]'
+ok "I2 dir state online-only after free, sizes kept" '[ "$(xget "$M/lib" user.onedrive.state)" = online-only ] && [ "$(t stat -c %s "$M/lib/b.txt")" = 9 ]'
+sleep 1.2   # let the kernel's 1 s attribute cache of the freed files expire
+echo "   (du -sk lib after free: $(t du -sk "$M/lib" | cut -f1) kB, backing dirs: $(du -sk "$B/lib" | cut -f1) kB)"
+ok "I2 du after free counts only the directories" '[ "$(t du -sk "$M/lib" | cut -f1)" = "$(du -sk "$B/lib" | cut -f1)" ]'
+ok "I2 pin alias on a directory" 'xset "$M/lib" user.onedrive.pin 1 && [ "$(xget "$M/lib" user.onedrive.state)" = pinned ] && [ "$(xget "$M/lib" user.onedrive.pin)" = 1 ]'
+
 echo "== events seen"
 grep '^EVENT' "$LOG"
 
@@ -190,7 +230,7 @@ ok "STOPPED printed" 'grep -q STOPPED "$LOG"'
 ok "no mount left" '! grep -q " $M fuse" /proc/mounts'
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|EVENT|APPLIED|STUB download|STUB createEmpty|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|EVENT|APPLIED|STUB download|STUB createEmpty|STUB action|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"
