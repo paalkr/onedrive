@@ -374,6 +374,9 @@ class CurlResponse {
 	string streamedQuickXorHash;
 	ulong streamedHashBytes;
 
+	// On-demand: redact every JSON "url" string value in diagnostic output (pre-signed thumbnail URLs)
+	bool redactUrlValues = false;
+
 	this() {
 		reset();
 	}
@@ -528,6 +531,7 @@ class CurlResponse {
 		if (!content.empty) {
 			str ~= format("\n----\n%s\n----\n", content);
 		}
+		if (redactUrlValues) str = redactJsonStringValue(str, "url");
 		return redactOAuthSecrets(str);
 	}
 

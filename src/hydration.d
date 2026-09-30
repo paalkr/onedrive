@@ -8,6 +8,7 @@ import core.sync.condition;
 import core.sync.mutex;
 import core.thread;
 import std.algorithm;
+import std.array;
 import std.conv;
 import std.datetime;
 import std.exception;
@@ -175,7 +176,20 @@ final class HydrationService {
 	private int databaseUsers;
 	// Set by shutdown(); aborts in-progress transfers of this service's OneDriveApi instances
 	private shared bool abortTransfers;
+	// Open file handles per item (driveId/id), reported by the FUSE layer; guarded by onDemandStateMutex
+	private int[string] openHandles;
+	// Directory states computed by stateOf(), valid for a short time and until any hydration write
+	private struct CachedDirectoryState {
+		HydrationState state;
+		ulong generation;
+		MonoTime computedAt;
+	}
+	private CachedDirectoryState[string] directoryStateCache;
+	private Mutex directoryStateCacheMutex;
+	private enum directoryStateCacheTtl = dur!"seconds"(2);
+	private enum directoryStateCacheLimit = 10_000;
 	// Background worker for requestAction(); started on first use
+	private enum actionQueueLimit = 10_000;
 	private OnDemandActionRequest[] actionQueue;
 	private Thread actionWorker;
 	private bool actionWorkerRunning;
@@ -194,6 +208,28 @@ final class HydrationService {
 		this.spaceReservation = appConfig.getValueLong("space_reservation");
 		serviceMutex = new Mutex();
 		serviceCondition = new Condition(serviceMutex);
+		directoryStateCacheMutex = new Mutex();
+	}
+
+	// An open or create of a handle on this item (FUSE layer). A file with open handles is never dehydrated.
+	void noteOpen(string driveId, string id) {
+		onDemandStateMutex.lock();
+		scope(exit) onDemandStateMutex.unlock();
+		openHandles[driveId ~ "/" ~ id]++;
+	}
+
+	// The release of a handle counted by noteOpen(). An unmatched call is ignored.
+	void noteClose(string driveId, string id) {
+		onDemandStateMutex.lock();
+		scope(exit) onDemandStateMutex.unlock();
+		string key = driveId ~ "/" ~ id;
+		if (auto count = key in openHandles) {
+			if (*count <= 1) {
+				openHandles.remove(key);
+			} else {
+				(*count)--;
+			}
+		}
 	}
 
 	// File: its database state. Directory: pinned if it is pinned, otherwise online-only if any
@@ -205,7 +241,25 @@ final class HydrationService {
 		}
 		if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
 			if (item.hydration == hydrationPinned) return HydrationState.pinned;
-			return subtreeHasOnlineOnlyItems(itemDB, driveId, id) ? HydrationState.onlineOnly : HydrationState.hydrated;
+			string key = driveId ~ "/" ~ id;
+			ulong generation = itemDB.hydrationGeneration();
+			MonoTime now = MonoTime.currTime;
+			directoryStateCacheMutex.lock();
+			if (auto cached = key in directoryStateCache) {
+				if ((cached.generation == generation) && (now - cached.computedAt < directoryStateCacheTtl)) {
+					HydrationState state = cached.state;
+					directoryStateCacheMutex.unlock();
+					return state;
+				}
+			}
+			directoryStateCacheMutex.unlock();
+
+			HydrationState state = subtreeHasOnlineOnlyItems(itemDB, driveId, id) ? HydrationState.onlineOnly : HydrationState.hydrated;
+			directoryStateCacheMutex.lock();
+			if (directoryStateCache.length >= directoryStateCacheLimit) directoryStateCache = null;
+			directoryStateCache[key] = CachedDirectoryState(state, generation, now);
+			directoryStateCacheMutex.unlock();
+			return state;
 		}
 		return hydrationStateFromDatabase(item.hydration);
 	}
@@ -243,6 +297,13 @@ final class HydrationService {
 		serviceMutex.lock();
 		scope(exit) serviceMutex.unlock();
 		if (shuttingDown) throw new HydrationError(EIO, "Hydration service is shutting down");
+		// Coalesce: a newer action for the same item replaces a queued one
+		size_t queuedBefore = actionQueue.length;
+		actionQueue = actionQueue.filter!(queued => !((queued.driveId == driveId) && (queued.id == id))).array;
+		if ((actionQueue.length == queuedBefore) && (actionQueue.length >= actionQueueLimit)) {
+			addLogEntry("On-demand: refusing '" ~ to!string(action) ~ "' for " ~ item.name ~ ": " ~ to!string(actionQueueLimit) ~ " actions are already queued");
+			throw new HydrationError(EAGAIN, "Too many on-demand actions are queued");
+		}
 		actionQueue ~= OnDemandActionRequest(driveId, id, action);
 		if (actionWorker is null) {
 			actionWorkerRunning = true;
@@ -325,6 +386,10 @@ final class HydrationService {
 		if (item.type != ItemType.file) return false;
 		if (item.hydration == hydrationPinned) return false;
 		if (isPinnedOrHasPinnedAncestor(itemDB, driveId, id)) return false;
+		// An open handle may be reading or writing the backing file
+		if ((driveId ~ "/" ~ id) in openHandles) {
+			throw new HydrationError(EBUSY, "The file is open");
+		}
 
 		string backingPath = backingPathFor(driveId, id);
 		if (item.hydration == hydrationOnlineOnly) {
@@ -514,6 +579,10 @@ final class HydrationService {
 				serviceCondition.wait();
 			}
 			if (shuttingDown) {
+				foreach (dropped; actionQueue) {
+					addLogEntry("On-demand: shutting down, dropping queued '" ~ to!string(dropped.action) ~ "' for item " ~ dropped.id);
+				}
+				actionQueue = null;
 				serviceMutex.unlock();
 				return;
 			}

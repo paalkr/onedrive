@@ -9,6 +9,7 @@ import std.string;
 import std.stdio;
 import std.algorithm.searching;
 import core.stdc.stdlib;
+import core.atomic;
 import core.sync.mutex;
 import std.json;
 import std.conv;
@@ -218,6 +219,8 @@ final class ItemDatabase {
 	private Mutex transactionMutex;
 	private bool transactionMutexHeld = false;
 	private bool serialiseTransactions = false;
+	// On-demand: incremented on every hydration state write and delete, so cached derived states can be invalidated
+	private shared ulong hydrationWriteGeneration;
 	
 	this(string filename) {
 		// Initialise the database monitor used to serialise all database access
@@ -785,6 +788,7 @@ final class ItemDatabase {
 	}
 
 	void deleteById(const(char)[] driveId, const(char)[] id) {
+		atomicOp!"+="(hydrationWriteGeneration, 1);
 		synchronized(databaseLock) {
 			auto p = db.prepare(deleteItemByIdStmt);
 			scope(exit) p.finalise(); // Ensure that the prepared statement is finalised after execution.
@@ -799,8 +803,14 @@ final class ItemDatabase {
 		}
 	}
 
+	// On-demand: changes whenever a hydration state may have changed
+	ulong hydrationGeneration() {
+		return atomicLoad(hydrationWriteGeneration);
+	}
+
 	// Set only the on-demand hydration state of an item. A null state stores NULL (hydrated).
 	void setHydration(const(char)[] driveId, const(char)[] id, const(char)[] state) {
+		atomicOp!"+="(hydrationWriteGeneration, 1);
 		synchronized(databaseLock) {
 			auto p = db.prepare("UPDATE item SET hydration = ?3 WHERE driveId = ?1 AND id = ?2");
 			scope(exit) p.finalise(); // Ensure that the prepared statement is finalised after execution.
@@ -859,6 +869,7 @@ final class ItemDatabase {
 			bind(19, relocParentId);
 			// NULL keeps the stored value (COALESCE in the statements)
 			bind(20, writeHydration ? hydration : null);
+			if (writeHydration) atomicOp!"+="(hydrationWriteGeneration, 1);
 		}
 	}
 

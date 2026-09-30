@@ -41,6 +41,9 @@ final class ThumbnailService {
 	private Condition serviceCondition;
 	private Thread worker;
 	private bool passRequested;
+	// Items to handle before the next full pass (new online-only files), in arrival order
+	private Item[] priorityItems;
+	private enum priorityItemsLimit = 10_000;
 	private bool shuttingDown;
 	private bool workerRunning;
 	private shared bool abortTransfers;
@@ -85,13 +88,31 @@ final class ThumbnailService {
 		scope(exit) serviceMutex.unlock();
 		if (shuttingDown) return;
 		passRequested = true;
+		startWorkerLocked();
+		serviceCondition.notifyAll();
+	}
+
+	// Handle these items (just recorded as online-only) soon, ahead of a full pass. Never blocks.
+	void requestItems(Item[] items) {
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		if (shuttingDown) return;
+		foreach (item; items) {
+			if (!isThumbnailable(item.name)) continue;
+			if (priorityItems.length >= priorityItemsLimit) break;
+			priorityItems ~= item;
+		}
+		startWorkerLocked();
+		serviceCondition.notifyAll();
+	}
+
+	private void startWorkerLocked() {
 		if (worker is null) {
 			workerRunning = true;
 			worker = new Thread(&workerLoop);
 			worker.isDaemon = true;
 			worker.start();
 		}
-		serviceCondition.notifyAll();
 	}
 
 	// Stop the worker; waits (bounded) so it does not use the database after shutdown
@@ -123,22 +144,26 @@ final class ThumbnailService {
 		}
 		while (true) {
 			serviceMutex.lock();
-			while (!passRequested && !shuttingDown) serviceCondition.wait();
+			while (!passRequested && (priorityItems.length == 0) && !shuttingDown) serviceCondition.wait();
 			if (shuttingDown) {
 				serviceMutex.unlock();
 				return;
 			}
-			passRequested = false;
+			Item[] items = priorityItems;
+			priorityItems = null;
+			bool fullPass = passRequested && (items.length == 0);
+			if (fullPass) passRequested = false;
 			serviceMutex.unlock();
 			try {
-				runPass();
+				// New items first; a requested full pass follows once they are done
+				runPass(fullPass ? itemDB.selectOnlineOnlyFiles() : items);
 			} catch (Exception e) {
 				addLogEntry("On-demand: thumbnail pass failed: " ~ e.msg);
 			}
 		}
 	}
 
-	private void runPass() {
+	private void runPass(Item[] candidates) {
 		OneDriveApi api;
 		scope(exit) {
 			if (api !is null) {
@@ -148,9 +173,12 @@ final class ThumbnailService {
 		}
 		int fetches = 0;
 		int written = 0;
-		foreach (item; itemDB.selectOnlineOnlyFiles()) {
+		foreach (candidate; candidates) {
 			if (isShuttingDown() || (fetches >= maxFetchesPerPass)) break;
-			if (!isThumbnailable(item.name)) continue;
+			if (!isThumbnailable(candidate.name)) continue;
+			// Use the current record: the item may have been hydrated, moved or removed meanwhile
+			Item item;
+			if (!itemDB.selectById(candidate.driveId, candidate.id, item) || (item.hydration != "O") || (item.type != ItemType.file)) continue;
 			string key = item.driveId ~ "/" ~ item.id;
 			if (auto previousETag = key in attempted) {
 				if (*previousETag == item.eTag) continue;

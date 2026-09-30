@@ -2452,6 +2452,11 @@ bool startOnDemand() {
 	addLogEntry("Files On-Demand mount is active: " ~ mountPoint);
 	if (appConfig.getValueBool("on_demand_thumbnails")) {
 		onDemandThumbnailService = ThumbnailService.create(appConfig, itemDB, mountPoint);
+		if (onDemandThumbnailService !is null) {
+			syncEngineInstance.onDemandOnlineOnlyItemsCommitted = delegate(Item[] items) {
+				if (onDemandThumbnailService !is null) onDemandThumbnailService.requestItems(items);
+			};
+		}
 	}
 	return true;
 }

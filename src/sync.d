@@ -159,6 +159,10 @@ class SyncEngine {
 	// filesystem echoes, but it does not own or process inotify state.
 	void delegate(string source) capturePendingLocalChanges;
 	bool delegate(string path) hasPendingLocalDeparture;
+	// On-demand: called on the main thread after each committed delta batch with the items that batch
+	// recorded as online-only (thumbnails can then be fetched before a file manager shows them)
+	void delegate(Item[] items) onDemandOnlineOnlyItemsCommitted;
+	private Item[] onDemandNewOnlineOnlyItems;
 	void delegate(string path) recordExpectedLocalDirectoryCreate;
 	void delegate(string from, string to) recordExpectedLocalMove;
 	void delegate(string path) recordExpectedLocalFileArrival;
@@ -2072,6 +2076,12 @@ class SyncEngine {
 				// Commit this batch of changes to the database
 				itemDB.commitTransaction();
 
+				// On-demand: report the online-only items this batch recorded
+				if (onDemand && (onDemandNewOnlineOnlyItems.length > 0)) {
+					if (onDemandOnlineOnlyItemsCommitted !is null) onDemandOnlineOnlyItemsCommitted(onDemandNewOnlineOnlyItems);
+					onDemandNewOnlineOnlyItems = null;
+				}
+
 				// To finish off the JSON processing items, this is needed to reflect this in the log
 				if (debugLogging) {addLogEntry(debugLogBreakType1, ["debug"]);}
 
@@ -3822,6 +3832,7 @@ class SyncEngine {
 					if (verboseLogging) {addLogEntry("On-demand: recording new online file as online-only: " ~ newItemPath, ["verbose"]);}
 					setItemHydration(newDatabaseItem, hydrationOnlineOnly);
 					itemDB.upsert(newDatabaseItem);
+					onDemandNewOnlineOnlyItems ~= newDatabaseItem;
 					goto functionCompletion;
 				}
 				// Add to the file to the download array for processing later
