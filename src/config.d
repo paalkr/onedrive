@@ -417,6 +417,8 @@ class ApplicationConfig {
 		boolValues["on_demand"] = false;
 		// The local backing directory used when 'on_demand' is enabled. Empty means '<confdir>/ondemand/backing'
 		stringValues["on_demand_backing_dir"] = "";
+		// Write file manager thumbnails for online-only files from Microsoft OneDrive thumbnails
+		boolValues["on_demand_thumbnails"] = true;
 		// On-demand CLI commands (path inside the mount); handled before any database or authentication use
 		stringValues["on_demand_cli_download"] = "";
 		stringValues["on_demand_cli_pin"] = "";
@@ -1843,6 +1845,7 @@ class ApplicationConfig {
 		addLogEntry("Config option 'download_only'                 = " ~ to!string(getValueBool("download_only")));
 		addLogEntry("Config option 'on_demand'                     = " ~ to!string(getValueBool("on_demand")));
 		addLogEntry("Config option 'on_demand_backing_dir'         = " ~ getValueString("on_demand_backing_dir"));
+		addLogEntry("Config option 'on_demand_thumbnails'          = " ~ to!string(getValueBool("on_demand_thumbnails")));
 		addLogEntry("Config option 'local_first'                   = " ~ to!string(getValueBool("local_first")));
 		addLogEntry("Config option 'mirror_local_state'            = " ~ to!string(getValueBool("mirror_local_state")));
 		addLogEntry("Config option 'check_nosync'                  = " ~ to!string(getValueBool("check_nosync")));

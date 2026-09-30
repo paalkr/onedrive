@@ -1462,6 +1462,26 @@ final class ItemDatabase {
 		}
 	}
 
+	// On-demand: all online-only file items
+	Item[] selectOnlineOnlyFiles() {
+		synchronized(databaseLock) {
+			Item[] items;
+			auto stmt = db.prepare("SELECT * FROM item WHERE hydration = 'O' AND type = 'file'");
+			scope(exit) stmt.finalise(); // Ensure that the prepared statement is finalised after execution.
+			try {
+				auto res = stmt.exec();
+				while (!res.empty) {
+					items ~= buildItem(res);
+					res.step();
+				}
+			} catch (SqliteException exception) {
+				// Handle the error appropriately
+				detailSQLErrorMessage(exception);
+			}
+			return items;
+		}
+	}
+
 	// On-demand: does any item have the online-only hydration state?
 	bool hasOnlineOnlyItems() {
 		synchronized(databaseLock) {

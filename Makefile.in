@@ -96,6 +96,8 @@ SOURCES = \
 	src/localAuth.d \
 	src/hydration.d \
 	src/ondemandcli.d \
+	src/thumbnails.d \
+	src/thumbnailpng.d \
 	src/ondemand.d \
 	src/c/fuse/common.d \
 	src/c/fuse/fuse.d \

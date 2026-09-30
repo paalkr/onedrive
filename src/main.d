@@ -40,6 +40,7 @@ import socketio;
 import hydration;
 import ondemand;
 import ondemandcli;
+import thumbnails;
 
 // Native stack trace support for fatal signal diagnostics.
 // On OpenBSD this is provided by libexecinfo; on Linux this is provided by glibc.
@@ -136,6 +137,7 @@ OneDriveSocketIo oneDriveSocketIo;
 // the FUSE layer receives them through its constructor.
 HydrationService onDemandHydrationService;
 OnDemandChangeQueue onDemandChangeQueue;
+ThumbnailService onDemandThumbnailService;
 bool onDemandMountActive = false;
 // On-demand local changes drained from onDemandChangeQueue, waiting to be applied
 OnDemandLocalChange[] pendingOnDemandChanges;
@@ -1638,6 +1640,9 @@ int main(string[] cliArgs) {
 							// Handle any new inotify events
 							captureAndApplyInotifyEvents("monitor_loop.post_sync_process");
 
+							// On-demand: refresh thumbnails of online-only files in the background
+							if (onDemandThumbnailService !is null) onDemandThumbnailService.requestPass();
+
 							// Detail the outcome of the sync process
 							if (appConfig.systemTimeAllowsSync()) {
 								displaySyncOutcome();
@@ -2445,6 +2450,9 @@ bool startOnDemand() {
 	}
 	onDemandMountActive = true;
 	addLogEntry("Files On-Demand mount is active: " ~ mountPoint);
+	if (appConfig.getValueBool("on_demand_thumbnails")) {
+		onDemandThumbnailService = ThumbnailService.create(appConfig, itemDB, mountPoint);
+	}
 	return true;
 }
 
@@ -3198,6 +3206,11 @@ void shutdownFilesystemMonitor() {
 }
 
 void shutdownOnDemand() {
+	if (onDemandThumbnailService !is null) {
+		if (debugLogging) {addLogEntry("Shutting down on-demand thumbnail service", ["debug"]);}
+		onDemandThumbnailService.shutdown();
+		onDemandThumbnailService = null;
+	}
 	if (onDemandHydrationService !is null) {
 		if (debugLogging) {addLogEntry("Shutting down on-demand hydration service", ["debug"]);}
 		onDemandHydrationService.shutdown();
