@@ -36,7 +36,7 @@ enum HydrationState { onlineOnly, hydrated, pinned }
 
 enum OnDemandAction { download, pin, unpin, free }
 
-enum OnDemandTransientState { none, syncing, pending, error }
+enum TransientState { none, syncing, pending, error }
 
 class HydrationError : Exception
 {
@@ -101,7 +101,7 @@ final class HydrationService
 	private bool stopping;
 	private uint[string] downloads;
 	private uint[string] openCount;
-	private OnDemandTransientState[string] transient;
+	private TransientState[string] transient;
 	private bool[string] deferred;
 	__gshared uint webUrlDelayMsecs;
 
@@ -343,11 +343,11 @@ final class HydrationService
 	}
 
 	/* Iteration 3: transient sync states, deferred online changes, web URL */
-	void setTransientForTest(string driveId, string id, OnDemandTransientState state)
+	void setTransientForTest(string driveId, string id, TransientState state)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
-		if (state == OnDemandTransientState.none) transient.remove(key(driveId, id));
+		if (state == TransientState.none) transient.remove(key(driveId, id));
 		else transient[key(driveId, id)] = state;
 	}
 
@@ -359,33 +359,33 @@ final class HydrationService
 	}
 
 	// Directories: syncing if any item below is, else pending, else error
-	OnDemandTransientState transientStateOf(string driveId, string id)
+	TransientState transientStateOf(string driveId, string id)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
 		return transientLocked(driveId, id);
 	}
 
-	private OnDemandTransientState transientLocked(string driveId, string id)
+	private TransientState transientLocked(string driveId, string id)
 	{
-		auto own = transient.get(key(driveId, id), OnDemandTransientState.none);
+		auto own = transient.get(key(driveId, id), TransientState.none);
 		Item item;
 		if (!itemDB.selectById(driveId, id, item) || (item.type != ItemType.dir && item.type != ItemType.root))
 			return own;
-		bool[OnDemandTransientState] seen;
+		bool[TransientState] seen;
 		seen[own] = true;
 		foreach (child; itemDB.selectChildren(driveId, id))
 			seen[transientLocked(child.driveId, child.id)] = true;
-		foreach (state; [OnDemandTransientState.syncing, OnDemandTransientState.pending, OnDemandTransientState.error])
+		foreach (state; [TransientState.syncing, TransientState.pending, TransientState.error])
 			if (state in seen) return state;
-		return OnDemandTransientState.none;
+		return TransientState.none;
 	}
 
 	string webUrlOf(string driveId, string id)
 	{
 		Item item;
 		if (!itemDB.selectById(driveId, id, item))
-			throw new HydrationError(errno.ENOENT, "Item is not in the local database: " ~ driveId ~ " " ~ id);
+			throw new HydrationError(errno.ENODATA, "Item is not in the local database: " ~ driveId ~ " " ~ id);
 		stubLog("STUB webUrlOf ", id);
 		if (webUrlDelayMsecs)
 			Thread.sleep(dur!"msecs"(webUrlDelayMsecs));

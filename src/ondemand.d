@@ -798,14 +798,14 @@ final class OnDemandFs : Operations
 		string id = item.type == ItemType.remote ? item.remoteId : item.id;
 		// An upload or download in progress, a queued or retried change, or a failure takes
 		// precedence over the stored state. The engine aggregates directories.
-		OnDemandTransientState transient;
+		TransientState transient;
 		try transient = hydration.transientStateOf(driveId, id);
 		catch (HydrationError e) return "local";
 		final switch (transient) {
-			case OnDemandTransientState.syncing: return "syncing";
-			case OnDemandTransientState.pending: return "pending";
-			case OnDemandTransientState.error: return "error";
-			case OnDemandTransientState.none: break;
+			case TransientState.syncing: return "syncing";
+			case TransientState.pending: return "pending";
+			case TransientState.error: return "error";
+			case TransientState.none: break;
 		}
 		// For a directory stateOf() aggregates: pinned if it is pinned, else online-only
 		// if any file below it is, else hydrated

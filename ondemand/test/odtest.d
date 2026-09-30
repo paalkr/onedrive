@@ -175,7 +175,7 @@ void main(string[] args)
 				import std.string : split;
 				auto parts = baseName(entry.name).split("~");
 				if (parts[0] == "defer") svc.deferForTest(driveId, parts[1]);
-				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!OnDemandTransientState);
+				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!TransientState);
 				remove(entry.name);
 				writeln("CTL ", baseName(entry.name));
 			}
