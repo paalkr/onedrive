@@ -100,6 +100,9 @@ void main(string[] args)
 	onlineFile("f-b", "d-lib", "lib/b.txt", "bbbbbbbb\n");
 	onlineFile("f-c", "d-libsub", "lib/sub/c.txt", "cccccccccccc\n");
 	onlineFile("f-one", "root", "one.txt", "single file action\n");
+	// Fix round 3: open handles and thumbnailers
+	onlineFile("f-held", "root", "held.txt", "held open\n");
+	onlineFile("f-thumb", "root", "thumb.jpg", "not really a jpeg\n");
 	// V-partial: a database item whose real name ends in .partial
 	onlineFile("f-keep", "d-docs", "docs/keep.partial", "not an engine partial\n");
 	// V2: a shared folder from another drive
@@ -132,6 +135,8 @@ void main(string[] args)
 			}
 			stdout.flush();
 		});
+		// The client logger writes to the same buffered stdout
+		stdout.flush();
 		while (due.length && due[0].at <= MonoTime.currTime) {
 			auto c = due[0].change;
 			due = due[1 .. $];

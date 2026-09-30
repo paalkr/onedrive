@@ -52,7 +52,7 @@ BIGSIZE=$(stat -c %s "$R/docs/big.txt")
 ok "stat size of online-only file = remote size ($BIGSIZE)" '[ "$(t stat -c %s "$M/docs/big.txt")" = "$BIGSIZE" ]'
 ok "stat mtime of online-only file from DB (1704164645)" '[ "$(t stat -c %Y "$M/docs/big.txt")" = 1704164645 ]'
 ok "stat mode of online-only file is 0600 regular" '[ "$(t stat -c %A "$M/docs/big.txt")" = "-rw-------" ]'
-ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply docs emptydir hold lib local.txt one.txt shared write-me.txt " ]'
+ok "readdir lists DB children and backing entries" '[ "$(t ls "$M" | tr "\n" " ")" = "apply docs emptydir held.txt hold lib local.txt one.txt shared thumb.jpg write-me.txt " ]'
 ok "online-only file not in backing dir" '[ ! -e "$B/docs/big.txt" ]'
 ok "state xattr online-only" '[ "$(xget "$M/docs/big.txt" user.onedrive.state)" = online-only ]'
 ok "open+close without read does not hydrate" 't python3 -c "import os; os.close(os.open(\"$M/docs/pin-me.txt\", os.O_RDONLY))" && [ "$(downloads docs/pin-me.txt)" = 0 ]'
@@ -217,6 +217,36 @@ echo "   (du -sk lib after free: $(t du -sk "$M/lib" | cut -f1) kB, backing dirs
 ok "I2 du after free counts only the directories" '[ "$(t du -sk "$M/lib" | cut -f1)" = "$(du -sk "$B/lib" | cut -f1)" ]'
 ok "I2 pin alias on a directory" 'xset "$M/lib" user.onedrive.pin 1 && [ "$(xget "$M/lib" user.onedrive.state)" = pinned ] && [ "$(xget "$M/lib" user.onedrive.pin)" = 1 ]'
 
+echo "== R1 free of an open file"
+t cat "$M/held.txt" >/dev/null
+exec 7>>"$M/held.txt"
+ok "R1 free while open for writing: EBUSY, file intact" 'act "$M/held.txt" free | grep -q "Device or resource busy" && [ "$(cat "$B/held.txt")" = "held open" ]'
+exec 7>&-
+sleep 0.3   # FUSE sends RELEASE after close() returns
+act "$M/held.txt" free
+ok "R1 free after close works" '[ "$(xget "$M/held.txt" user.onedrive.state)" = online-only ] && [ ! -e "$B/held.txt" ]'
+exec 8<"$M/held.txt"
+t mv "$M/held.txt" "$M/held-moved.txt"
+exec 8<&-
+sleep 0.3
+ok "R1 noteOpen/noteClose balanced, also for a handle moved while open" '[ "$(grep -c "^STUB noteOpen " "$LOG")" = "$(grep -c "^STUB noteClose [^U]" "$LOG")" ] && ! grep -q UNBALANCED "$LOG" && [ "$(grep -c "^STUB noteOpen " "$LOG")" -gt 0 ]'
+echo "   (noteOpen $(grep -c "^STUB noteOpen " "$LOG"), noteClose $(grep -c "^STUB noteClose [^U]" "$LOG"))"
+
+echo "== R5 thumbnailers never hydrate"
+mkdir -p "$T/bin"
+cp /usr/bin/cat "$T/bin/gdk-pixbuf-thumbnailer"
+cp "$(readlink -f "$(command -v python3)")" "$T/bin/evince-thumbnailer"
+ok "R5 thumbnailer by comm (gdk-pixbuf-thum): EIO" '! t "$T/bin/gdk-pixbuf-thumbnailer" "$M/thumb.jpg" >/dev/null 2>&1 && ! t "$T/bin/gdk-pixbuf-thumbnailer" "$M/thumb.jpg" >/dev/null 2>&1'
+ok "R5 thumbnailer by exe with comm changed to reader: EIO" '! t "$T/bin/evince-thumbnailer" -c "import ctypes,sys; ctypes.CDLL(None).prctl(15, b\"reader\", 0, 0, 0); open(sys.argv[1]).read()" "$M/thumb.jpg" 2>/dev/null'
+ok "R5 nothing downloaded for thumbnailers" '[ "$(downloads thumb.jpg)" = 0 ] && [ ! -e "$B/thumb.jpg" ]'
+# The client log is written by a logger thread; wait for it
+for i in $(seq 1 30); do grep -q "not downloading ./thumb.jpg" "$LOG" && break; sleep 0.1; done
+sleep 0.5
+ok "R5 one log line per item" '[ "$(grep -c "not downloading ./thumb.jpg for thumbnailer" "$LOG")" = 1 ]'
+grep "not downloading ./thumb.jpg" "$LOG" | sed "s/^/   /"
+ok "R5 an ordinary reader still hydrates" '[ "$(t cat "$M/thumb.jpg")" = "not really a jpeg" ] && [ "$(downloads thumb.jpg)" = 1 ]'
+ok "R5 thumbnailer may read a hydrated file" '[ "$(t "$T/bin/gdk-pixbuf-thumbnailer" "$M/thumb.jpg")" = "not really a jpeg" ]'
+
 echo "== events seen"
 grep '^EVENT' "$LOG"
 
@@ -230,7 +260,7 @@ ok "STOPPED printed" 'grep -q STOPPED "$LOG"'
 ok "no mount left" '! grep -q " $M fuse" /proc/mounts'
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|EVENT|APPLIED|STUB download|STUB createEmpty|STUB action|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|EVENT|APPLIED|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"

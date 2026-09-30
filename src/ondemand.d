@@ -61,6 +61,42 @@ private final class Handle
 	int flags;
 	int fd = -1;
 	bool written;
+	// The database item reported to HydrationService.noteOpen(), closed on release
+	string openDriveId;
+	string openId;
+}
+
+// Thumbnailers, by full name and by the 15-character /proc/<pid>/comm truncation
+private immutable string[] thumbnailerNames = [
+	"gdk-pixbuf-thumbnailer", "evince-thumbnailer", "totem-video-thumbnailer",
+	"ffmpegthumbnailer", "gnome-thumbnailer", "tumblerd",
+	"gdk-pixbuf-thum", "evince-thumbnai", "totem-video-thu", "ffmpegthumbnail",
+	"ffmpegthumbnai", "gnome-thumbnai",
+];
+
+// Is the process that sent the current FUSE request a thumbnailer? pid 0 (not visible in our
+// pid namespace) or an unreadable /proc entry counts as not a thumbnailer.
+private string thumbnailerCaller() {
+	import c.fuse.fuse : fuse_get_context;
+	import std.file : readLink, readText;
+	import std.string : strip;
+	auto context = fuse_get_context();
+	if (context is null || context.pid <= 0) return null;
+	string proc = "/proc/" ~ to!string(context.pid);
+	string[] names;
+	try names ~= readText(proc ~ "/comm").strip; catch (Exception e) {}
+	// comm can be changed by the process and is truncated; the executable is the backstop
+	try names ~= baseName(readLink(proc ~ "/exe")).chompDeleted; catch (Exception e) {}
+	foreach (name; names)
+		foreach (known; thumbnailerNames)
+			if (name == known) return name;
+	return null;
+}
+
+// readlink of /proc/<pid>/exe appends " (deleted)" when the binary was replaced
+private string chompDeleted(string name) {
+	enum suffix = " (deleted)";
+	return name.endsWith(suffix) ? name[0 .. $ - suffix.length] : name;
 }
 
 final class OnDemandFs : Operations
@@ -80,6 +116,9 @@ final class OnDemandFs : Operations
 	private string backingDir;
 	private string rootDriveId;
 	private string rootId;
+
+	private Mutex thumbnailLogLock;
+	private bool[string] thumbnailRefusalLogged;
 
 	private Mutex handleLock;
 	private Handle[ulong] handles;
@@ -102,6 +141,7 @@ final class OnDemandFs : Operations
 		this.rootId = rootId;
 		handleLock = new Mutex();
 		pendingLock = new Mutex();
+		thumbnailLogLock = new Mutex();
 	}
 
 	override void initialize(ref fuse_conn_info conn, ref fuse_config cfg) {
@@ -287,6 +327,17 @@ final class OnDemandFs : Operations
 		if (!isOnlineOnly(item)) return;
 		if (!resolveSettled(path, item)) fail(ENOENT);
 		if (existsPath(backingPath(path)) || !isOnlineOnly(item)) return;
+		// Thumbnails for online-only files come from OneDrive; never download a file to draw one
+		string thumbnailer = thumbnailerCaller();
+		if (thumbnailer !is null) {
+			bool first;
+			synchronized (thumbnailLogLock) {
+				first = (itemKey(item) in thumbnailRefusalLogged) is null;
+				thumbnailRefusalLogged[itemKey(item)] = true;
+			}
+			if (first) addLogEntry("On-demand: not downloading " ~ dbPath(path) ~ " for thumbnailer " ~ thumbnailer);
+			fail(EIO);
+		}
 		try {
 			hydration.hydrate(item.driveId, item.id);
 		} catch (HydrationError e) {
@@ -312,6 +363,21 @@ final class OnDemandFs : Operations
 	}
 
 	// Handles
+
+	// Tells HydrationService that a database file is open, so "free" leaves it alone.
+	// Called last in open/create, when nothing can fail any more; release() closes it.
+	private void noteOpened(const(char)[] path, Handle h) {
+		Item item;
+		if (!resolve(path, item) || item.type != ItemType.file) return;
+		try {
+			hydration.noteOpen(item.driveId, item.id);
+		} catch (HydrationError e) {
+			// Removed from the database since it was resolved
+			return;
+		}
+		h.openDriveId = item.driveId;
+		h.openId = item.id;
+	}
 
 	private Handle handleOf(ref fuse_file_info fi) {
 		synchronized (handleLock) {
@@ -440,6 +506,7 @@ final class OnDemandFs : Operations
 			if (!isOnlineOnly(item)) fail(ENOENT);
 			if (!truncating) {
 				// Downloaded on the first read or write
+				noteOpened(path, h);
 				addHandle(fi, h);
 				return;
 			}
@@ -448,10 +515,12 @@ final class OnDemandFs : Operations
 			if (!createEmptyOnlineOnly(path)) hydrateIfNeeded(path);
 		}
 		h.fd = openBacking(path, fi.flags);
+		scope(failure) core.sys.posix.unistd.close(h.fd);
 		if (fi.flags & O_TRUNC) {
 			check(ftruncate(h.fd, 0));
 			h.written = true;
 		}
+		noteOpened(path, h);
 		addHandle(fi, h);
 	}
 
@@ -464,6 +533,7 @@ final class OnDemandFs : Operations
 		// A new file is uploaded even if nothing is written to it
 		h.written = true;
 		clearPending(dbPath(path));
+		noteOpened(path, h);
 		addHandle(fi, h);
 	}
 
@@ -532,6 +602,11 @@ final class OnDemandFs : Operations
 		synchronized (h) {
 			if (h.fd != -1) core.sys.posix.unistd.close(h.fd);
 			h.fd = -1;
+		}
+		// The item recorded at open, even if it has been moved or deleted since
+		if (h.openId.length) {
+			try hydration.noteClose(h.openDriveId, h.openId);
+			catch (HydrationError e) addLogEntry("On-demand: noteClose failed for " ~ h.openId ~ ": " ~ e.msg);
 		}
 		// A null path means the file was unlinked while open; the delete was already reported
 		if (h.written && path !is null) emit(OnDemandChangeKind.changed, path);
