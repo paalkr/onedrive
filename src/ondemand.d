@@ -53,6 +53,13 @@ __gshared uint onDemandPendingExpirySeconds = 300;
 // Most FUSE worker threads at once
 enum uint onDemandMaxWorkerThreads = 64;
 
+// What a lookup by the touch thread sees for a path, so that its system call makes the kernel
+// report a change the engine already made in the backing dir
+private struct Pretend {
+	bool present;        // false: does not exist yet (create, mkdir, rename target)
+	stat_t st;           // attributes shown while present (a deleted or moved-away entry)
+}
+
 // The database item that was at a path when it was moved away or replaced
 private struct StalePath {
 	string key;
@@ -86,6 +93,8 @@ private final class Handle
 	int flags;
 	int fd = -1;
 	bool written;
+	// Opened by the touch thread to report a change to watchers; not a user open
+	bool touch;
 	// The database item reported to HydrationService.noteOpen(), closed on release
 	string openDriveId;
 	string openId;
@@ -145,6 +154,11 @@ final class OnDemandFs : Operations
 	private Mutex thumbnailLogLock;
 	private bool[string] thumbnailRefusalLogged;
 
+	// Reporting changes made behind the mount's back (notifyBackingChange)
+	private BackgroundFuse mount;
+	private Mutex touchLock;
+	private Pretend[string] pretend;       // "/a/b" -> what the touch thread's lookup sees
+
 	private Mutex handleLock;
 	private Handle[ulong] handles;
 	private ulong nextHandle = 1;
@@ -167,6 +181,7 @@ final class OnDemandFs : Operations
 		handleLock = new Mutex();
 		pendingLock = new Mutex();
 		thumbnailLogLock = new Mutex();
+		touchLock = new Mutex();
 	}
 
 	override void initialize(ref fuse_conn_info conn, ref fuse_config cfg) {
@@ -451,9 +466,95 @@ final class OnDemandFs : Operations
 		}
 	}
 
+	// Changes made behind the mount's back
+
+	// Is the current request from the touch thread? The kernel reports the calling thread's
+	// id (verified on 7.0), so nothing else, not even another thread of this process, matches.
+	private bool isTouchRequest() {
+		import c.fuse.fuse : fuse_get_context;
+		if (mount is null) return false;
+		auto context = fuse_get_context();
+		if (context is null || context.pid <= 0) return false;
+		return context.pid == mount.notifierTid();
+	}
+
+	private void endPretend(const(char)[] path) {
+		synchronized (touchLock) pretend.remove(path.idup);
+	}
+
+	private stat_t presentAs(string mountPath, bool isDirectory) {
+		stat_t st;
+		if (lstatPath(backingPath(mountPath), st)) return st;
+		st.st_mode = isDirectory ? S_IFDIR | dirMode : S_IFREG | fileMode;
+		st.st_nlink = isDirectory ? 2 : 1;
+		st.st_uid = getuid();
+		st.st_gid = getgid();
+		return st;
+	}
+
+	// See notifyBackingChange()
+	void backingChanged(string path, OnDemandChangeKind kind, string oldPath, bool isDirectory) {
+		if (mount is null) return;
+		static string mountPath(string rel) {
+			if (rel == "." || rel == "./") return "/";
+			return rel.startsWith("./") ? rel[1 .. $] : "/" ~ rel;
+		}
+		string p = mountPath(path);
+		if (p == "/") return;
+		stat_t st;
+		bool exists = lstatPath(backingPath(p), st);
+		bool dir = exists ? (st.st_mode & S_IFMT) == S_IFDIR : isDirectory;
+		final switch (kind) {
+			case OnDemandChangeKind.changed:
+			case OnDemandChangeKind.createDir:
+				if (!exists) return;
+				synchronized (touchLock) pretend[p] = Pretend(false);
+				if (dir) {
+					mount.queueTouch(Touch.mkdir, p);
+				} else {
+					// Reported as created, which a file manager also takes as "reload this file",
+					// then with its attributes so a replaced file shows its new size and time
+					mount.queueTouch(Touch.create, p);
+					mount.queueTouch(Touch.attrib, p, null, st.st_mtime);
+				}
+				break;
+			case OnDemandChangeKind.deleted:
+				if (exists) return;
+				synchronized (touchLock) pretend[p] = Pretend(true, presentAs(p, isDirectory));
+				mount.queueTouch(dir ? Touch.rmdir : Touch.unlink, p);
+				break;
+			case OnDemandChangeKind.moved:
+				if (!exists || oldPath is null) return;
+				string o = mountPath(oldPath);
+				synchronized (touchLock) {
+					pretend[o] = Pretend(true, st);
+					pretend[p] = Pretend(false);
+				}
+				mount.queueTouch(Touch.rename, p, o);
+				// The kernel keeps the attributes it was shown for the old name; refresh them
+				if (!dir) mount.queueTouch(Touch.attrib, p, null, st.st_mtime);
+				break;
+		}
+	}
+
 	// Operations
 
 	override void getattr(const(char)[] path, ref stat_t st) {
+		if (isTouchRequest()) {
+			Pretend p;
+			bool found;
+			synchronized (touchLock) {
+				if (auto q = path in pretend) {
+					p = *q;
+					found = true;
+				}
+			}
+			if (found) {
+				if (!p.present) fail(ENOENT);
+				st = p.st;
+				return;
+			}
+		}
 		if (isEnginePartial(path)) fail(ENOENT);
 		if (lstatPath(backingPath(path), st)) {
 			// A backing file whose database path is hidden was recreated locally
@@ -566,6 +667,14 @@ final class OnDemandFs : Operations
 	override void create(const(char)[] path, mode_t mode, ref fuse_file_info fi) {
 		auto h = new Handle();
 		h.flags = fi.flags;
+		if (isTouchRequest()) {
+			// The file is already in the backing dir; this open only makes the kernel report it
+			endPretend(path);
+			h.touch = true;
+			h.fd = core.sys.posix.fcntl.open(toStringz(backingPath(path)), O_RDONLY);
+			addHandle(fi, h);
+			return;
+		}
 		if (path.endsWith(partialSuffix)) fail(EINVAL);
 		h.fd = core.sys.posix.fcntl.open(toStringz(backingPath(path)), fi.flags | O_CREAT, mode);
 		check(h.fd);
@@ -642,6 +751,7 @@ final class OnDemandFs : Operations
 			if (h.fd != -1) core.sys.posix.unistd.close(h.fd);
 			h.fd = -1;
 		}
+		if (h.touch) return;
 		// The item recorded at open, even if it has been moved or deleted since
 		if (h.openId.length) {
 			try hydration.noteClose(h.openDriveId, h.openId);
@@ -652,6 +762,10 @@ final class OnDemandFs : Operations
 	}
 
 	override void mkdir(const(char)[] path, uint mode) {
+		if (isTouchRequest()) {
+			endPretend(path);
+			return;
+		}
 		if (path.endsWith(partialSuffix)) fail(EINVAL);
 		check(core.sys.posix.sys.stat.mkdir(toStringz(backingPath(path)), cast(mode_t) mode));
 		clearPending(dbPath(path));
@@ -659,6 +773,10 @@ final class OnDemandFs : Operations
 	}
 
 	override void unlink(const(char)[] path) {
+		if (isTouchRequest()) {
+			endPretend(path);
+			return;
+		}
 		string target = backingPath(path);
 		Item item;
 		bool inDatabase = resolve(path, item);
@@ -673,6 +791,10 @@ final class OnDemandFs : Operations
 	}
 
 	override void rmdir(const(char)[] path) {
+		if (isTouchRequest()) {
+			endPretend(path);
+			return;
+		}
 		stat_t st;
 		getattr(path, st);
 		if ((st.st_mode & S_IFMT) != S_IFDIR) fail(ENOTDIR);
@@ -687,6 +809,11 @@ final class OnDemandFs : Operations
 	}
 
 	override void rename(const(char)[] orig, const(char)[] dest, uint flags) {
+		if (isTouchRequest()) {
+			endPretend(orig);
+			endPretend(dest);
+			return;
+		}
 		enum RENAME_NOREPLACE = 1;
 		// RENAME_EXCHANGE and RENAME_WHITEOUT are not supported
 		if (flags & ~RENAME_NOREPLACE) fail(EINVAL);
@@ -752,6 +879,8 @@ final class OnDemandFs : Operations
 	}
 
 	override void utimens(const(char)[] path, const(timespec)[] tv, fuse_file_info* fi) {
+		// Sent by the touch thread only to make the kernel report changed attributes
+		if (isTouchRequest()) return;
 		hydrateIfNeeded(path);
 		timespec[2] times;
 		if (tv is null) times[0].tv_nsec = times[1].tv_nsec = UTIME_NOW;
@@ -954,12 +1083,37 @@ void startOnDemandMount(ItemDatabase itemDB, HydrationService hydration, OnDeman
 	if (activeMount !is null && activeMount.mounted()) throw new Exception("On-demand filesystem is already mounted");
 	auto fs = new OnDemandFs(itemDB, hydration, changes, mainTid, backingDir, rootDriveId, rootId);
 	auto mount = new BackgroundFuse();
+	fs.mount = mount;
 	// Downloads and web URL lookups block their worker thread; with libfuse's default of 10
 	// workers ten of them would stall every other request (ls, stat) on the mount
 	mount.start(fs, "onedrive", mountPoint, ["fsname=onedrive", "subtype=onedrive", "default_permissions"], onDemandMaxWorkerThreads);
+	mount.startNotifier();
 	activeFs = fs;
 	activeMount = mount;
 	addLogEntry("On-demand filesystem mounted: " ~ mountPoint);
+}
+
+/*
+ * Reports a change the engine made directly in the backing dir, so that file managers watching
+ * the mount (inotify) see it: a download or re-download (changed), a new directory (createDir),
+ * a delete (deleted) or a move (moved, oldPath is the old path). Paths are "./a/b" like
+ * OnDemandLocalChange. Call it after the change is complete on disk; for deleted, pass
+ * isDirectory for a directory. Thread-safe, never blocks, returns at once; a no-op when nothing
+ * is mounted. It never produces an OnDemandLocalChange.
+ *
+ * The kernel sends inotify events only for system calls made through the mount, and no FUSE
+ * notification produces one (ondemand/test/notify-matrix.sh), so a dedicated thread repeats the
+ * change as a system call on the mount (create, mkdir, unlink, rmdir, rename, utimensat) that
+ * the filesystem recognises and turns into a no-op.
+ */
+void notifyBackingChange(string path, OnDemandChangeKind kind, string oldPath = null, bool isDirectory = false) {
+	auto fs = activeFs;
+	if (fs !is null) fs.backingChanged(path, kind, oldPath, isDirectory);
+}
+
+// The active mount, for tests of the kernel notifications
+BackgroundFuse onDemandMountForTest() {
+	return activeMount;
 }
 
 // Unmounts. Safe to call when nothing is mounted.

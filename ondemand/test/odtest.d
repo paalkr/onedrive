@@ -126,6 +126,9 @@ void main(string[] args)
 	localFile("f-dst2", "d-etag", "etag/dst2.txt", "destination two\n", HydrationState.pinned);
 	localFile("f-src3", "root", "src3.txt", "source three\n", HydrationState.hydrated);
 	localFile("f-dst3", "root", "dst3.txt", "destination three\n", HydrationState.pinned);
+	// Kernel notification experiments and tests
+	add("d-notify", "root", "notify", ItemType.dir);
+	mkdirRecurse(buildPath(backing, "notify"));
 	// Iteration 3
 	add("d-sync", "root", "syncdir", ItemType.dir);
 	mkdirRecurse(buildPath(backing, "syncdir"));
@@ -155,6 +158,7 @@ void main(string[] args)
 	import core.time : MonoTime;
 	struct Due { MonoTime at; OnDemandLocalChange change; }
 	Due[] due;
+	ulong[string] recordedIno;
 	string stopFile = buildPath(work, "stop");
 	while (!exists(stopFile)) {
 		receiveTimeout(dur!"msecs"(100), (OnDemandWake w) {
@@ -175,6 +179,39 @@ void main(string[] args)
 				import std.string : split;
 				auto parts = baseName(entry.name).split("~");
 				if (parts[0] == "defer") svc.deferForTest(driveId, parts[1]);
+				// notifyBackingChange: backing~<kind>~<path>[~<oldPath>|~dir], paths use % for /
+				if (parts[0] == "backing") {
+					import std.array : replace;
+					string p = parts[2].replace("%", "/");
+					string o = parts.length > 3 && parts[3] != "dir" ? parts[3].replace("%", "/") : null;
+					notifyBackingChange(p, parts[1].to!OnDemandChangeKind, o, parts.length > 3 && parts[3] == "dir");
+				}
+				// Notification experiments: paths use % for /
+				if (parts[0] == "ino") {
+					import std.array : replace;
+					string p = parts[1].replace("%", "/");
+					recordedIno[p] = onDemandMountForTest().inodeOf(p);
+					writeln("INO ", p, " ", recordedIno[p]);
+				}
+				if (parts[0] == "exp") {
+					import std.array : replace;
+					auto m = onDemandMountForTest();
+					string p = parts[2].replace("%", "/");
+					string parent = dirName(p);
+					ulong parentIno = parent == "/" ? 1 : m.inodeOf(parent);
+					ulong ino = recordedIno.get(p, 0);
+					int rc;
+					switch (parts[1]) {
+						case "inval_entry": rc = m.notifyInvalEntry(parentIno, baseName(p)); break;
+						case "delete": rc = m.notifyDelete(parentIno, ino, baseName(p)); break;
+						case "inval_inode": rc = m.notifyInvalInode(ino ? ino : m.inodeOf(p)); break;
+						case "inval_inode_dir": rc = m.notifyInvalInode(parentIno); break;
+						case "invalidate_path": rc = m.invalidatePath(p); break;
+						case "invalidate_path_dir": rc = m.invalidatePath(parent); break;
+						default: rc = -9999;
+					}
+					writeln("EXP ", parts[1], " ", p, " parent=", parentIno, " ino=", ino, " rc=", rc);
+				}
 				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!TransientState);
 				remove(entry.name);
 				writeln("CTL ", baseName(entry.name));

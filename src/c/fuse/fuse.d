@@ -218,6 +218,19 @@ extern (System)
     void fuse_loop_cfg_set_clone_fd(fuse_loop_config* config, uint value);
     int fuse_loop_mt_312(fuse* f, fuse_loop_config* config);
 
+    /* Cache invalidation notifications, <fuse3/fuse_lowlevel.h>. Inode
+       numbers are the high-level library's node ids, which it reports as
+       st_ino when use_ino is off (1 is the root). None of these may be
+       called from a request handler of a related operation. */
+    alias fuse_ino_t = uint64_t;
+    nothrow int fuse_lowlevel_notify_inval_inode(fuse_session* se, fuse_ino_t ino,
+        off_t off, off_t len);
+    nothrow int fuse_lowlevel_notify_inval_entry(fuse_session* se, fuse_ino_t parent,
+        const(char)* name, size_t namelen);
+    nothrow int fuse_lowlevel_notify_delete(fuse_session* se, fuse_ino_t parent,
+        fuse_ino_t child, const(char)* name, size_t namelen);
+    nothrow int fuse_invalidate_path(fuse* f, const(char)* path);
+
     /* Exported unversioned as fuse_main_real@@FUSE_3.0 by libfuse 3.14 */
     int fuse_main_real(int argc, char** argv, const(fuse_operations)* op,
         size_t op_size, void* private_data);
