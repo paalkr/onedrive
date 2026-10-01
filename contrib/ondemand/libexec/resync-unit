@@ -1,0 +1,56 @@
+#!/bin/sh
+# Helper of onedrive-ondemand-resync@.service. Not meant to be run by hand.
+#
+# Usage: resync-unit pre|post PROFILE
+#
+#   pre   create the marker $XDG_RUNTIME_DIR/onedrive-ondemand/PROFILE.resyncing
+#         (the normal units have an ExecCondition= on it) and stop the
+#         profile's normal unit
+#   post  (ExecStopPost=) remove the marker; if the resync exited with status 0,
+#         start the profile's normal unit again (without waiting for it)
+
+set -eu
+
+[ $# -eq 2 ] || { echo "usage: resync-unit pre|post PROFILE" >&2; exit 2; }
+ACTION=$1
+PROFILE=$2
+: "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is not set}"
+MARKER_DIR=$XDG_RUNTIME_DIR/onedrive-ondemand
+MARKER=$MARKER_DIR/$PROFILE.resyncing
+
+# The default profile's normal unit is onedrive-ondemand.service; it can also
+# have been started as the template instance
+if [ "$PROFILE" = onedrive-ondemand ]; then
+	NORMAL_UNITS="onedrive-ondemand.service onedrive-ondemand@onedrive-ondemand.service"
+	START_UNIT=onedrive-ondemand.service
+else
+	NORMAL_UNITS="onedrive-ondemand@$PROFILE.service"
+	START_UNIT=$NORMAL_UNITS
+fi
+
+case "$ACTION" in
+pre)
+	mkdir -p "$MARKER_DIR"
+	: > "$MARKER"
+	for unit in $NORMAL_UNITS; do
+		if systemctl --user -q is-active "$unit"; then
+			echo "Stopping $unit for the resync"
+		fi
+		systemctl --user stop "$unit"
+	done
+	;;
+post)
+	rm -f "$MARKER"
+	# Set by systemd for ExecStopPost=
+	if [ "${SERVICE_RESULT:-}" = success ] && [ "${EXIT_CODE:-}" = exited ] && [ "${EXIT_STATUS:-}" = 0 ]; then
+		echo "Resync of profile $PROFILE succeeded, starting $START_UNIT"
+		systemctl --user start --no-block "$START_UNIT"
+	else
+		echo "Resync of profile $PROFILE did not succeed (result ${SERVICE_RESULT:-unknown}, ${EXIT_CODE:-?} ${EXIT_STATUS:-?}); $START_UNIT is left stopped"
+	fi
+	;;
+*)
+	echo "usage: resync-unit pre|post PROFILE" >&2
+	exit 2
+	;;
+esac

@@ -20,6 +20,9 @@ Package contents, besides upstream's files (`/usr/bin/onedrive`, man page, docs,
 | `/usr/bin/onedrive-ondemand-unmount` | lazily unmounts a stale mount of a profile's `sync_dir`; used by the units' `ExecStopPost=` |
 | `/usr/lib/systemd/user/onedrive-ondemand.service` | runs profile `~/.config/onedrive-ondemand` |
 | `/usr/lib/systemd/user/onedrive-ondemand@.service` | runs profile `~/.config/<instance>` |
+| `/usr/bin/onedrive-ondemand-resync` | runs a resync of a profile in the background (below) |
+| `/usr/lib/systemd/user/onedrive-ondemand-resync@.service` | the resync of profile `~/.config/<instance>`, also for the default profile |
+| `/usr/libexec/onedrive-ondemand/resync-unit` | helper of the resync unit |
 | `/usr/share/nautilus-python/extensions/onedrive-ondemand.py` | Nautilus state emblems and "OneDrive" context menu |
 
 The package Conflicts/Replaces/Provides `onedrive`: Ubuntu's `onedrive` package ships `/usr/bin/onedrive` too and is removed when this one is installed.
@@ -74,6 +77,24 @@ onedrive-ondemand-setup --profile onedrive-ondemand-business --mount ~/OneDrive-
 
 The default profile `onedrive-ondemand` runs as `onedrive-ondemand.service`; every other profile runs as the template instance `onedrive-ondemand@<profile>.service`, e.g. `systemctl --user enable --now onedrive-ondemand@onedrive-ondemand-business.service`. Do not run a profile under both names at once (`onedrive-ondemand@onedrive-ondemand.service` is the same profile as `onedrive-ondemand.service`).
 
+## Resync
+
+When the client asks for a `--resync` (the service stops with exit status 78), or after changing `sync_dir`/`sync_list`:
+
+```sh
+onedrive-ondemand-resync                              # default profile onedrive-ondemand
+onedrive-ondemand-resync onedrive-ondemand-business   # any other profile
+onedrive-ondemand-resync --no-follow PROFILE          # start it and return
+```
+
+This starts the user unit `onedrive-ondemand-resync@<profile>.service` (the instance is always the profile directory name, also `onedrive-ondemand-resync@onedrive-ondemand.service` for the default profile). The unit:
+
+1. stops the profile's normal unit (`onedrive-ondemand.service` for the default profile, `onedrive-ondemand@<profile>.service` otherwise) and marks the profile as resyncing (`$XDG_RUNTIME_DIR/onedrive-ondemand/<profile>.resyncing`; while it exists the normal unit is skipped if anything starts it),
+2. runs `onedrive --on-demand --on-demand-resync-once --confdir=~/.config/<profile>`: resync, first full sync and restore of pins, with the mount active,
+3. on success starts the normal unit again; on failure stays in the failed state (`systemctl --user status onedrive-ondemand-resync@<profile>`) and leaves the normal unit stopped.
+
+The command follows the unit's journal until it finishes and exits with the resync's status. Ctrl+C only stops following. `systemctl --user stop onedrive-ondemand-resync@<profile>` cancels a resync (the normal unit then stays stopped).
+
 ## Logs and troubleshooting
 
 ```sh
@@ -81,7 +102,9 @@ journalctl --user -u onedrive-ondemand -f
 journalctl --user -u onedrive-ondemand@onedrive-ondemand-business -f
 ```
 
-The service restarts on failure, except when the client exits because a `--resync` is required (exit status 78): stop the service, run the step 1 command, start it again.
+The service restarts on failure, except when the client exits because a `--resync` is required (exit status 78): run `onedrive-ondemand-resync [<profile>]` (see Resync), or stop the service, run the step 1 command by hand and start it again.
+
+Resync logs: `journalctl --user -u onedrive-ondemand-resync@<profile>`.
 
 When the client stops, the units run `onedrive-ondemand-unmount --confdir=...`, which lazily unmounts (`fusermount3 -u -z`) the profile's `sync_dir` if a stale mount was left behind ("Transport endpoint is not connected"). It can also be run by hand.
 

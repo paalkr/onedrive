@@ -1,0 +1,88 @@
+#!/bin/sh
+# Resynchronise a OneDrive Files On-Demand profile in the background.
+#
+# Usage: onedrive-ondemand-resync [--no-follow] [PROFILE]
+#
+# Starts onedrive-ondemand-resync@PROFILE.service (systemd --user), which stops
+# the profile's normal unit, runs 'onedrive --on-demand --on-demand-resync-once'
+# and, if that succeeds, starts the normal unit again. PROFILE is the directory
+# name below ~/.config (default: onedrive-ondemand).
+#
+# Without --no-follow the journal of the resync is shown until it finishes, and
+# the exit status is that of the resync (0 on success). Ctrl+C stops following;
+# the resync itself continues. With --no-follow the unit is only started.
+
+set -eu
+
+FOLLOW=yes
+PROFILE=
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--no-follow) FOLLOW=no ;;
+	-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	-*) echo "onedrive-ondemand-resync: unknown option: $1" >&2; exit 2 ;;
+	*)
+		[ -z "$PROFILE" ] || { echo "onedrive-ondemand-resync: only one profile can be given" >&2; exit 2; }
+		PROFILE=$1
+		;;
+	esac
+	shift
+done
+[ -n "$PROFILE" ] || PROFILE=onedrive-ondemand
+
+case "$PROFILE" in
+[!A-Za-z0-9_]*|*[!A-Za-z0-9_.-]*)
+	echo "onedrive-ondemand-resync: '$PROFILE' is not a valid profile name" >&2
+	exit 2
+	;;
+esac
+: "${HOME:?HOME is not set}"
+if [ ! -f "$HOME/.config/$PROFILE/config" ]; then
+	echo "onedrive-ondemand-resync: $HOME/.config/$PROFILE/config does not exist (set the profile up with onedrive-ondemand-setup)" >&2
+	exit 2
+fi
+
+UNIT=onedrive-ondemand-resync@$PROFILE.service
+
+if [ "$FOLLOW" = no ]; then
+	systemctl --user start --no-block "$UNIT"
+	echo "Started $UNIT"
+	echo "Follow it with: journalctl --user -u $UNIT -f"
+	exit 0
+fi
+
+# Joining a resync that is already running: show what it logged so far
+if [ "$(systemctl --user show -p ActiveState --value "$UNIT")" = activating ]; then
+	echo "$UNIT is already running; following it"
+	JOURNAL_SINCE="-n 50"
+else
+	JOURNAL_SINCE="--since=$(date '+%Y-%m-%d %H:%M:%S')"
+fi
+
+# shellcheck disable=SC2086 # JOURNAL_SINCE is one or two words on purpose
+journalctl --user -u "$UNIT" -f -o cat $JOURNAL_SINCE &
+JOURNAL_PID=$!
+stop_journal() {
+	kill "$JOURNAL_PID" 2>/dev/null || true
+	wait "$JOURNAL_PID" 2>/dev/null || true
+}
+trap 'stop_journal; echo; echo "Stopped following. The resync continues: journalctl --user -u $UNIT -f (stop it with: systemctl --user stop $UNIT)"; exit 130' INT TERM
+
+# A oneshot start returns once the unit has finished
+RC=0
+systemctl --user start "$UNIT" || RC=$?
+# Let the last journal lines through
+sleep 1
+stop_journal
+trap - INT TERM
+
+if [ "$RC" -eq 0 ]; then
+	echo "Resync of profile $PROFILE completed"
+	exit 0
+fi
+STATUS=$(systemctl --user show -p ExecMainStatus --value "$UNIT" 2>/dev/null || true)
+case "$STATUS" in
+''|0|*[!0-9]*) STATUS=$RC ;;
+esac
+echo "Resync of profile $PROFILE failed (exit status $STATUS). Details: journalctl --user -u $UNIT" >&2
+exit "$STATUS"

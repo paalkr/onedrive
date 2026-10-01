@@ -1,0 +1,30 @@
+.TH ONEDRIVE-ONDEMAND-RESYNC 1 "October 2026" "onedrive-ondemand" "User Commands"
+.SH NAME
+onedrive-ondemand-resync \- resynchronise a OneDrive Files On-Demand profile in the background
+.SH SYNOPSIS
+.B onedrive-ondemand-resync
+[\fB\-\-no\-follow\fR] [\fIPROFILE\fR]
+.SH DESCRIPTION
+Starts the systemd user unit \fBonedrive-ondemand-resync@\fIPROFILE\fB.service\fR.
+\fIPROFILE\fR is the directory name below \fI~/.config\fR (default
+\fBonedrive-ondemand\fR). The unit stops the profile's normal unit
+(\fBonedrive-ondemand.service\fR for the default profile,
+\fBonedrive-ondemand@\fIPROFILE\fB.service\fR otherwise), runs
+\fBonedrive \-\-on-demand \-\-on-demand-resync-once\fR with the mount active,
+and starts the normal unit again if the resync succeeded. If it failed, the
+resync unit is left in the failed state and the normal unit stays stopped.
+While the resync runs, the normal unit is skipped if something starts it.
+.PP
+By default the resync's journal is shown until it finishes, and the exit
+status is that of the resync. Ctrl+C stops following; the resync continues.
+.SH OPTIONS
+.TP
+\fB\-\-no\-follow\fR
+Only start the unit and return.
+.SH EXIT STATUS
+0 on success; the exit status of the client (or 1) on failure; 2 for usage
+errors; 130 when following was interrupted.
+.SH SEE ALSO
+.BR onedrive (1),
+.BR onedrive-ondemand-setup (1),
+.BR journalctl (1)
