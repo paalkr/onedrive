@@ -23,6 +23,7 @@ import itemdb;
 import log;
 import onedrive;
 import thumbnailpng;
+import dbusstatus;
 import util;
 
 // Writes freedesktop thumbnails for online-only files from Microsoft Graph thumbnails, so a file
@@ -183,6 +184,8 @@ final class ThumbnailService {
 		int written = 0;
 		foreach (candidate; candidates) {
 			if (isShuttingDown() || (fetches >= maxFetchesPerPass)) break;
+			// Paused: no thumbnail fetches; the next pass after resuming continues
+			if (statusIsPaused()) break;
 			if (!isThumbnailable(candidate.name)) continue;
 			// Use the current record: the item may have been hydrated, moved or removed meanwhile
 			Item item;

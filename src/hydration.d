@@ -624,6 +624,10 @@ final class HydrationService {
 			throw new HydrationError(EAGAIN, "Too many on-demand actions are queued");
 		}
 		actionQueue ~= OnDemandActionRequest(driveId, id, action);
+		// D-Bus status: a file download/pin waits for the worker
+		if (!isDirectory && ((action == OnDemandAction.download) || (action == OnDemandAction.pin))) {
+			statusTransferQueue(itemDB.computePath(driveId, id), "hydrate", item.size.empty ? 0 : to!ulong(item.size));
+		}
 		if (actionWorker is null) {
 			actionWorkerRunning = true;
 			actionWorker = new Thread(&actionWorkerLoop);
@@ -658,6 +662,20 @@ final class HydrationService {
 		}
 
 		if (owner) {
+			// D-Bus status: queued until the download starts (the hydration lists itself as active then)
+			string statusPath;
+			try {
+				Item statusItem;
+				if (itemDB.selectById(driveId, id, statusItem) && (statusItem.type == ItemType.file)) {
+					statusPath = itemDB.computePath(driveId, id);
+					statusTransferQueue(statusPath, "hydrate", statusItem.size.empty ? 0 : to!ulong(statusItem.size));
+				}
+			} catch (Exception e) {
+				statusPath = null;
+			}
+			scope(exit) {
+				if (!statusPath.empty) statusTransferEnd(statusPath, "hydrate");
+			}
 			int errnoCode = 0;
 			string message;
 			try {
@@ -924,6 +942,8 @@ final class HydrationService {
 			actionQueue = actionQueue[1 .. $];
 			serviceMutex.unlock();
 
+			// Paused: queued actions wait (reads of online-only files still hydrate on demand)
+			if (!waitWhileStatusPaused()) return;
 			if (!enterDatabase()) return;
 			try {
 				performAction(request);
@@ -943,6 +963,14 @@ final class HydrationService {
 		string itemPath = itemDB.computePath(request.driveId, request.id);
 		bool isDirectory = (item.type == ItemType.dir) || (item.type == ItemType.root);
 		addLogEntry("On-demand: " ~ to!string(request.action) ~ " " ~ itemPath ~ " ...");
+
+		// D-Bus status: the online-only files a directory download/pin will hydrate are queued
+		if (isDirectory && ((request.action == OnDemandAction.download) || (request.action == OnDemandAction.pin))) {
+			queueSubtreeForStatus(request.driveId, request.id);
+		}
+		scope(exit) {
+			if (isDirectory) statusClearQueuedTransfers("hydrate");
+		}
 
 		final switch (request.action) {
 			case OnDemandAction.download:
@@ -974,6 +1002,16 @@ final class HydrationService {
 				break;
 		}
 		addLogEntry("On-demand: " ~ to!string(request.action) ~ " " ~ itemPath ~ " ... done");
+	}
+
+	private void queueSubtreeForStatus(string driveId, string id) {
+		foreach (child; itemDB.selectChildren(driveId, id)) {
+			if (child.type == ItemType.dir) {
+				queueSubtreeForStatus(child.driveId, child.id);
+			} else if ((child.type == ItemType.file) && (child.hydration == hydrationOnlineOnly)) {
+				statusTransferQueue(itemDB.computePath(child.driveId, child.id), "hydrate", child.size.empty ? 0 : to!ulong(child.size));
+			}
+		}
 	}
 
 	// Free up space for every file below a directory; refused files stay local and are logged
@@ -1223,6 +1261,8 @@ final class HydrationService {
 		}
 		api.initialise();
 		api.setTransferAbortFlag(&abortTransfers);
+		// D-Bus status: download progress of the staging file is reported for the backing path
+		api.setStatusTransfer(relativePath(backingPath, backingDir), "hydrate");
 
 		JSONValue onlineItem;
 		try {

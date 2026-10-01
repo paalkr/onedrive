@@ -4551,9 +4551,14 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
-		// D-Bus status: files waiting to be downloaded in this batch
+		// D-Bus status: files waiting to be downloaded in this batch (the first ones listed as queued)
 		statusSetPendingDownloads(fileJSONItemsToDownload.length);
 		scope(exit) statusSetPendingDownloads(0);
+		foreach (queuedItem; fileJSONItemsToDownload[0 .. min(fileJSONItemsToDownload.length, 200)]) {
+			string queuedPath = computePathFromJSON(queuedItem);
+			if (!queuedPath.empty) statusTransferQueue(queuedPath, "download", hasFileSize(queuedItem) ? to!ulong(max(0, queuedItem["size"].integer)) : 0);
+		}
+		scope(exit) statusClearQueuedTransfers("download");
 
 		// Was exitHandlerTriggered flagged
 		if (exitHandlerTriggered) {
@@ -4727,6 +4732,10 @@ class SyncEngine {
 		// Calculate this items path
 		string newItemPath = computeItemPath(downloadDriveId, downloadParentId) ~ "/" ~ downloadItemName;
 		if (debugLogging) {addLogEntry("JSON Item calculated full path for download is: " ~ newItemPath, ["debug"]);}
+
+		// D-Bus status: no new transfer starts while paused (an exit while waiting skips the download;
+		// the delta checkpoint is not advanced on exit, so it is fetched again)
+		if (!waitWhileStatusPaused()) return;
 
 		// A downloaded live item must have a real Microsoft Graph filesystem timestamp.
 		// Do not download an item when its authoritative timestamp is unavailable because
@@ -8421,9 +8430,13 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
-		// D-Bus status: modified files waiting to be uploaded in this batch
+		// D-Bus status: modified files waiting to be uploaded in this batch (the first ones listed as queued)
 		statusSetPendingUploads(databaseItemsWhereContentHasChanged.length);
 		scope(exit) statusSetPendingUploads(0);
+		foreach (queuedItem; databaseItemsWhereContentHasChanged[0 .. min(databaseItemsWhereContentHasChanged.length, 200)]) {
+			statusTransferQueue(queuedItem[2], "upload", fileSizeForStatus(queuedItem[2]));
+		}
+		scope(exit) statusClearQueuedTransfers("upload");
 
 		// Each element in this array 'databaseItemsWhereContentHasChanged' is an Database Item ID that has been modified locally
 		size_t batchSize = to!int(appConfig.getValueLong("threads"));
@@ -8490,7 +8503,8 @@ class SyncEngine {
 		string changedItemId = localItemDetails[1];
 		string localFilePath = localItemDetails[2];
 
-		// D-Bus status: this upload is in progress
+		// D-Bus status: no new transfer starts while paused; this upload is in progress
+		if (!waitWhileStatusPaused()) return;
 		statusTransferBegin(localFilePath, "upload", fileSizeForStatus(localFilePath));
 		scope(exit) statusTransferEnd(localFilePath, "upload");
 
@@ -9846,9 +9860,13 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
-		// D-Bus status: new files waiting to be uploaded in this batch
+		// D-Bus status: new files waiting to be uploaded in this batch (the first ones listed as queued)
 		statusSetPendingUploads(newLocalFilesToUploadToOneDrive.length);
 		scope(exit) statusSetPendingUploads(0);
+		foreach (queuedPath; newLocalFilesToUploadToOneDrive[0 .. min(newLocalFilesToUploadToOneDrive.length, 200)]) {
+			statusTransferQueue(queuedPath, "upload", fileSizeForStatus(queuedPath));
+		}
+		scope(exit) statusClearQueuedTransfers("upload");
 
 		// Are there any new local items to upload?
 		if (!newLocalFilesToUploadToOneDrive.empty) {
@@ -11439,7 +11457,8 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
-		// D-Bus status: this upload is in progress
+		// D-Bus status: no new transfer starts while paused; this upload is in progress
+		if (!waitWhileStatusPaused()) return;
 		statusTransferBegin(fileToUpload, "upload", fileSizeForStatus(fileToUpload));
 		scope(exit) statusTransferEnd(fileToUpload, "upload");
 

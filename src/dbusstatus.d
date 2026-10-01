@@ -16,6 +16,7 @@ import std.string;
 
 // What other modules that we have created do we need to import?
 import log;
+import util : exitHandlerTriggered;
 
 // D-Bus status interface (session bus): io.github.abraunegg.OneDrive1 on /io/github/abraunegg/OneDrive,
 // bus name io.github.abraunegg.OneDrive.i<first 16 hex of sha256(confdir)>.
@@ -83,6 +84,12 @@ private __gshared bool statusIssuesChanged = false;
 private shared bool statusSyncNowRequested = false;
 
 private enum size_t maxIssues = 500;
+// Queued transfers listed per direction (the head of the current batch)
+private enum size_t maxQueuedTransfers = 200;
+
+// Pause: no new sync cycles or transfers start; in-flight ones finish. Not persisted.
+private __gshared bool statusPaused = false;
+private __gshared SysTime statusPausedUntil;   // SysTime.init: until Resume
 
 shared static this() {
 	statusMutex = new Mutex();
@@ -96,7 +103,7 @@ void statusConfigure(string clientVersion, string configDir, string syncDir, boo
 	statusConfigDir = buildNormalizedPath(absolutePath(configDir));
 	statusSyncDir = buildNormalizedPath(absolutePath(syncDir));
 	statusOnDemand = onDemand;
-	statusCapabilities = onDemand ? ["ondemand", "actions", "issues", "transfers"] : ["issues", "transfers"];
+	statusCapabilities = onDemand ? ["ondemand", "actions", "issues", "transfers", "pause"] : ["issues", "transfers", "pause"];
 	statusEnabled = true;
 }
 
@@ -202,6 +209,36 @@ void statusTransferBegin(string path, string direction, ulong bytesTotal) {
 	statusTransfersChanged = true;
 }
 
+// A transfer is waiting to start. Never downgrades an active one. At most maxQueuedTransfers per direction.
+void statusTransferQueue(string path, string direction, ulong bytesTotal) {
+	if (!statusEnabled) return;
+	string relative = statusRelativePath(path);
+	statusMutex.lock();
+	scope(exit) statusMutex.unlock();
+	string key = direction ~ ":" ~ relative;
+	if (key in statusTransfers) return;
+	size_t queued = 0;
+	foreach (entry; statusTransfers) {
+		if ((entry.direction == direction) && (entry.state == "queued")) queued++;
+	}
+	if (queued >= maxQueuedTransfers) return;
+	statusTransfers[key] = TransferEntry(relative, direction, "queued", 0, bytesTotal, MonoTime.zero);
+	statusTransfersChanged = true;
+}
+
+// Remove the queued (not active) transfers of a direction, at the end of a batch
+void statusClearQueuedTransfers(string direction) {
+	if (!statusEnabled) return;
+	statusMutex.lock();
+	scope(exit) statusMutex.unlock();
+	string[] remove;
+	foreach (key, entry; statusTransfers) {
+		if ((entry.direction == direction) && (entry.state == "queued")) remove ~= key;
+	}
+	foreach (key; remove) statusTransfers.remove(key);
+	if (remove.length > 0) statusTransfersChanged = true;
+}
+
 void statusTransferProgress(string path, string direction, ulong bytesDone) {
 	if (!statusEnabled) return;
 	string relative = statusRelativePath(path);
@@ -271,6 +308,70 @@ private bool statusDismissIssue(string issueId) {
 	if (statusIssues.length == before) return false;
 	statusIssuesChanged = true;
 	return true;
+}
+
+// Is the client paused? A timed pause that has expired is resumed here.
+bool statusIsPaused() {
+	statusMutex.lock();
+	scope(exit) statusMutex.unlock();
+	return pausedLocked();
+}
+
+private bool pausedLocked() {
+	if (!statusPaused) return false;
+	if ((statusPausedUntil != SysTime.init) && (Clock.currTime() >= statusPausedUntil)) {
+		statusPaused = false;
+		statusPausedUntil = SysTime.init;
+		markChangedLocked("State");
+		markChangedLocked("StateDetail");
+		atomicStore(statusSyncNowRequested, true);
+		addLogEntry("The pause requested through the D-Bus status interface has ended; synchronisation resumes");
+		return false;
+	}
+	return true;
+}
+
+private string pausedDetailLocked() {
+	if (statusPausedUntil == SysTime.init) return "Paused";
+	return format("Paused until %02d:%02d", statusPausedUntil.hour, statusPausedUntil.minute);
+}
+
+// Pause for 'minutes' (0: until Resume or restart)
+void statusPause(uint minutes) {
+	statusMutex.lock();
+	scope(exit) statusMutex.unlock();
+	statusPaused = true;
+	statusPausedUntil = (minutes == 0) ? SysTime.init : (Clock.currTime() + dur!"minutes"(minutes));
+	markChangedLocked("State");
+	markChangedLocked("StateDetail");
+	addLogEntry("Synchronisation paused through the D-Bus status interface: " ~ pausedDetailLocked());
+}
+
+void statusResume() {
+	statusMutex.lock();
+	scope(exit) statusMutex.unlock();
+	if (!statusPaused) return;
+	statusPaused = false;
+	statusPausedUntil = SysTime.init;
+	markChangedLocked("State");
+	markChangedLocked("StateDetail");
+	atomicStore(statusSyncNowRequested, true);
+	addLogEntry("Synchronisation resumed through the D-Bus status interface");
+}
+
+// Block the calling transfer while paused. Returns false if the application is exiting
+// (the caller then does not start the transfer).
+bool waitWhileStatusPaused() {
+	bool logged = false;
+	while (statusIsPaused()) {
+		if (exitHandlerTriggered) return false;
+		if (!logged) {
+			if (debugLogging) {addLogEntry("Transfer waiting while synchronisation is paused", ["debug"]);}
+			logged = true;
+		}
+		Thread.sleep(dur!"msecs"(500));
+	}
+	return !exitHandlerTriggered;
 }
 
 // Was SyncNow() called since the last call? The monitor loop then starts a sync cycle.
@@ -536,6 +637,9 @@ final class DBusStatusService {
 				dbus_message_unref(message);
 			}
 
+			// A timed pause that expired is resumed (and announced) even when nothing else happens
+			statusIsPaused();
+
 			// Signals, each at most twice per second
 			MonoTime now = MonoTime.currTime;
 			if (now - lastPropertiesSignal >= signalInterval) {
@@ -635,8 +739,17 @@ final class DBusStatusService {
 					replyEmpty(connection, message);
 					return;
 				case "Pause":
+					uint minutes;
+					if (!readUintArgument(message, 0, minutes)) {
+						replyError(connection, message, "org.freedesktop.DBus.Error.InvalidArgs", "Pause expects (u)");
+						return;
+					}
+					statusPause(minutes);
+					replyEmpty(connection, message);
+					return;
 				case "Resume":
-					replyError(connection, message, "org.freedesktop.DBus.Error.NotSupported", "Pause and Resume are not supported by this client ('pause' is not in Capabilities)");
+					statusResume();
+					replyEmpty(connection, message);
 					return;
 				default:
 					break;
@@ -657,6 +770,17 @@ final class DBusStatusService {
 		string xml = "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\"\n \"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n<node>\n";
 		if (!child.empty) xml ~= "  <node name=\"" ~ child ~ "\"/>\n";
 		return xml ~ "</node>\n";
+	}
+
+	private static bool readUintArgument(DBusMessage* message, int index, out uint value) {
+		DBusMessageIter iter;
+		if (!dbus_message_iter_init(message, &iter)) return false;
+		foreach (i; 0 .. index) {
+			if (!dbus_message_iter_next(&iter)) return false;
+		}
+		if (dbus_message_iter_get_arg_type(&iter) != DBUS_TYPE_UINT32) return false;
+		dbus_message_iter_get_basic(&iter, &value);
+		return true;
 	}
 
 	private static bool readStringArgument(DBusMessage* message, int index, out string value) {
@@ -763,8 +887,8 @@ final class DBusStatusService {
 			case "AccountType": appendString(&variant, statusAccountType); break;
 			case "OnDemand": appendBool(&variant, statusOnDemand); break;
 			case "Capabilities": appendStringArray(&variant, statusCapabilities); break;
-			case "State": appendString(&variant, statusState); break;
-			case "StateDetail": appendString(&variant, statusStateDetail); break;
+			case "State": appendString(&variant, pausedLocked() ? "paused" : statusState); break;
+			case "StateDetail": appendString(&variant, pausedLocked() ? pausedDetailLocked() : statusStateDetail); break;
 			case "LastSyncTime": appendInt64(&variant, statusLastSyncTime); break;
 			case "QuotaUsed": appendUint64(&variant, statusQuotaUsed); break;
 			case "QuotaTotal": appendUint64(&variant, statusQuotaTotal); break;

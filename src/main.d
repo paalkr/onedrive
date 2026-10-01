@@ -1468,7 +1468,7 @@ int main(string[] cliArgs) {
 
 				// On-demand: due locked-online upload retries run here as well, in case applying local
 				// changes returned early (for example while the system time gate is closed)
-				if (onDemandMountActive && appConfig.systemTimeAllowsSync()) {
+				if (onDemandMountActive && appConfig.systemTimeAllowsSync() && !statusIsPaused()) {
 					syncEngineInstance.onDemandRetryDueLockedUploads();
 				}
 				
@@ -1549,10 +1549,18 @@ int main(string[] cliArgs) {
 				// configured a longer normal monitor interval.
 				auto activeMonitorCheckInterval = appConfig.systemTimeAllowsSync() ?
 					checkOnlineInterval : dur!"seconds"(TIME_BLOCKED_RETRY_INTERVAL_SECONDS);
-				// D-Bus SyncNow() requests a cycle now
+				// D-Bus SyncNow() requests a cycle now; while paused (D-Bus Pause) no cycle starts
 				bool syncNowRequested = consumeStatusSyncNowRequest();
-				if (syncNowRequested) addLogEntry("A sync was requested through the D-Bus status interface");
-				if ((currentTime - lastCheckTime >= activeMonitorCheckInterval) || (monitorLoopFullCount == 0) || syncNowRequested) {
+				bool syncPaused = statusIsPaused();
+				if (syncNowRequested) {
+					if (syncPaused) {
+						addLogEntry("A sync requested through the D-Bus status interface is ignored while synchronisation is paused");
+						syncNowRequested = false;
+					} else {
+						addLogEntry("Starting a sync cycle requested through the D-Bus status interface (SyncNow)");
+					}
+				}
+				if (!syncPaused && ((currentTime - lastCheckTime >= activeMonitorCheckInterval) || (monitorLoopFullCount == 0) || syncNowRequested)) {
 					// Increment relevant counters
 					monitorLoopFullCount++;
 					fullScanFrequencyLoopCount++;
@@ -2365,6 +2373,8 @@ void captureAndApplyInotifyEvents(string invocationSource) {
 		return;
 	}
 	filesystemMonitor.clearExpectedEvents(invocationSource);
+	// D-Bus Pause: local changes stay queued (captured above) until synchronisation resumes
+	if (statusIsPaused()) return;
 	applyPendingLocalChanges(invocationSource);
 }
 

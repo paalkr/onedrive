@@ -81,8 +81,8 @@ def main():
         ok("ConfigDir is the absolute confdir", allprops.get("ConfigDir") == os.path.abspath(confA))
         ok("SyncDir is the configured sync_dir", allprops.get("SyncDir") == os.path.abspath(syncA))
         ok("State is starting before authentication", allprops.get("State") == "starting")
-        ok("OnDemand false, Capabilities without ondemand/actions/pause",
-           allprops.get("OnDemand") is False and set(allprops.get("Capabilities", [])) == {"issues", "transfers"})
+        ok("OnDemand false, Capabilities issues/transfers/pause (no ondemand/actions)",
+           allprops.get("OnDemand") is False and set(allprops.get("Capabilities", [])) == {"issues", "transfers", "pause"})
         state = props.call_sync("Get", GLib.Variant("(ss)", (IFACE, "State")), Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
         ok("Get(State)", state == "starting", state)
         try:
@@ -101,11 +101,26 @@ def main():
             ok("DismissIssue of an unknown id fails", False)
         except GLib.Error as e:
             ok("DismissIssue of an unknown id fails", "InvalidArgs" in e.message, e.message)
-        try:
-            proxy.call_sync("Pause", GLib.Variant("(u)", (5,)), Gio.DBusCallFlags.NONE, 5000, None)
-            ok("Pause is refused (no 'pause' capability)", False)
-        except GLib.Error as e:
-            ok("Pause is refused (no 'pause' capability)", "NotSupported" in e.message, e.message)
+        def getprop(name):
+            return props.call_sync("Get", GLib.Variant("(ss)", (IFACE, name)), Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+        changed = []
+        bus.signal_subscribe(nameA, "org.freedesktop.DBus.Properties", "PropertiesChanged", PATH, None,
+                             Gio.DBusSignalFlags.NONE, lambda *args: changed.append(args[5].unpack()[1]))
+        proxy.call_sync("Pause", GLib.Variant("(u)", (5,)), Gio.DBusCallFlags.NONE, 5000, None)
+        ok("Pause(5): State paused", getprop("State") == "paused", getprop("State"))
+        detail = getprop("StateDetail")
+        ok("Pause(5): StateDetail 'Paused until HH:MM'", detail.startswith("Paused until ") and len(detail) == len("Paused until 00:00"), detail)
+        ctx = GLib.MainContext.default()
+        end = time.time() + 3
+        while time.time() < end and not any("State" in c for c in changed):
+            ctx.iteration(False); time.sleep(0.05)
+        ok("Pause emits PropertiesChanged with State", any(c.get("State") == "paused" for c in changed), str(changed))
+        proxy.call_sync("Resume", None, Gio.DBusCallFlags.NONE, 5000, None)
+        ok("Resume: State back to starting", getprop("State") == "starting", getprop("State"))
+        proxy.call_sync("Pause", GLib.Variant("(u)", (0,)), Gio.DBusCallFlags.NONE, 5000, None)
+        ok("Pause(0): StateDetail 'Paused'", getprop("State") == "paused" and getprop("StateDetail") == "Paused", getprop("StateDetail"))
+        proxy.call_sync("Resume", None, Gio.DBusCallFlags.NONE, 5000, None)
+        ok("Resume after Pause(0)", getprop("State") == "starting")
 
         xml = bus.call_sync(nameA, PATH, "org.freedesktop.DBus.Introspectable", "Introspect", None,
                             GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]

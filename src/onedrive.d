@@ -212,6 +212,9 @@ class OneDriveApi {
 	private shared(bool)* transferAbortFlag = null;
 	// On-demand: redact JSON "url" values of the next responses in all diagnostic output
 	private bool redactResponseUrlValues = false;
+	// D-Bus status: report download progress under this transfer instead of the download path
+	private string statusTransferPath;
+	private string statusTransferDirection;
 
 	this(ApplicationConfig appConfig) {
 		// Configure the class variable to consume the application configuration
@@ -258,6 +261,12 @@ class OneDriveApi {
 	}
 
 	// Configure the active CurlEngine using the current application settings
+	// D-Bus status: report download progress of this instance as this transfer (path relative to the sync directory)
+	void setStatusTransfer(string path, string direction) {
+		statusTransferPath = path;
+		statusTransferDirection = direction;
+	}
+
 	// On-demand: abort transfers on this instance once '*flag' becomes true (HydrationService shutdown)
 	void setTransferAbortFlag(shared(bool)* flag) {
 		transferAbortFlag = flag;
@@ -2367,7 +2376,11 @@ class OneDriveApi {
 					if (transferAbortRequested()) return 1;
 
 					// D-Bus status: download progress (throttled by the status module)
-					statusTransferProgress(originalFilename, "download", cast(ulong) (effectiveResumeOffset + cast(long) dlnow));
+					if (statusTransferPath.empty) {
+						statusTransferProgress(originalFilename, "download", cast(ulong) (effectiveResumeOffset + cast(long) dlnow));
+					} else {
+						statusTransferProgress(statusTransferPath, statusTransferDirection, cast(ulong) (effectiveResumeOffset + cast(long) dlnow));
+					}
 
 					// Handle SIGINT (CTRL-C) and SIGTERM (kill) events + 'force_xfer_abort'
 					if ((exitHandlerTriggered) && (appConfig.getValueBool("force_xfer_abort"))) {
@@ -2533,8 +2546,9 @@ class OneDriveApi {
 			} else {
 				// No progress bar, no resumable download
 				// On-demand: still allow the owner of this instance to abort the transfer
-				if (transferAbortFlag !is null) {
+				if ((transferAbortFlag !is null) || !statusTransferPath.empty) {
 					curlEngine.http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) {
+						if (!statusTransferPath.empty) statusTransferProgress(statusTransferPath, statusTransferDirection, cast(ulong) dlnow);
 						return transferAbortRequested() ? 1 : 0;
 					};
 				}
@@ -2764,6 +2778,11 @@ class OneDriveApi {
 				curlEngine.beginUploadStreamHash();
 			}
 			curlEngine.setFile(filepath, contentRange, offset, offsetSize);
+			// D-Bus status: upload progress of this file (offset of this fragment plus bytes sent)
+			curlEngine.http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) {
+				statusTransferProgress(filepath, "upload", offset + cast(ulong) ulnow);
+				return transferAbortRequested() ? 1 : 0;
+			};
 			auto uploadResponse = curlEngine.execute();
 			if (finishUploadStreamHash) {
 				curlEngine.finishUploadStreamHash(uploadResponse);
