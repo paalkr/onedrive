@@ -14,6 +14,7 @@ import std.conv;
 import std.datetime;
 import std.file;
 import std.getopt;
+import std.json : JSONValue, JSONType;
 import std.net.curl: CurlException;
 import std.parallelism;
 import std.path;
@@ -677,6 +678,33 @@ int main(string[] cliArgs) {
 		} else {
 			// --dry-run scenario ... technically we should not be making any local file changes .......
 			addLogEntry("DRY-RUN: Not removing the saved authentication status");
+		}
+	}
+	
+	// One-shot resync: verify that Microsoft OneDrive is reachable and that the stored authentication
+	// works BEFORE the resync removes the item database, so a failure leaves the profile untouched.
+	// Other modes keep upstream's order.
+	if (onDemandResyncOnce) {
+		auto oneShotProbe = probeMicrosoftService(appConfig, false);
+		if (!oneShotProbe.reachable) {
+			addLogEntry("ERROR: On-demand: one-shot resync: Microsoft OneDrive is not reachable; the local index was not changed");
+			return EXIT_FAILURE;
+		}
+		bool oneShotAuthenticated = false;
+		OneDriveApi oneShotApi = new OneDriveApi(appConfig);
+		try {
+			if (oneShotApi.initialise()) {
+				JSONValue oneShotDrive = oneShotApi.getDefaultDriveDetails();
+				oneShotAuthenticated = (oneShotDrive.type() == JSONType.object) && ("id" in oneShotDrive);
+			}
+		} catch (Exception e) {
+			addLogEntry("ERROR: On-demand: one-shot resync: authentication check failed: " ~ e.msg);
+		}
+		oneShotApi.releaseCurlEngine();
+		oneShotApi = null;
+		if (!oneShotAuthenticated) {
+			addLogEntry("ERROR: On-demand: one-shot resync: the stored authentication does not work; the local index was not changed");
+			return EXIT_FAILURE;
 		}
 	}
 	
