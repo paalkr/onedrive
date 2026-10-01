@@ -2502,6 +2502,17 @@ class ApplicationConfig {
 				addLogEntry("ERROR: --on-demand cannot be used with --upload-only or --download-only");
 				operationalConflictDetected = true;
 			}
+			// mirror_local_state deletes online what would be downloaded and new online folders,
+			// which contradicts online-only files in the mount
+			if (getValueBool("mirror_local_state")) {
+				addLogEntry("ERROR: --on-demand cannot be used with --mirror-local-state");
+				operationalConflictDetected = true;
+			}
+			// A dry run fakes engine transfers on a database copy while the mount changes real local data
+			if (getValueBool("dry_run")) {
+				addLogEntry("ERROR: --on-demand cannot be used with --dry-run");
+				operationalConflictDetected = true;
+			}
 		}
 		
 		// --upload-only and --download-only cannot be used together
@@ -3142,7 +3153,15 @@ class ApplicationConfig {
 		}
 		
 		// Perform the check and return the evaluation
-		return startsWith(recycleBin, syncRoot);
+		if (startsWith(recycleBin, syncRoot)) return true;
+
+		// On-demand: the configured 'sync_dir' is the mountpoint; a recycle bin inside it cannot
+		// receive renames from the backing directory (different filesystem)
+		if (getValueBool("on_demand") && !onDemandMountPoint.empty) {
+			string mountRoot = onDemandMountPoint.endsWith(sep) ? onDemandMountPoint : onDemandMountPoint ~ sep;
+			if (startsWith(recycleBin, mountRoot)) return true;
+		}
+		return false;
 	}
 	
 	// Is the client running under a GUI session?

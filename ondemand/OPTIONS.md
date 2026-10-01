@@ -31,8 +31,8 @@ Status values:
 | azure_tenant_id | relevant | Authentication | config.d:342 |
 | transfer_order | relevant | Order of engine download/upload batches. Hydrations are on demand and not ordered. | config.d:350 |
 | monitor_authoritative_sync | ignored | Only consulted with download_only + cleanup_local_files, which on-demand refuses | config.d:354; main.d:1572; sync.d:1181 |
-| use_recycle_bin | risky | Online deletions move backing-dir files to the recycle bin (online-only files have no local file, so nothing moves). The "recycle bin inside sync_dir" check compares against the backing dir, not the mountpoint (config.d:3128-3150, main.d:380-391). A recycle_bin_path inside the mount passes the check. rename() from the backing dir into the mount then fails (EXDEV), the move fails, and the delta checkpoint is held back on every cycle (sync.d:6148 onwards). | config.d:358 |
-| recycle_bin_path | risky | See use_recycle_bin | config.d:360 |
+| use_recycle_bin | risky | Online deletions move backing-dir files to the recycle bin (online-only files have no local file, so nothing moves). A recycle_bin_path inside the backing dir or inside the mountpoint is refused at startup (config.d checkRecycleBinPathAsChildOfSyncDir, main.d recycle bin check). A rename cannot reach a recycle bin inside the mount (different filesystem). | config.d:358 |
+| recycle_bin_path | risky | Refused inside the backing dir or the mountpoint; otherwise see use_recycle_bin | config.d:360 |
 | verbose | relevant | Logging | config.d:363 |
 | monitor_interval | relevant | Sync cycle interval. Also the long interval of locked-online retries. | config.d:365 |
 | skip_size (R) | relevant | Filtering. Larger online files are not recorded, so they are not visible in the mount. | config.d:367 |
@@ -70,7 +70,7 @@ Status values:
 | skip_symlinks (R) | ignored | Symlinks cannot be created through the mount (no symlink operation). Only external writes into the backing dir could create one, and those are unsupported. | config.d:448; sync.d:7557, 9946 |
 | debug_https | relevant | Diagnostics. Pre-signed thumbnail URLs are redacted (curlEngine.d redactUrlValues). | config.d:450 |
 | skip_dotfiles (R) | relevant | Filtering | config.d:452 |
-| dry_run | risky | Uses a copy of the database and fakes engine transfers. The mount runs normally. FUSE writes, deletes and renames change the real backing dir. HydrationService downloads and frees real files. A dry run therefore modifies local data while the engine pretends not to, and its DB copy diverges from the backing dir. See "Should be refused". | config.d:454; main.d:510 |
+| dry_run | refused | "--on-demand cannot be used with --dry-run" (config.d checkForBasicOptionConflicts). A dry run fakes engine transfers on a database copy while the mount and HydrationService would change real local data. | config.d:454; main.d:510 |
 | sync_root_files | relevant | sync_list | config.d:456 |
 | remove_source_files | ignored | Only valid with upload_only (refused) | config.d:458 |
 | remove_source_folders | ignored | Only valid with upload_only (refused) | config.d:460 |
@@ -101,7 +101,7 @@ Status values:
 | display_manager_integration | relevant | Bookmarks use sync_dir, which is the mountpoint the user sees | config.d:546; main.d:3433 |
 | disable_version_check | relevant | Version check | config.d:549 |
 | disable_time_check | relevant | System time validation | config.d:553 |
-| mirror_local_state | risky | With local_first: online items queued for download are deleted online instead (sync.d:3445-3457), and new online folders are deleted online (sync.d:3918-3922). In on-demand mode new files under pinned folders and changed hydrated files are queued for download, so they would be deleted online, and new online folders too. This contradicts the online-only model. See "Should be refused". | config.d:557 |
+| mirror_local_state | refused | "--on-demand cannot be used with --mirror-local-state" (config.d checkForBasicOptionConflicts). With local_first it deletes online what is queued for download (sync.d:3445-3457) and new online folders (sync.d:3918-3922), which contradicts online-only files. | config.d:557 |
 | display_memory | relevant | Diagnostics | config.d:597 |
 | monitor_max_loop | relevant | Developer option | config.d:601 |
 | display_sync_options | relevant | Diagnostics | config.d:604 |
@@ -126,8 +126,8 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `azure_tenant_id` | relevant | no | Authentication. |
 | `transfer_order` | relevant | no | Order of engine download/upload batches. |
 | `monitor_authoritative_sync` | ignored | no | Only consulted with download_only + cleanup_local_files, which on-demand refuses. |
-| `use_recycle_bin` | risky | no | Online deletions move backing-dir files to the recycle bin (online-only files have no local file, so nothing moves). |
-| `recycle_bin_path` | risky | no | See use_recycle_bin. |
+| `use_recycle_bin` | risky | no | Online deletions move local files to the recycle bin; a recycle bin inside sync_dir (the mount) or the backing dir is refused. |
+| `recycle_bin_path` | risky | no | Refused inside sync_dir (the mount) or the backing dir. |
 | `verbose` | relevant | no | Logging. |
 | `monitor_interval` | relevant | no | Sync cycle interval. |
 | `skip_size` | relevant | yes | Filtering. |
@@ -169,7 +169,7 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `skip_symlinks` | ignored | yes | Symlinks cannot be created through the mount (no symlink operation). |
 | `debug_https` | relevant | no | Diagnostics. |
 | `skip_dotfiles` | relevant | yes | Filtering. |
-| `dry_run` | risky | no | Uses a copy of the database and fakes engine transfers. |
+| `dry_run` | refused | no | Refused with --on-demand: a dry run would fake engine transfers while the mount changes real local data. |
 | `sync_root_files` | relevant | no | sync_list. |
 | `remove_source_files` | ignored | no | Only valid with upload_only (refused). |
 | `remove_source_folders` | ignored | no | Only valid with upload_only (refused). |
@@ -205,7 +205,7 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `display_manager_integration` | relevant | no | Bookmarks use sync_dir, which is the mountpoint the user sees. |
 | `disable_version_check` | relevant | no | Version check. |
 | `disable_time_check` | relevant | no | System time validation. |
-| `mirror_local_state` | risky | no | With local_first: online items queued for download are deleted online instead (sync.d:3445-3457), and new online folders are deleted online (sync.d:3918-3922). |
+| `mirror_local_state` | refused | no | Refused with --on-demand: with local_first it would delete online files and folders that are online-only here. |
 | `display_memory` | relevant | no | Diagnostics. |
 | `monitor_max_loop` | relevant | no | Developer option. |
 | `display_sync_options` | relevant | no | Diagnostics. |
@@ -225,14 +225,11 @@ Set in `updateFromArgs()` (config.d:1308-1337 and getopt); not accepted in the c
 - `--dry-run`: see dry_run.
 - `--confdir`: selects the profile and the D-Bus bus name.
 
-## Should be refused but are not
+## Refusal guards added
 
-Each would endanger data or leave the client stuck in on-demand mode. Proposed one-line guards for `checkForBasicOptionConflicts()` (config.d, next to the existing on-demand checks), not implemented:
-- **mirror_local_state (with local_first)**: deletes online the new files of pinned folders, changed hydrated files and new online folders.
-  Guard: `if (getValueBool("on_demand") && getValueBool("mirror_local_state")) { addLogEntry("ERROR: --on-demand cannot be used with --mirror-local-state"); operationalConflictDetected = true; }`
-- **dry_run**: the mount and HydrationService change real local data while the engine works on a database copy.
-  Guard: `if (getValueBool("on_demand") && getValueBool("dry_run")) { addLogEntry("ERROR: --on-demand cannot be used with --dry-run"); operationalConflictDetected = true; }`
-- **recycle_bin_path inside the mountpoint**: passes the existing check (it compares with the backing dir), then every online delete fails to move (EXDEV) and the delta checkpoint is held back forever.
-  Guard: in `checkRecycleBinPathAsChildOfSyncDir()` also test `onDemandMountPoint` when `on_demand` is set.
+The three combinations previously listed here as "should be refused" are now refused at startup (on-demand mode only; normal mode is unchanged):
+- on_demand with mirror_local_state: `ERROR: --on-demand cannot be used with --mirror-local-state`
+- on_demand with dry_run: `ERROR: --on-demand cannot be used with --dry-run`
+- on_demand with a recycle_bin_path inside the mountpoint: `ERROR: The configured 'recycle_bin_path' (...) is located within the configured 'sync_dir' (<mountpoint>).`
 
-Not proposed for refusal, but documented as risky: bypass_data_preservation (deliberate user choice; upstream semantics) and sync_business_shared_items (shared items simply bypass on-demand).
+Documented as risky, not refused: bypass_data_preservation (a deliberate user choice; upstream semantics) and sync_business_shared_items (shared items bypass on-demand).

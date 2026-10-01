@@ -388,7 +388,8 @@ int main(string[] cliArgs) {
 			if (appConfig.checkRecycleBinPathAsChildOfSyncDir) {
 				// ERROR: 'Recycle Bin' path is a child of the configured 'sync_dir'
 				addLogEntry();
-				addLogEntry("ERROR: The configured 'recycle_bin_path' (" ~ appConfig.recycleBinParentPath ~ ") is located within the configured 'sync_dir' (" ~ appConfig.runtimeSyncDirectory ~ ").", ["info", "notify"]);
+				string configuredSyncDir = (appConfig.getValueBool("on_demand") && !appConfig.onDemandMountPoint.empty) ? appConfig.onDemandMountPoint : appConfig.runtimeSyncDirectory;
+				addLogEntry("ERROR: The configured 'recycle_bin_path' (" ~ appConfig.recycleBinParentPath ~ ") is located within the configured 'sync_dir' (" ~ configuredSyncDir ~ ").", ["info", "notify"]);
 				addLogEntry("       This would cause locally recycled items to be re-uploaded to Microsoft OneDrive.");
 				addLogEntry("       Please set 'recycle_bin_path' to a location outside of 'sync_dir' and restart the client.");
 				addLogEntry();
