@@ -1,0 +1,29 @@
+.TH ONEDRIVE-ONDEMAND-SETUP 1 "October 2026" "onedrive-ondemand" "User Commands"
+.SH NAME
+onedrive-ondemand-setup \- set up a OneDrive Files On-Demand profile for the current user
+.SH SYNOPSIS
+.B onedrive-ondemand-setup
+[\fIOPTIONS\fR]
+.SH DESCRIPTION
+Writes \fI~/.config/<profile>/config\fR (and \fIsync_list\fR), runs
+\fBonedrive \-\-confdir=\fR... once to authorise the client, and prints the
+commands for the first synchronisation and for the systemd user unit. The
+first \fB\-\-resync\fR is never run automatically. The unit is enabled and
+started only when confirmed or with \fB\-\-enable\-service\fR.
+.PP
+The mount folder must be empty or absent. An existing profile with different
+settings is only overwritten with \fB\-\-force\fR. Running the command again is
+safe: steps that are done are reported and skipped.
+.PP
+Profile \fBonedrive-ondemand\fR runs as \fBonedrive-ondemand.service\fR; any
+other profile as \fBonedrive-ondemand@<profile>.service\fR.
+.SH OPTIONS
+Run \fBonedrive-ondemand-setup \-\-help\fR for the full list:
+\fB\-\-profile\fR, \fB\-\-mount\fR, \fB\-\-sync\-list\fR, \fB\-\-business\fR,
+\fB\-\-application\-id\fR, \fB\-\-azure\-tenant\-id\fR, \fB\-\-use\-intune\-sso\fR,
+\fB\-\-force\fR, \fB\-\-no\-auth\fR, \fB\-\-non\-interactive\fR,
+\fB\-\-enable\-service\fR, \fB\-\-no\-enable\-service\fR.
+.SH SEE ALSO
+.BR onedrive (1),
+.BR onedrive-ondemand-unmount (1),
+/usr/share/doc/onedrive-ondemand/README.ondemand.md

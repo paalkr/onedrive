@@ -1,0 +1,25 @@
+[Unit]
+Description=OneDrive Files On-Demand (profile onedrive-ondemand)
+Documentation=man:onedrive(1) file:///usr/share/doc/onedrive-ondemand/README.ondemand.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# No sandboxing options here on purpose. ProtectSystem=, ProtectHome=,
+# PrivateTmp= and similar give a user unit its own mount namespace, so the
+# FUSE mount would be invisible to the desktop session. RestrictRealtime=,
+# SystemCallFilter= and similar imply NoNewPrivileges=, which stops the
+# setuid fusermount3 helper that mounts on behalf of the user.
+ExecStartPre=/bin/sh -c 'sleep 15'
+ExecStart=/usr/bin/onedrive --monitor --on-demand --confdir=%h/.config/onedrive-ondemand
+# Lazily unmounts sync_dir if the client left a stale mount behind (crash, kill)
+ExecStopPost=/usr/bin/onedrive-ondemand-unmount --confdir=%h/.config/onedrive-ondemand
+Restart=on-failure
+RestartSec=10
+# Do not restart the service if a --resync is required; the client exits with EX_CONFIG (78)
+RestartPreventExitStatus=78
+# Time to wait for the service to stop gracefully (finish uploads, unmount) before forcefully terminating it
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target

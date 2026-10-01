@@ -1,0 +1,83 @@
+#!/bin/sh
+# Lazily unmount the Files On-Demand mount of a onedrive profile if it is
+# still mounted, for example after the client crashed or was killed and left
+# a stale mount ('Transport endpoint is not connected').
+#
+# Usage: onedrive-ondemand-unmount [--confdir=DIR] [--dry-run]
+#
+# The mountpoint is the 'sync_dir' of DIR/config (default ~/OneDrive when the
+# config does not set it). DIR defaults to ~/.config/onedrive-ondemand. Only a
+# onedrive FUSE mount (fstype fuse.onedrive) at that path is unmounted
+# (fusermount3 -u -z). Nothing to do is not an error. Used as ExecStopPost=
+# of the onedrive-ondemand user units.
+
+set -eu
+
+CONFDIR=
+DRYRUN=no
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--confdir=*) CONFDIR=${1#--confdir=} ;;
+	--confdir) shift; CONFDIR=${1:?--confdir needs a value} ;;
+	--dry-run) DRYRUN=yes ;;
+	-h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+	*) echo "onedrive-ondemand-unmount: unknown argument: $1" >&2; exit 2 ;;
+	esac
+	shift
+done
+
+: "${HOME:?HOME is not set}"
+
+expand_home() {
+	case "$1" in
+	"~") printf '%s\n' "$HOME" ;;
+	"~/"*) printf '%s/%s\n' "$HOME" "${1#"~/"}" ;;
+	"\$HOME") printf '%s\n' "$HOME" ;;
+	"\$HOME/"*) printf '%s/%s\n' "$HOME" "${1#"\$HOME/"}" ;;
+	"\${HOME}") printf '%s\n' "$HOME" ;;
+	"\${HOME}/"*) printf '%s/%s\n' "$HOME" "${1#"\${HOME}/"}" ;;
+	/*) printf '%s\n' "$1" ;;
+	*) printf '%s/%s\n' "$HOME" "$1" ;;
+	esac
+}
+
+[ -n "$CONFDIR" ] || CONFDIR="$HOME/.config/onedrive-ondemand"
+CONFDIR=$(expand_home "$CONFDIR")
+
+SYNC_DIR="~/OneDrive"
+if [ -r "$CONFDIR/config" ]; then
+	# Last uncommented 'sync_dir = "..."' wins
+	value=$(sed -n 's/^[[:space:]]*sync_dir[[:space:]]*=[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$CONFDIR/config" | tail -n 1)
+	[ -z "$value" ] || SYNC_DIR=$value
+fi
+MOUNTPOINT=$(expand_home "$SYNC_DIR")
+# Drop trailing slashes (but keep "/")
+while [ "${MOUNTPOINT%/}" != "$MOUNTPOINT" ] && [ "$MOUNTPOINT" != / ]; do
+	MOUNTPOINT=${MOUNTPOINT%/}
+done
+
+# /proc/self/mountinfo escapes space, tab, newline and backslash as octal
+escaped=$(printf '%s' "$MOUNTPOINT" | sed -e 's/\\/\\134/g' -e 's/ /\\040/g' -e 's/	/\\011/g')
+
+fuse_mounted() {
+	# Passed through the environment: awk -v would undo the octal escapes
+	MOUNTINFO_PATH=$escaped awk '
+		$5 == ENVIRON["MOUNTINFO_PATH"] {
+			for (i = 7; i <= NF; i++) if ($i == "-") { t = $(i + 1); break }
+			if (t == "fuse.onedrive") found = 1
+		}
+		END { exit found ? 0 : 1 }' /proc/self/mountinfo
+}
+
+if ! fuse_mounted; then
+	echo "onedrive-ondemand-unmount: $MOUNTPOINT is not mounted, nothing to do"
+	exit 0
+fi
+
+if [ "$DRYRUN" = yes ]; then
+	echo "onedrive-ondemand-unmount: would run: fusermount3 -u -z $MOUNTPOINT"
+	exit 0
+fi
+
+echo "onedrive-ondemand-unmount: unmounting stale mount $MOUNTPOINT"
+fusermount3 -u -z "$MOUNTPOINT"
