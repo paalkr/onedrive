@@ -42,6 +42,7 @@ import ondemand;
 import ondemandcli;
 import thumbnails;
 import dbusstatus;
+import ondemandpins;
 
 // Native stack trace support for fatal signal diagnostics.
 // On OpenBSD this is provided by libexecinfo; on Linux this is provided by glibc.
@@ -1675,6 +1676,8 @@ int main(string[] cliArgs) {
 								}
 								// Perform the standard sync process
 								performStandardSyncProcess(localPath, filesystemMonitor);
+								// On-demand: after the first cycle following a resync, pin the previously pinned items again
+								if (onDemandMountActive) restoreOnDemandPinsAfterResync();
 							}
 
 							// Handle any new inotify events
@@ -2479,7 +2482,9 @@ bool startOnDemand() {
 			addLogEntry("ERROR: The configured 'sync_dir' is not a directory and cannot be used as the on-demand mountpoint: " ~ mountPoint, ["info", "notify"]);
 			return false;
 		} else if (!dirEntries(mountPoint, SpanMode.shallow, false).empty) {
-			addLogEntry("WARNING: The on-demand mountpoint is not empty; its existing content is hidden while mounted: " ~ mountPoint);
+			// A non-empty folder would be hidden by the mount (and is not part of this profile's data)
+			addLogEntry("ERROR: The on-demand mountpoint (sync_dir) must be an empty directory: " ~ mountPoint, ["info", "notify"]);
+			return false;
 		}
 	} catch (FileException e) {
 		addLogEntry("ERROR: Unable to prepare the on-demand mountpoint " ~ mountPoint ~ ": " ~ e.msg, ["info", "notify"]);
@@ -2575,6 +2580,30 @@ LocalChange[] takePendingOnDemandChanges() {
 	pendingOnDemandChanges = null;
 	if (debugLogging && result.length > 0) {addLogEntry("On-demand: local changes reported by the mount: " ~ to!string(result.length), ["debug"]);}
 	return result;
+}
+
+// On-demand: pin again the items recorded before a --resync (by id, else by path). Pinned folders keep
+// pinning new files below them; pinned files that are not present are hydrated by the pin action.
+void restoreOnDemandPinsAfterResync() {
+	string pinsFile = onDemandPinsFile(appConfig.configDirName);
+	if (!exists(pinsFile) || (onDemandHydrationService is null)) return;
+	try {
+		auto records = loadOnDemandPins(pinsFile);
+		auto items = resolveOnDemandPins(itemDB, records, appConfig.defaultDriveId);
+		size_t queued = 0;
+		foreach (item; items) {
+			try {
+				onDemandHydrationService.requestAction(item.driveId, item.id, OnDemandAction.pin);
+				queued++;
+			} catch (Exception e) {
+				addLogEntry("On-demand: unable to pin " ~ item.name ~ " again after the resync: " ~ e.msg);
+			}
+		}
+		addLogEntry("On-demand: pinning " ~ to!string(queued) ~ " of " ~ to!string(records.length) ~ " item(s) again after the resync");
+		std.file.remove(pinsFile);
+	} catch (Exception e) {
+		addLogEntry("WARNING: On-demand: unable to restore pinned items after the resync: " ~ e.msg);
+	}
 }
 
 // On-demand: keep a local deletion for the next scheduled sync if its item is still in the database
@@ -2752,6 +2781,17 @@ void processResyncDatabaseRemoval(string databaseFilePathToRemove) {
 	}
 	
 	// If we have exclusive access we will not have exited
+	// On-demand: keep "Always keep on this device" across the resync. The ondemand_deferred table
+	// goes with the database deliberately: the resync rebuilds from the current online state, and an
+	// open file is deferred again at that point.
+	if (appConfig.getValueBool("on_demand") && !dryRun) {
+		try {
+			size_t pinned = saveOnDemandPins(itemDB, onDemandPinsFile(appConfig.configDirName));
+			if (pinned > 0) addLogEntry("On-demand: recorded " ~ to!string(pinned) ~ " pinned item(s) to pin again after the resync");
+		} catch (Exception e) {
+			addLogEntry("WARNING: On-demand: unable to record pinned items before the resync: " ~ e.msg);
+		}
+	}
 	// destroy access test
 	itemDB = null;
 	// delete application sync state

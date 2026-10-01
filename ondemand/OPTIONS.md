@@ -24,7 +24,7 @@ Status values:
 | log_dir | relevant | Logging only | config.d:318 |
 | skip_dir (R) | relevant | Client-side filtering. Excluded online items are not recorded, so they do not appear in the mount. A matching folder created through the mount stays local only (in the backing dir). | config.d:319, 1081 |
 | skip_file (R) | relevant | As skip_dir, for files | config.d:320, 1074 |
-| sync_dir (R) | relevant-ondemand | It is the mountpoint. Data lives in the backing dir. | config.d:321, 1064; config.d initialiseRuntimeSyncDirectory |
+| sync_dir (R in normal mode only) | relevant-ondemand | It is the mountpoint; data lives in the backing dir. In on-demand mode a changed sync_dir needs no --resync when the backing dir recorded in the database marker is unchanged (config.d onDemandSyncDirChangeIsMountOnly). The new mountpoint must be an empty directory, not inside the backing dir; the old one is left alone. | config.d:321, 1064; config.d initialiseRuntimeSyncDirectory |
 | user_agent | relevant | HTTP | config.d:322; onedrive.d:280 |
 | drive_id (R) | relevant | SharePoint library selection | config.d:324 |
 | azure_ad_endpoint | relevant | National cloud endpoints | config.d:340 |
@@ -56,7 +56,7 @@ Status values:
 | check_nosync (R) | relevant | `.nosync` in a folder of the backing dir (created through the mount) protects it as in normal mode | config.d:413; sync.d:2612, 2948, 7439 |
 | download_only | refused | See upload_only | config.d:415 |
 | on_demand | relevant-ondemand | Requires --monitor. Database marker checks (main.d checkOnDemandProfileState). | config.d:417 |
-| on_demand_backing_dir | relevant-ondemand | Backing dir. A change requires --resync (marker records it). | config.d:419 |
+| on_demand_backing_dir | relevant-ondemand | Backing dir. A change requires --resync (the database marker records it). | config.d:419 |
 | dbus_status | relevant-ondemand | D-Bus status interface, both modes | config.d:421 |
 | on_demand_thumbnails | relevant-ondemand | Thumbnails for online-only files | config.d:423 |
 | on_demand_cli_download, _pin, _unpin, _free, _status | refused (in the config file) | CLI only. Ignored with a warning in the config file. | config.d:425-429, 1024-1031 |
@@ -119,7 +119,7 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `log_dir` | relevant | no | Logging only. |
 | `skip_dir` | relevant | yes | Client-side filtering. |
 | `skip_file` | relevant | yes | As skip_dir, for files. |
-| `sync_dir` | relevant-ondemand | yes | It is the mountpoint. |
+| `sync_dir` | relevant-ondemand | no | The mountpoint; changing it needs no --resync in on-demand mode (it does in normal mode) as long as on_demand_backing_dir is unchanged. |
 | `user_agent` | relevant | no | HTTP. |
 | `drive_id` | relevant | yes | SharePoint library selection. |
 | `azure_ad_endpoint` | relevant | no | National cloud endpoints. |
@@ -151,7 +151,7 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `check_nosync` | relevant | yes | `.nosync` in a folder of the backing dir (created through the mount) protects it as in normal mode. |
 | `download_only` | refused | no | See upload_only. |
 | `on_demand` | relevant-ondemand | no | Requires --monitor. |
-| `on_demand_backing_dir` | relevant-ondemand | no | Backing dir. |
+| `on_demand_backing_dir` | relevant-ondemand | yes | The local folder that holds downloaded files; changing it requires --resync. |
 | `dbus_status` | relevant-ondemand | no | D-Bus status interface, both modes. |
 | `on_demand_thumbnails` | relevant-ondemand | no | Thumbnails for online-only files. |
 | `on_demand_cli_download` | refused | no | CLI only. |

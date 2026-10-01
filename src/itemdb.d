@@ -1538,6 +1538,26 @@ final class ItemDatabase {
 		}
 	}
 
+	// On-demand: all pinned items (files and folders)
+	Item[] selectPinnedItems() {
+		synchronized(databaseLock) {
+			Item[] items;
+			auto stmt = db.prepare("SELECT * FROM item WHERE hydration = 'P'");
+			scope(exit) stmt.finalise(); // Ensure that the prepared statement is finalised after execution.
+			try {
+				auto res = stmt.exec();
+				while (!res.empty) {
+					items ~= buildItem(res);
+					res.step();
+				}
+			} catch (SqliteException exception) {
+				// Handle the error appropriately
+				detailSQLErrorMessage(exception);
+			}
+			return items;
+		}
+	}
+
 	// On-demand: all online-only file items
 	Item[] selectOnlineOnlyFiles() {
 		synchronized(databaseLock) {

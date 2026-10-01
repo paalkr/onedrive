@@ -96,6 +96,7 @@ SOURCES = \
 	src/localAuth.d \
 	src/hydration.d \
 	src/dbusstatus.d \
+	src/ondemandpins.d \
 	src/ondemandcli.d \
 	src/thumbnails.d \
 	src/thumbnailpng.d \

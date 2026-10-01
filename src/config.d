@@ -2314,6 +2314,13 @@ class ApplicationConfig {
 			if (!configFileSkipSize && (getValueLong("skip_size") > 0)) logAndSetDifference("skip_size: CLI override of config file option, --resync needed", 10);
 		}
 
+		// On-demand: 'sync_dir' is only the mountpoint; the data lives in the backing directory. A changed
+		// 'sync_dir' needs no resync when the backing directory recorded for the database is unchanged.
+		if (configOptionsDifferent[3] && onDemandSyncDirChangeIsMountOnly()) {
+			addLogEntry("On-demand: 'sync_dir' (the mountpoint) changed; the backing directory is unchanged, so no --resync is needed");
+			configOptionsDifferent[3] = false;
+		}
+
 		// Aggregate the result to determine if a resync is required
 		if (!failedToReadBackupConfig) {
 			foreach (optionDifferent; configOptionsDifferent) {
@@ -3135,6 +3142,19 @@ class ApplicationConfig {
 		recycleBinInfoPath = basePath ~ "info"  ~ dirSeparatorString;
 	}
 	
+	// On-demand: does the database marker ('<database>.ondemand') record the current backing directory?
+	bool onDemandSyncDirChangeIsMountOnly() {
+		if (!getValueBool("on_demand")) return false;
+		string marker = databaseFilePath ~ ".ondemand";
+		if (!exists(marker)) return false;
+		try {
+			string recorded = strip(readText(marker));
+			return !recorded.empty && (recorded == buildNormalizedPath(absolutePath(runtimeSyncDirectory)));
+		} catch (Exception e) {
+			return false;
+		}
+	}
+
 	// Is 'recycleBinParentPath' a child path of the configured 'runtimeSyncDirectory'?
 	bool checkRecycleBinPathAsChildOfSyncDir() {
 		// Configure the variables to check
