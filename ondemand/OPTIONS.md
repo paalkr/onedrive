@@ -109,6 +109,110 @@ Status values:
 | display_processing_time | relevant | Diagnostics | config.d:612 |
 | force_xfer_abort | relevant | Engine transfers on exit. Hydrations are aborted by HydrationService.shutdown() regardless. | config.d:614 |
 
+## Machine-readable summary
+
+One row per config key, for tools (OneDriveGUI's settings editor parses this table). Class is the on-demand status from the table above; Resync is `yes` when changing the option requires `--resync`.
+
+| Option | Class | Resync | Notes |
+|---|---|---|---|
+| `application_id` | relevant | no | Authentication only. |
+| `log_dir` | relevant | no | Logging only. |
+| `skip_dir` | relevant | yes | Client-side filtering. |
+| `skip_file` | relevant | yes | As skip_dir, for files. |
+| `sync_dir` | relevant-ondemand | yes | It is the mountpoint. |
+| `user_agent` | relevant | no | HTTP. |
+| `drive_id` | relevant | yes | SharePoint library selection. |
+| `azure_ad_endpoint` | relevant | no | National cloud endpoints. |
+| `azure_tenant_id` | relevant | no | Authentication. |
+| `transfer_order` | relevant | no | Order of engine download/upload batches. |
+| `monitor_authoritative_sync` | ignored | no | Only consulted with download_only + cleanup_local_files, which on-demand refuses. |
+| `use_recycle_bin` | risky | no | Online deletions move backing-dir files to the recycle bin (online-only files have no local file, so nothing moves). |
+| `recycle_bin_path` | risky | no | See use_recycle_bin. |
+| `verbose` | relevant | no | Logging. |
+| `monitor_interval` | relevant | no | Sync cycle interval. |
+| `skip_size` | relevant | yes | Filtering. |
+| `monitor_log_frequency` | relevant | no | Log suppression. |
+| `monitor_fullscan_frequency` | relevant | no | Online full-scan true-up. |
+| `classify_as_big_delete` | relevant | no | Applies in uploadDeletedItem (sync.d:12768). |
+| `sync_dir_permissions` | relevant | no | Applied to backing-dir folders created by the engine. |
+| `sync_file_permissions` | relevant | no | Applied to downloaded/hydrated backing files and visible through the mount (lstat). |
+| `rate_limit` | relevant | no | Applies to engine transfers and hydrations (same CurlEngine). |
+| `space_reservation` | relevant | no | Download and hydration free-space check. |
+| `file_fragment_size` | relevant | no | Session uploads. |
+| `operation_timeout` | relevant | no | HTTP. |
+| `dns_timeout` | relevant | no | HTTP, connectivity probe. |
+| `connect_timeout` | relevant | no | HTTP, connectivity probe, thumbnails. |
+| `data_timeout` | relevant | no | HTTP, thumbnails. |
+| `ip_protocol_version` | relevant | no | HTTP. |
+| `max_curl_idle` | relevant | no | CurlEngine pool. |
+| `threads` | relevant | no | Engine transfer pool. |
+| `upload_only` | refused | no | "--on-demand cannot be used with --upload-only or --download-only". |
+| `check_nomount` | ignored | no | Checks for `.nosync` in the working directory, which is the backing dir under the confdir. |
+| `check_nosync` | relevant | yes | `.nosync` in a folder of the backing dir (created through the mount) protects it as in normal mode. |
+| `download_only` | refused | no | See upload_only. |
+| `on_demand` | relevant-ondemand | no | Requires --monitor. |
+| `on_demand_backing_dir` | relevant-ondemand | no | Backing dir. |
+| `dbus_status` | relevant-ondemand | no | D-Bus status interface, both modes. |
+| `on_demand_thumbnails` | relevant-ondemand | no | Thumbnails for online-only files. |
+| `on_demand_cli_download` | refused | no | CLI only. |
+| `on_demand_cli_pin` | refused | no | CLI only. |
+| `on_demand_cli_unpin` | refused | no | CLI only. |
+| `on_demand_cli_free` | refused | no | CLI only. |
+| `on_demand_cli_status` | refused | no | CLI only. |
+| `disable_notifications` | relevant | no | Desktop notifications. |
+| `disable_download_validation` | relevant | no | Honoured by engine downloads and hydrations (hydration.d verifyDownload). |
+| `disable_upload_validation` | relevant | no | Uploads. |
+| `enable_logging` | relevant | no | Logging. |
+| `force_http_11` | relevant | no | HTTP. |
+| `local_first` | relevant | no | Local-first ordering of the standard sync (main.d:2125). |
+| `no_remote_delete` | ignored | no | Only valid with upload_only, which on-demand refuses (config.d "--no-remote-delete can only be used with --upload-only"). |
+| `skip_symlinks` | ignored | yes | Symlinks cannot be created through the mount (no symlink operation). |
+| `debug_https` | relevant | no | Diagnostics. |
+| `skip_dotfiles` | relevant | yes | Filtering. |
+| `dry_run` | risky | no | Uses a copy of the database and fakes engine transfers. |
+| `sync_root_files` | relevant | no | sync_list. |
+| `remove_source_files` | ignored | no | Only valid with upload_only (refused). |
+| `remove_source_folders` | ignored | no | Only valid with upload_only (refused). |
+| `skip_dir_strict_match` | relevant | no | Filtering. |
+| `resync` | relevant | no | Rebuilds the database. |
+| `resync_auth` | relevant | no | Authentication. |
+| `bypass_data_preservation` | risky | no | No safeBackup conflict copies. |
+| `sync_business_shared_items` | risky | yes | Shared (remote) items are out of scope for on-demand. |
+| `display_running_config` | relevant | no | Display. |
+| `read_only_auth_scope` | relevant | no | Uploads fail; local edits through the mount stay local. |
+| `cleanup_local_files` | ignored | no | Only valid with download_only (refused). |
+| `permanent_delete` | relevant | no | Local deletes through the mount (including of online-only files) are permanent online, as in normal mode. |
+| `disable_upload_hash_streaming` | relevant | no | Uploads. |
+| `create_new_file_version` | relevant | no | SharePoint enrichment handling. |
+| `force_session_upload` | relevant | no | Uploads. |
+| `delay_inotify_processing` | ignored | no | Only applies while the inotify monitor is initialised (main.d:1814 `filesystemMonitor.initialised`), which it is not in on-demand mode. |
+| `inotify_delay` | ignored | no | See delay_inotify_processing. |
+| `webhook_enabled` | relevant | no | Remote change notification. |
+| `webhook_public_url` | relevant | no | Webhook. |
+| `webhook_listening_host` | relevant | no | Webhook. |
+| `webhook_listening_port` | relevant | no | Webhook. |
+| `webhook_expiration_interval` | relevant | no | Webhook. |
+| `webhook_renewal_interval` | relevant | no | Webhook. |
+| `webhook_retry_interval` | relevant | no | Webhook. |
+| `disable_websocket_support` | relevant | no | Remote change notification. |
+| `notify_file_actions` | relevant | no | Notifications. |
+| `notify_monitor_start` | relevant | no | Notification (status text shows "on-demand mount"). |
+| `display_transfer_metrics` | relevant | no | Engine transfers (not hydrations). |
+| `write_xattr_data` | relevant | no | Writes `user.onedrive.createdBy` / `user.onedrive.lastModifiedBy` on backing files after download (sync.d:5388-5389). |
+| `disable_permission_set` | relevant | no | Backing dir permissions (engine and hydration). |
+| `use_intune_sso` | relevant | no | Authentication. |
+| `use_device_auth` | relevant | no | Authentication. |
+| `display_manager_integration` | relevant | no | Bookmarks use sync_dir, which is the mountpoint the user sees. |
+| `disable_version_check` | relevant | no | Version check. |
+| `disable_time_check` | relevant | no | System time validation. |
+| `mirror_local_state` | risky | no | With local_first: online items queued for download are deleted online instead (sync.d:3445-3457), and new online folders are deleted online (sync.d:3918-3922). |
+| `display_memory` | relevant | no | Diagnostics. |
+| `monitor_max_loop` | relevant | no | Developer option. |
+| `display_sync_options` | relevant | no | Diagnostics. |
+| `force_children_scan` | relevant | no | Online scan method. |
+| `display_processing_time` | relevant | no | Diagnostics. |
+| `force_xfer_abort` | relevant | no | Engine transfers on exit. |
+
 ## CLI-only options that matter for a GUI
 
 Set in `updateFromArgs()` (config.d:1308-1337 and getopt); not accepted in the config file:
