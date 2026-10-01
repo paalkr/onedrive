@@ -1,0 +1,419 @@
+#!/usr/bin/python3
+"""Per-user setup of a OneDrive Files On-Demand profile.
+
+Writes ~/.config/<profile>/config (and sync_list), authorises the client
+once, prints the commands for the first synchronisation, and optionally
+enables the systemd user unit. Every step can be repeated: a step that is
+already done is reported and skipped.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+DEFAULT_PROFILE = "onedrive-ondemand"
+DEFAULT_MOUNT = "~/OneDrive"
+PROFILE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+GUID_RE = re.compile(r"^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$")
+SYNC_DIR_RE = re.compile(r'^\s*sync_dir\s*=\s*"(.*)"\s*$')
+
+EPILOG = """\
+examples:
+  onedrive-ondemand-setup
+  onedrive-ondemand-setup --non-interactive --mount ~/OneDrive
+  onedrive-ondemand-setup --non-interactive --profile onedrive-ondemand-business \\
+      --mount ~/OneDrive-Business --business --azure-tenant-id contoso.onmicrosoft.com \\
+      --application-id 00000000-0000-0000-0000-000000000000 --sync-list Projects
+
+profiles:
+  A profile is the directory ~/.config/<profile>. The default profile
+  'onedrive-ondemand' runs as onedrive-ondemand.service; any other profile
+  runs as onedrive-ondemand@<profile>.service (systemd --user).
+"""
+
+
+class SetupError(Exception):
+    pass
+
+
+def say(msg=""):
+    print(msg, flush=True)
+
+
+def home():
+    h = os.environ.get("HOME")
+    if not h or not os.path.isabs(h):
+        raise SetupError("HOME is not set to an absolute path")
+    return os.path.normpath(h)
+
+
+def expand(path):
+    path = path.strip()
+    if path == "~" or path.startswith("~/"):
+        path = home() + path[1:]
+    elif not os.path.isabs(path):
+        path = os.path.join(home(), path)
+    return os.path.normpath(path)
+
+
+def unit_name(profile):
+    if profile == DEFAULT_PROFILE:
+        return "onedrive-ondemand.service"
+    return "onedrive-ondemand@%s.service" % profile
+
+
+def quote_value(name, value):
+    if '"' in value or "\n" in value:
+        raise SetupError("%s must not contain quotes or newlines" % name)
+    return '"%s"' % value
+
+
+def ask(prompt, default=None):
+    suffix = " [%s]" % default if default else ""
+    try:
+        answer = input("%s%s: " % (prompt, suffix)).strip()
+    except EOFError:
+        raise SetupError("input ended")
+    return answer or (default or "")
+
+
+def ask_yes_no(prompt, default=False):
+    suffix = " [Y/n]" if default else " [y/N]"
+    while True:
+        try:
+            answer = input(prompt + suffix + ": ").strip().lower()
+        except EOFError:
+            raise SetupError("input ended")
+        if not answer:
+            return default
+        if answer in ("y", "yes"):
+            return True
+        if answer in ("n", "no"):
+            return False
+
+
+def fuse_mountpoints():
+    """Mountpoints of FUSE file systems, from /proc/self/mountinfo."""
+    points = set()
+    try:
+        with open("/proc/self/mountinfo") as f:
+            for line in f:
+                fields = line.split()
+                if "-" not in fields[6:]:
+                    continue
+                fstype = fields[fields.index("-", 6) + 1]
+                if fstype == "fuse" or fstype.startswith("fuse."):
+                    point = re.sub(r"\\([0-7]{3})", lambda m: chr(int(m.group(1), 8)), fields[4])
+                    points.add(os.path.normpath(point))
+    except OSError:
+        pass
+    return points
+
+
+def other_profile_using(mount, confdir):
+    """Another ~/.config/*/config whose sync_dir is this mount, if any."""
+    config_root = os.path.join(home(), ".config")
+    try:
+        names = sorted(os.listdir(config_root))
+    except OSError:
+        return None
+    for name in names:
+        other = os.path.join(config_root, name)
+        if os.path.normpath(other) == confdir:
+            continue
+        cfg = os.path.join(other, "config")
+        if not os.path.isfile(cfg):
+            continue
+        try:
+            with open(cfg, errors="replace") as f:
+                values = [m.group(1) for m in map(SYNC_DIR_RE.match, f) if m]
+        except OSError:
+            continue
+        if values and expand(values[-1]) == mount:
+            return other
+    return None
+
+
+def validate(opts):
+    if not PROFILE_RE.match(opts.profile):
+        raise SetupError("profile name '%s' is not valid (letters, digits, '_', '.', '-'; not starting with '.' or '-')" % opts.profile)
+    confdir = os.path.join(home(), ".config", opts.profile)
+    mount = expand(opts.mount)
+    if mount in ("/", home()):
+        raise SetupError("the mount folder cannot be %s" % mount)
+    for a, b in ((mount, confdir), (confdir, mount)):
+        if a == b or a.startswith(b + "/"):
+            raise SetupError("the mount folder (%s) and the profile directory (%s) must not contain each other" % (mount, confdir))
+    already_mounted = mount in fuse_mountpoints()
+    if os.path.lexists(mount):
+        if not os.path.isdir(mount) or os.path.islink(mount):
+            raise SetupError("%s exists and is not a directory" % mount)
+        if not already_mounted:
+            try:
+                entries = os.listdir(mount)
+            except OSError as e:
+                raise SetupError("cannot read %s: %s (a stale mount? try: onedrive-ondemand-unmount --confdir=%s)" % (mount, e.strerror, confdir))
+            if entries:
+                raise SetupError("%s is not empty. The mount would hide its content; choose an empty or new folder" % mount)
+    other = other_profile_using(mount, confdir)
+    if other:
+        raise SetupError("%s is already the sync_dir of %s" % (mount, other))
+    if opts.application_id and not GUID_RE.match(opts.application_id):
+        raise SetupError("application_id must be a GUID (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)")
+    folders = []
+    for folder in opts.sync_list:
+        folder = folder.strip().strip("/")
+        if not folder:
+            continue
+        if "\n" in folder or folder.startswith("!") or folder.startswith("-") or ".." in folder.split("/"):
+            raise SetupError("sync_list folder '%s' is not valid" % folder)
+        folders.append(folder)
+    return confdir, mount, already_mounted, folders
+
+
+def render_config(opts, mount):
+    lines = [
+        "# OneDrive Files On-Demand profile '%s', written by onedrive-ondemand-setup." % opts.profile,
+        "# Started by %s (systemd --user) with --monitor --on-demand." % unit_name(opts.profile),
+        "# All options: /usr/share/doc/onedrive-ondemand/config and application-config-options.md",
+        "# Changing sync_dir or sync_list later requires a --resync.",
+        "sync_dir = %s" % quote_value("mount folder", mount),
+    ]
+    if opts.application_id:
+        lines.append("application_id = %s" % quote_value("application_id", opts.application_id))
+    if opts.azure_tenant_id:
+        lines.append("azure_tenant_id = %s" % quote_value("azure_tenant_id", opts.azure_tenant_id))
+    if opts.use_intune_sso:
+        lines.append('use_intune_sso = "true"')
+    return "\n".join(lines) + "\n"
+
+
+def render_sync_list(folders):
+    if not folders:
+        return None
+    lines = ["# Folders presented in the on-demand mount (relative to the OneDrive root)."]
+    lines += ["/%s/" % f for f in folders]
+    return "\n".join(lines) + "\n"
+
+
+def read_or_none(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def backup(path):
+    n = 1
+    while os.path.lexists("%s.bak.%d" % (path, n)):
+        n += 1
+    os.replace(path, "%s.bak.%d" % (path, n))
+    say("  kept the previous %s as %s.bak.%d" % (os.path.basename(path), path, n))
+
+
+def write_private(path, text):
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def step_profile(opts, confdir, mount, folders):
+    config_path = os.path.join(confdir, "config")
+    sync_list_path = os.path.join(confdir, "sync_list")
+    wanted = {config_path: render_config(opts, mount), sync_list_path: render_sync_list(folders)}
+    current = {p: read_or_none(p) for p in wanted}
+
+    say("Profile %s (%s)" % (opts.profile, confdir))
+    if current[config_path] is not None and current == wanted:
+        say("  config is already up to date")
+    else:
+        if current[config_path] is not None and not opts.force:
+            raise SetupError("the profile %s already exists with different settings. Use --force to overwrite it (the old files are kept as .bak)" % confdir)
+        os.makedirs(confdir, mode=0o700, exist_ok=True)
+        if current[config_path] is not None and os.path.exists(os.path.join(confdir, "items.sqlite3")):
+            say("  NOTE: this profile has synchronised before; the next run needs --resync")
+        for path, text in wanted.items():
+            if current[path] == text:
+                continue
+            if current[path] is not None:
+                backup(path)
+            if text is not None:
+                write_private(path, text)
+                say("  wrote %s" % path)
+    for path, text in wanted.items():
+        if text is not None:
+            say("  --- %s" % os.path.basename(path))
+            for line in text.splitlines():
+                say("  | " + line)
+
+    if os.path.isdir(mount):
+        say("  mount folder %s exists" % mount)
+    else:
+        os.makedirs(mount, mode=0o700)
+        say("  created mount folder %s" % mount)
+
+
+def authorised(confdir):
+    return any(os.path.exists(os.path.join(confdir, f)) for f in ("refresh_token", "intune_account"))
+
+
+def step_auth(opts, confdir):
+    say()
+    say("Authorisation")
+    auth_cmd = [opts.onedrive, "--confdir=%s" % confdir]
+    if authorised(confdir):
+        say("  already authorised (%s has a token)" % confdir)
+        return True
+    if opts.no_auth:
+        say("  skipped (--no-auth). Authorise later with:")
+        say("    %s" % " ".join(auth_cmd))
+        return False
+    if shutil.which(opts.onedrive) is None:
+        raise SetupError("'%s' not found" % opts.onedrive)
+    say("  running: %s" % " ".join(auth_cmd))
+    say("  Follow the instructions of the client to sign in. It exits after authorising; the")
+    say("  message that --sync or --monitor is missing is expected.")
+    say()
+    subprocess.run(auth_cmd)
+    say()
+    if authorised(confdir):
+        say("  authorised")
+        return True
+    say("  not authorised (no token in %s). Run the command above again." % confdir)
+    return False
+
+
+def systemctl(*args, capture=True):
+    return subprocess.run(["systemctl", "--user"] + list(args), stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.STDOUT if capture else None, universal_newlines=True)
+
+
+def step_next(opts, confdir, mount, is_authorised, already_mounted):
+    unit = unit_name(opts.profile)
+    first_sync = "%s --confdir=%s --monitor --on-demand --resync --resync-auth" % (opts.onedrive, confdir)
+    say()
+    say("Next steps")
+    say("  1. First synchronisation, in a terminal (stop it with Ctrl+C once the log shows")
+    say("     'Files On-Demand mount is active' and the initial sync has completed):")
+    say("       %s" % first_sync)
+    say("  2. Run it in the background from then on (and at every login):")
+    say("       systemctl --user daemon-reload")
+    say("       systemctl --user enable --now %s" % unit)
+    say("     Logs: journalctl --user -u %s -f" % unit)
+    say("  3. File manager integration (package python3-nautilus): nautilus -q")
+    say("  Mount folder: %s" % mount)
+
+    if shutil.which("systemctl") is None:
+        say("  (systemctl not found; skipping the service step)")
+        return
+    if opts.enable_service is None:
+        if opts.non_interactive:
+            return
+        if not is_authorised:
+            say("  The service is not offered until the profile is authorised.")
+            return
+        say()
+        if not ask_yes_no("Enable and start %s now (only after step 1 has completed)?" % unit):
+            return
+    elif not opts.enable_service:
+        return
+    if not is_authorised:
+        raise SetupError("the profile is not authorised; not enabling %s" % unit)
+    say()
+    systemctl("daemon-reload")
+    enabled = systemctl("is-enabled", unit).stdout.strip() == "enabled"
+    active = systemctl("is-active", unit).stdout.strip() == "active"
+    if enabled and active:
+        say("%s is already enabled and running" % unit)
+        return
+    if already_mounted and not active:
+        raise SetupError("%s is already mounted by another process (a foreground client from step 1?). Stop it first" % mount)
+    result = systemctl("enable", "--now", unit, capture=False)
+    if result.returncode != 0:
+        raise SetupError("systemctl --user enable --now %s failed" % unit)
+    say("%s enabled and started. Logs: journalctl --user -u %s -f" % (unit, unit))
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="onedrive-ondemand-setup",
+        description="Set up a OneDrive Files On-Demand profile for the current user. Writes "
+                    "~/.config/<profile>/config (and sync_list), authorises the client, and "
+                    "prints the commands for the first synchronisation. Safe to run again.",
+        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--profile", help="profile name, the directory below ~/.config (default: %s)" % DEFAULT_PROFILE)
+    p.add_argument("--mount", help="folder where OneDrive appears; must be empty or absent (default: %s)" % DEFAULT_MOUNT)
+    p.add_argument("--sync-list", action="append", metavar="FOLDER",
+                   help="only present this OneDrive folder (repeatable); default: everything")
+    p.add_argument("--business", action="store_true", help="ask for / accept the work or school account options below")
+    p.add_argument("--application-id", metavar="GUID", help="application_id of your organisation's app registration")
+    p.add_argument("--azure-tenant-id", metavar="TENANT", help="azure_tenant_id (GUID or domain)")
+    p.add_argument("--use-intune-sso", action="store_true", help="sign in through the Microsoft Intune broker (use_intune_sso)")
+    p.add_argument("--force", action="store_true", help="overwrite an existing profile with different settings (backups are kept)")
+    p.add_argument("--no-auth", action="store_true", help="do not run the client to authorise")
+    p.add_argument("--non-interactive", action="store_true", help="never prompt; use the options and defaults")
+    svc = p.add_mutually_exclusive_group()
+    svc.add_argument("--enable-service", dest="enable_service", action="store_true", default=None,
+                     help="enable and start the systemd user unit without asking")
+    svc.add_argument("--no-enable-service", dest="enable_service", action="store_false",
+                     help="do not offer to enable the systemd user unit")
+    p.add_argument("--onedrive", default="onedrive", metavar="PATH", help=argparse.SUPPRESS)
+    return p.parse_args(argv)
+
+
+def interview(opts):
+    say("OneDrive Files On-Demand setup. Press Enter to accept the [default].")
+    say()
+    if opts.profile is None:
+        opts.profile = ask("Profile name (directory below ~/.config)", DEFAULT_PROFILE)
+    if opts.mount is None:
+        opts.mount = ask("Folder where OneDrive appears (must be empty or new)", DEFAULT_MOUNT)
+    if opts.sync_list is None:
+        answer = ask("Only show some OneDrive folders? Comma-separated list, empty for everything", "")
+        opts.sync_list = [f for f in answer.split(",") if f.strip()]
+    if not (opts.business or opts.application_id or opts.azure_tenant_id or opts.use_intune_sso):
+        opts.business = ask_yes_no("Work or school account with organisation-specific sign-in settings?")
+    if opts.business:
+        if opts.application_id is None:
+            opts.application_id = ask("application_id (empty for the client's default)", "")
+        if opts.azure_tenant_id is None:
+            opts.azure_tenant_id = ask("azure_tenant_id (empty if not needed)", "")
+        if not opts.use_intune_sso:
+            opts.use_intune_sso = ask_yes_no("Sign in through Microsoft Intune SSO (use_intune_sso)?")
+    say()
+
+
+def main(argv):
+    opts = parse_args(argv)
+    try:
+        if not opts.non_interactive:
+            if not sys.stdin.isatty():
+                raise SetupError("standard input is not a terminal; use --non-interactive")
+            interview(opts)
+        opts.profile = opts.profile or DEFAULT_PROFILE
+        opts.mount = opts.mount or DEFAULT_MOUNT
+        opts.sync_list = opts.sync_list or []
+        opts.application_id = (opts.application_id or "").strip()
+        opts.azure_tenant_id = (opts.azure_tenant_id or "").strip()
+
+        confdir, mount, already_mounted, folders = validate(opts)
+        step_profile(opts, confdir, mount, folders)
+        is_authorised = step_auth(opts, confdir)
+        step_next(opts, confdir, mount, is_authorised, already_mounted)
+    except SetupError as e:
+        print("onedrive-ondemand-setup: ERROR: %s" % e, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -1,0 +1,23 @@
+.TH ONEDRIVE-ONDEMAND-UNMOUNT 1 "October 2026" "onedrive-ondemand" "User Commands"
+.SH NAME
+onedrive-ondemand-unmount \- remove a stale Files On-Demand mount of a onedrive profile
+.SH SYNOPSIS
+.B onedrive-ondemand-unmount
+[\fB\-\-confdir=\fIDIR\fR] [\fB\-\-dry\-run\fR]
+.SH DESCRIPTION
+Reads \fBsync_dir\fR from \fIDIR/config\fR (default
+\fI~/.config/onedrive-ondemand\fR; \fI~/OneDrive\fR when the config does not
+set it) and, if the onedrive FUSE file system (fuse.onedrive) is still mounted there, unmounts it with
+\fBfusermount3 \-u \-z\fR. Nothing mounted is not an error. The
+onedrive-ondemand systemd user units run it as \fBExecStopPost=\fR.
+.SH OPTIONS
+.TP
+\fB\-\-confdir=\fIDIR\fR
+Profile directory.
+.TP
+\fB\-\-dry\-run\fR
+Only report what would be done.
+.SH SEE ALSO
+.BR onedrive (1),
+.BR onedrive-ondemand-setup (1),
+.BR fusermount3 (1)
