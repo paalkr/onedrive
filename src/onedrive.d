@@ -31,6 +31,7 @@ import config;
 import log;
 import util;
 import curlEngine;
+import dbusstatus;
 import intune;
 import localAuth;
 
@@ -2364,6 +2365,9 @@ class OneDriveApi {
 
 					// On-demand: the owner of this instance requested an abort
 					if (transferAbortRequested()) return 1;
+
+					// D-Bus status: download progress (throttled by the status module)
+					statusTransferProgress(originalFilename, "download", cast(ulong) (effectiveResumeOffset + cast(long) dlnow));
 
 					// Handle SIGINT (CTRL-C) and SIGTERM (kill) events + 'force_xfer_abort'
 					if ((exitHandlerTriggered) && (appConfig.getValueBool("force_xfer_abort"))) {

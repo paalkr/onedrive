@@ -41,6 +41,7 @@ import hydration;
 import ondemand;
 import ondemandcli;
 import thumbnails;
+import dbusstatus;
 
 // Native stack trace support for fatal signal diagnostics.
 // On OpenBSD this is provided by libexecinfo; on Linux this is provided by glibc.
@@ -138,6 +139,8 @@ OneDriveSocketIo oneDriveSocketIo;
 HydrationService onDemandHydrationService;
 OnDemandChangeQueue onDemandChangeQueue;
 ThumbnailService onDemandThumbnailService;
+// D-Bus status interface (dbus_status)
+DBusStatusService dbusStatusService;
 bool onDemandMountActive = false;
 // On-demand local changes drained from onDemandChangeQueue, waiting to be applied
 OnDemandLocalChange[] pendingOnDemandChanges;
@@ -334,6 +337,16 @@ int main(string[] cliArgs) {
 	// Are we doing a --sync or a --monitor operation? Both of these will be false if they are not set
 	if ((!appConfig.getValueBool("synchronize")) && (!appConfig.getValueBool("monitor"))) {
 		syncOrMonitorMissing = true; // --sync or --monitor is missing 
+	}
+	
+	// Start the D-Bus status interface early, so it reports 'starting' while authentication and
+	// initialisation run. Only for a sync or monitor run.
+	if (!syncOrMonitorMissing && appConfig.getValueBool("dbus_status")) {
+		string statusSyncDir = appConfig.getValueBool("on_demand") ? appConfig.onDemandMountPoint : runtimeSyncDirectory;
+		statusConfigure(applicationVersion, appConfig.configDirName, statusSyncDir, appConfig.getValueBool("on_demand"));
+		statusSetState("starting", "Starting");
+		dbusStatusService = new DBusStatusService(appConfig.configDirName);
+		dbusStatusService.start();
 	}
 	
 	// Has the client been configured to use Intune SSO via Microsoft Identity Broker (microsoft-identity-broker) dbus session
@@ -1171,6 +1184,7 @@ int main(string[] cliArgs) {
 		
 		// Are we doing a --sync operation? This includes doing any --single-directory operations
 		if (appConfig.getValueBool("synchronize")) {
+			statusSetState("syncing", "Synchronising with Microsoft OneDrive");
 			// We are not using this, so destroy it early
 			object.destroy(filesystemMonitor);
 			filesystemMonitor = null;
@@ -1214,6 +1228,8 @@ int main(string[] cliArgs) {
 
 			// Detail the outcome of the sync process
 			displaySyncOutcome();
+			statusSyncCompleted();
+			reportSyncOutcomeStatus();
 		}
 		
 		// Are we doing a --monitor operation?
@@ -1533,7 +1549,10 @@ int main(string[] cliArgs) {
 				// configured a longer normal monitor interval.
 				auto activeMonitorCheckInterval = appConfig.systemTimeAllowsSync() ?
 					checkOnlineInterval : dur!"seconds"(TIME_BLOCKED_RETRY_INTERVAL_SECONDS);
-				if ((currentTime - lastCheckTime >= activeMonitorCheckInterval) || (monitorLoopFullCount == 0)) {
+				// D-Bus SyncNow() requests a cycle now
+				bool syncNowRequested = consumeStatusSyncNowRequest();
+				if (syncNowRequested) addLogEntry("A sync was requested through the D-Bus status interface");
+				if ((currentTime - lastCheckTime >= activeMonitorCheckInterval) || (monitorLoopFullCount == 0) || syncNowRequested) {
 					// Increment relevant counters
 					monitorLoopFullCount++;
 					fullScanFrequencyLoopCount++;
@@ -1625,6 +1644,7 @@ int main(string[] cliArgs) {
 						if (appConfig.systemTimeAllowsSync()) {
 							// Starting a sync - we are online and the process-visible clock is safe
 							addLogEntry("Starting a sync with Microsoft OneDrive");
+							statusSetState("syncing", "Synchronising with Microsoft OneDrive");
 
 							// Attempt to reset syncFailures from any prior loop
 							syncEngineInstance.resetSyncFailures();
@@ -1657,7 +1677,10 @@ int main(string[] cliArgs) {
 							// Detail the outcome of the sync process
 							if (appConfig.systemTimeAllowsSync()) {
 								displaySyncOutcome();
+								statusSyncCompleted();
+								reportSyncOutcomeStatus();
 							} else {
+								statusSetState("error", "Synchronisation is suspended because the system time is not safe");
 								addLogEntry("Current synchronisation cycle was suspended because system time is not currently safe.");
 							}
 
@@ -1669,12 +1692,14 @@ int main(string[] cliArgs) {
 							itemDB.performCheckpoint("PASSIVE");
 						} else {
 							addLogEntry("OneDrive synchronisation is suspended because system time is not currently safe. The monitor process will remain running and revalidate time on the next monitor cycle.");
+							statusSetState("error", "Synchronisation is suspended because the system time is not safe");
 						}
 					} else {
 						// Not online. Preserve any previously-latched blocking state while recording
 						// that a fresh authoritative time observation is currently unavailable.
 						validateSystemTime(appConfig, monitorServiceProbe, true, false);
 						addLogEntry("Microsoft OneDrive service is not reachable at this time. Will re-try on next sync attempt.");
+						statusSetState("offline", "Waiting for network");
 					}
 					
 					// Output end of loop processing times
@@ -2637,6 +2662,15 @@ bool isOnDemandOnlineOnlyPath(string path) {
 	return (item.type == ItemType.file) && (item.hydration == hydrationOnlineOnly);
 }
 
+// D-Bus status after a completed sync cycle
+void reportSyncOutcomeStatus() {
+	if (syncEngineInstance.syncFailures) {
+		statusSetState("error", "Some items could not be synchronised");
+	} else {
+		statusSetState("idle", "Up to date");
+	}
+}
+
 // Display the sync outcome
 void displaySyncOutcome() {
 	// Detail any download or upload transfer failures
@@ -3080,6 +3114,9 @@ bool sleepInterruptibly(Duration totalSleep, string reason) {
 			return true;
 		}
 
+		// D-Bus SyncNow(): end the wait so the monitor loop starts a cycle
+		if (statusSyncNowPending()) return false;
+
 		auto sleepSlice = (remaining > sleepPollInterval) ? sleepPollInterval : remaining;
 		Thread.sleep(sleepSlice);
 		remaining -= sleepSlice;
@@ -3097,6 +3134,9 @@ bool waitForMonitorEventsInterruptibly(Duration totalWait, bool uploadOnly, ref 
 			addShutdownTelemetry("receiveTimeout wait interrupted due to shutdown request");
 			return true;
 		}
+
+		// D-Bus SyncNow(): end the wait so the monitor loop starts a cycle
+		if (statusSyncNowPending()) return false;
 
 		auto waitSlice = (remaining > waitPollInterval) ? waitPollInterval : remaining;
 		bool workerMessageReceived = false;
@@ -3174,6 +3214,7 @@ void performSynchronisedExitProcess(string scopeCaller = null) {
 			}
 
 			addShutdownTelemetry("performSynchronisedExitProcess entered by scope: " ~ caller);
+			statusSetState("stopping", "Stopping");
 			addShutdownTelemetry("planned final exit code: " ~ to!string(requestedExitCode) ~ ", termination signal: " ~ to!string(terminationSignal));
 
 			// Remove Desktop integration
@@ -3218,6 +3259,12 @@ void performSynchronisedExitProcess(string scopeCaller = null) {
 
 			// Shutdown the application configuration objects - nothing should be active now
 			shutdownAppConfig();
+
+			// Stop the D-Bus status interface (it announces 'stopping' and releases its bus name)
+			if (dbusStatusService !is null) {
+				dbusStatusService.stop();
+				dbusStatusService = null;
+			}
 
 			// Shutdown application logging
 			shutdownApplicationLogging();

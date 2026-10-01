@@ -21,6 +21,7 @@ import std.uni;
 // What other modules that we have created do we need to import?
 import config;
 import curlEngine;
+import dbusstatus;
 import itemdb;
 import log;
 import onedrive;
@@ -1296,6 +1297,10 @@ final class HydrationService {
 		};
 
 		addLogEntry("On-demand: hydrating " ~ backingPath);
+		// D-Bus status: this hydration is in progress
+		string statusPath = relativePath(backingPath, backingDir);
+		statusTransferBegin(statusPath, "hydrate", fileSize);
+		scope(exit) statusTransferEnd(statusPath, "hydrate");
 		CurlResponse response;
 		try {
 			response = api.downloadById(driveId, id, stagingPath, fileSize, onlineHash, 0, verifyDownload);

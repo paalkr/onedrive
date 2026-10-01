@@ -39,6 +39,7 @@ import itemdb;
 import clientSideFiltering;
 import xattr;
 import hydration;
+import dbusstatus;
 
 class JsonResponseException: Exception {
 	@safe pure this(string inputMessage) {
@@ -355,6 +356,7 @@ class SyncEngine {
 		safeBackup(path, dryRun, bypassDataPreservation, renamedPath);
 		if (!renamedPath.empty) {
 			notifyExpectedLocalMove(to!string(path), renamedPath);
+			statusAddIssue(renamedPath, "conflict_copy", "info", "Conflict copy of " ~ to!string(path) ~ ": the local version was kept under this name");
 		}
 	}
 
@@ -396,6 +398,7 @@ class SyncEngine {
 		// This backup was created by the operation above. Existing matching backups
 		// returned earlier do not generate a new filesystem arrival to suppress.
 		notifyExpectedLocalFileArrival(backupPath);
+		statusAddIssue(backupPath, "conflict_copy", "info", "Conflict copy of " ~ to!string(path) ~ ": the local version was kept under this name");
 		return true;
 	}
 
@@ -904,6 +907,25 @@ class SyncEngine {
 		if ((defaultOneDriveDriveDetails.type() == JSONType.object) && (hasId(defaultOneDriveDriveDetails))) {
 			if (debugLogging) {addLogEntry("OneDrive Account Default Drive Details:      " ~ sanitiseJSONItem(defaultOneDriveDriveDetails), ["debug"]);}
 			appConfig.accountType = defaultOneDriveDriveDetails["driveType"].str;
+
+			// D-Bus status: account and quota
+			string statusAccountName;
+			if (("owner" in defaultOneDriveDriveDetails) && (defaultOneDriveDriveDetails["owner"].type == JSONType.object) &&
+				("user" in defaultOneDriveDriveDetails["owner"]) && (defaultOneDriveDriveDetails["owner"]["user"].type == JSONType.object)) {
+				JSONValue owner = defaultOneDriveDriveDetails["owner"]["user"];
+				if (("email" in owner) && (owner["email"].type == JSONType.string)) {
+					statusAccountName = owner["email"].str;
+				} else if (("displayName" in owner) && (owner["displayName"].type == JSONType.string)) {
+					statusAccountName = owner["displayName"].str;
+				}
+			}
+			statusSetAccount(statusAccountName, appConfig.accountType);
+			if (hasQuota(defaultOneDriveDriveDetails)) {
+				JSONValue quota = defaultOneDriveDriveDetails["quota"];
+				ulong quotaUsed = (("used" in quota) && (quota["used"].type == JSONType.integer)) ? to!ulong(max(0, quota["used"].integer)) : 0;
+				ulong quotaTotal = (("total" in quota) && (quota["total"].type == JSONType.integer)) ? to!ulong(max(0, quota["total"].integer)) : 0;
+				statusSetQuota(quotaUsed, quotaTotal);
+			}
 
 			// Issue #3115 - Validate driveId length
 			// What account type is this?
@@ -4529,6 +4551,10 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
+		// D-Bus status: files waiting to be downloaded in this batch
+		statusSetPendingDownloads(fileJSONItemsToDownload.length);
+		scope(exit) statusSetPendingDownloads(0);
+
 		// Was exitHandlerTriggered flagged
 		if (exitHandlerTriggered) {
 			// exitHandlerTriggered triggered
@@ -4724,6 +4750,9 @@ class SyncEngine {
 		if (onDemand && canonicalFileExistedBeforeDownload && onDemandDeferIfOpen(downloadDriveId, downloadItemId, onedriveJSONItem, ignoreDataPreservationCheck, newItemPath)) {
 			return;
 		}
+		// D-Bus status: this download is in progress
+		statusTransferBegin(newItemPath, "download", hasFileSize(onedriveJSONItem) ? to!ulong(onedriveJSONItem["size"].integer) : 0);
+		scope(exit) statusTransferEnd(newItemPath, "download");
 		bool onDemandDownloadSucceeded = false;
 		if (onDemand) {
 			onDemandForgetDeferral(downloadDriveId, downloadItemId);
@@ -4823,6 +4852,7 @@ class SyncEngine {
 				// localActualFreeSpace is less than freeSpaceReservation .. insufficient free space
 				// jsonFileSize is greater than localActualFreeSpace .. insufficient free space
 				addLogEntry("Downloading file: " ~ newItemPath ~ " ... failed!", ["info", "notify"]);
+				statusAddIssue(newItemPath, "download_failed", "attention", "The file could not be downloaded");
 				addLogEntry("Insufficient local disk space to download file");
 				downloadFailed = true;
 			} else {
@@ -5187,6 +5217,7 @@ class SyncEngine {
 						if ((exception.httpStatusCode == 403) && (appConfig.getValueBool("sync_business_shared_files"))) {
 							// We attempted to download a file, that was shared with us, but this was shared with us as read-only and no download permission
 							addLogEntry("Unable to download this file as this was shared as read-only without download permission: " ~ newItemPath);
+							statusAddIssue(newItemPath, "permission_denied", "attention", "The file was shared without download permission");
 							downloadFailed = true;
 						} else if (exception.httpStatusCode == 404) {
 							// The online item is no longer available at the time of download. This can legitimately
@@ -5229,6 +5260,8 @@ class SyncEngine {
 			if (!downloadFailed) {
 				// Download did not fail
 				addLogEntry("Downloading file: " ~ newItemPath ~ " ... done", fileTransferNotifications());
+				statusClearIssue(newItemPath, "download_failed");
+				statusClearIssue(newItemPath, "deferred_online_change");
 				onDemandDownloadSucceeded = true;
 
 				// As no download failure, calculate transfer metrics in a consistent manner
@@ -5259,6 +5292,7 @@ class SyncEngine {
 				if (!exitHandlerTriggered) {
 					// Output to the user that the file download failed
 					addLogEntry("Downloading file: " ~ newItemPath ~ " ... failed!", ["info", "notify"]);
+				statusAddIssue(newItemPath, "download_failed", "attention", "The file could not be downloaded");
 
 					// Add the path to a list of items that failed to download
 					if (!canFind(fileDownloadFailures, newItemPath)) {
@@ -5790,6 +5824,15 @@ class SyncEngine {
 		return subtreeHasOnlineOnlyItems(itemDB, item.driveId, item.id);
 	}
 
+	// Size of a local file for status reporting, 0 if it cannot be read
+	ulong fileSizeForStatus(string path) {
+		try {
+			return (exists(path) && isFile(path)) ? getSize(path) : 0;
+		} catch (Exception e) {
+			return 0;
+		}
+	}
+
 	// On-demand: if the item is open locally, defer (and persist) its newer online version instead
 	// of replacing the file. Returns true when deferred.
 	bool onDemandDeferIfOpen(string driveId, string id, JSONValue onlineItem, bool ignoreDataPreservationCheck, string localPath) {
@@ -5800,7 +5843,10 @@ class SyncEngine {
 		// before it is closed, and that edit must be kept as a conflict copy, not replaced
 		if (!deferOnlineChangeIfOpen(driveId, id, eTag, false, first)) return false;
 		itemDB.addOnDemandDeferred(driveId, id, eTag);
-		if (first) addLogEntry("On-demand: " ~ localPath ~ " is open locally; the newer online version will be applied when it is closed");
+		if (first) {
+			addLogEntry("On-demand: " ~ localPath ~ " is open locally; the newer online version will be applied when it is closed");
+			statusAddIssue(localPath, "deferred_online_change", "info", "A newer online version is applied when the file is closed");
+		}
 		return true;
 	}
 
@@ -7124,6 +7170,7 @@ class SyncEngine {
 				} else {
 					//The file is not readable - skipped
 					addLogEntry("Skipping processing this file as it cannot be read (file permissions or file corruption): " ~ localFilePath);
+					statusAddIssue(localFilePath, "permission_denied", "attention", "The local file cannot be read");
 				}
 			} else {
 				// The item was a file but now is a directory
@@ -7326,7 +7373,7 @@ class SyncEngine {
 		// Check path against Microsoft OneDrive restriction and limitations about Windows naming for files and folders
 		if (!invalidPath) {
 			if (!isValidName(localFilePath)) { // This will return false if this is not a valid name according to the OneDrive API specifications
-				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Microsoft Naming Convention): " ~ localFilePath, invalidPathLogTags);
+				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Microsoft Naming Convention): " ~ localFilePath, invalidPathLogTags); statusAddIssue(localFilePath, "invalid_name", "attention", "The name cannot be used on Microsoft OneDrive (Microsoft Naming Convention)");
 				invalidPath = true;
 			}
 		}
@@ -7334,7 +7381,7 @@ class SyncEngine {
 		// Check path for bad whitespace items
 		if (!invalidPath) {
 			if (containsBadWhiteSpace(localFilePath)) { // This will return true if this contains a bad whitespace character
-				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Contains an invalid whitespace character): " ~ localFilePath, invalidPathLogTags);
+				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Contains an invalid whitespace character): " ~ localFilePath, invalidPathLogTags); statusAddIssue(localFilePath, "invalid_name", "attention", "The name cannot be used on Microsoft OneDrive (Contains an invalid whitespace character)");
 				invalidPath = true;
 			}
 		}
@@ -7342,7 +7389,7 @@ class SyncEngine {
 		// Check path for HTML ASCII Codes
 		if (!invalidPath) {
 			if (containsASCIIHTMLCodes(localFilePath)) { // This will return true if this contains HTML ASCII Codes
-				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Contains HTML ASCII Code): " ~ localFilePath, invalidPathLogTags);
+				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Contains HTML ASCII Code): " ~ localFilePath, invalidPathLogTags); statusAddIssue(localFilePath, "invalid_name", "attention", "The name cannot be used on Microsoft OneDrive (Contains HTML ASCII Code)");
 				invalidPath = true;
 			}
 		}
@@ -7350,7 +7397,7 @@ class SyncEngine {
 		// Validate that the path is a valid UTF-16 encoded path
 		if (!invalidPath) {
 			if (!isValidUTF16(localFilePath)) { // This will return true if this is a valid UTF-16 encoded path, so we are checking for 'false' as response
-				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Invalid UTF-16 encoded path): " ~ localFilePath, invalidPathLogTags);
+				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Invalid UTF-16 encoded path): " ~ localFilePath, invalidPathLogTags); statusAddIssue(localFilePath, "invalid_name", "attention", "The name cannot be used on Microsoft OneDrive (Invalid UTF-16 encoded path)");
 				invalidPath = true;
 			}
 		}
@@ -7358,7 +7405,7 @@ class SyncEngine {
 		// Check path for ASCII Control Codes
 		if (!invalidPath) {
 			if (containsASCIIControlCodes(localFilePath)) { // This will return true if this contains ASCII Control Codes
-				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Contains ASCII Control Codes): " ~ localFilePath, invalidPathLogTags);
+				addLogEntry("Skipping " ~ logModifier ~" - invalid name (Contains ASCII Control Codes): " ~ localFilePath, invalidPathLogTags); statusAddIssue(localFilePath, "invalid_name", "attention", "The name cannot be used on Microsoft OneDrive (Contains ASCII Control Codes)");
 				invalidPath = true;
 			}
 		}
@@ -8374,6 +8421,10 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
+		// D-Bus status: modified files waiting to be uploaded in this batch
+		statusSetPendingUploads(databaseItemsWhereContentHasChanged.length);
+		scope(exit) statusSetPendingUploads(0);
+
 		// Each element in this array 'databaseItemsWhereContentHasChanged' is an Database Item ID that has been modified locally
 		size_t batchSize = to!int(appConfig.getValueLong("threads"));
 		long batchCount = (databaseItemsWhereContentHasChanged.length + batchSize - 1) / batchSize;
@@ -8438,6 +8489,10 @@ class SyncEngine {
 		string changedItemDriveId = localItemDetails[0];
 		string changedItemId = localItemDetails[1];
 		string localFilePath = localItemDetails[2];
+
+		// D-Bus status: this upload is in progress
+		statusTransferBegin(localFilePath, "upload", fileSizeForStatus(localFilePath));
+		scope(exit) statusTransferEnd(localFilePath, "upload");
 
 		// A .nosync marker may have appeared after this item was queued. Re-check the
 		// boundary immediately before any upload work begins.
@@ -8707,10 +8762,12 @@ class SyncEngine {
 			// No space available online
 			if (!spaceAvailableOnline) {
 				addLogEntry("Skipping uploading modified file: " ~ localFilePath ~ " due to insufficient free space available on Microsoft OneDrive", ["info", "notify"]);
+				statusAddIssue(localFilePath, "quota_exceeded", "attention", "There is not enough free space on Microsoft OneDrive to upload this file");
 			}
 			// File exceeds max allowed size
 			if (skippedMaxSize) {
 				addLogEntry("Skipping uploading this modified file as it exceeds the maximum size allowed by Microsoft OneDrive: " ~ localFilePath, ["info", "notify"]);
+				statusAddIssue(localFilePath, "too_large", "attention", "The file exceeds the maximum size allowed by Microsoft OneDrive");
 			}
 			// Generic message
 			if (skippedExceptionError) {
@@ -8719,11 +8776,14 @@ class SyncEngine {
 				if (exists(localFilePath)) {
 					// Issue #2626 | Case 2-1 was not triggered, file still exists on local filesystem
 					addLogEntry("Uploading modified file: " ~ localFilePath ~ " ... failed!", ["info", "notify"]);
+					statusAddIssue(localFilePath, "upload_failed", "attention", "The modified file could not be uploaded");
 				}
 			}
 		} else {
 			// Upload was successful
 			addLogEntry("Uploading modified file: " ~ localFilePath ~ " ... done", fileTransferNotifications());
+			statusClearIssue(localFilePath, "upload_failed");
+			statusClearIssue(localFilePath, "locked_online");
 
 			// As no upload failure, calculate transfer metrics in a consistent manner
 			displayTransferMetrics(localFilePath, thisFileSizeLocal, uploadTransferStartTime, uploadTransferEndTime, uploadStartTime, Clock.currTime());
@@ -9184,6 +9244,7 @@ class SyncEngine {
 					if ((exception.httpStatusCode == 403) && (appConfig.getValueBool("sync_business_shared_files"))) {
 						// We attempted to upload a file, that was shared with us, but this was shared with us as read-only
 						addLogEntry("Unable to upload this modified file as this was shared as read-only: " ~ localFilePath);
+						statusAddIssue(localFilePath, "permission_denied", "attention", "The file was shared read-only; local changes cannot be uploaded");
 					}
 					// HTTP request returned status code 423
 					// Resolve https://github.com/abraunegg/onedrive/issues/36
@@ -9191,6 +9252,7 @@ class SyncEngine {
 						// The file is currently checked out or locked for editing by another user
 						// We cant upload this file at this time
 						addLogEntry("Unable to upload this modified file as this is currently checked out or locked for editing by another user: " ~ localFilePath);
+						statusAddIssue(localFilePath, "locked_online", "info", "The file is checked out or locked for editing online; the upload is retried");
 						// On-demand: retry soon (30 s, 60 s, 120 s, then the monitor interval)
 						if (onDemand) recordLockedUpload(dbItem.driveId, dbItem.id, localFilePath, dur!"seconds"(appConfig.getValueLong("monitor_interval")));
 					} else {
@@ -9225,6 +9287,7 @@ class SyncEngine {
 					if ((exception.httpStatusCode == 403) && (appConfig.getValueBool("sync_business_shared_files"))) {
 						// We attempted to upload a file, that was shared with us, but this was shared with us as read-only
 						addLogEntry("Unable to upload this modified file as this was shared as read-only: " ~ localFilePath);
+						statusAddIssue(localFilePath, "permission_denied", "attention", "The file was shared read-only; local changes cannot be uploaded");
 						uploadFileOneDriveApiInstance.releaseCurlEngine();
 						uploadFileOneDriveApiInstance = null;
 						return uploadResponse;
@@ -9236,6 +9299,7 @@ class SyncEngine {
 						// The file is currently checked out or locked for editing by another user
 						// We cant upload this file at this time
 						addLogEntry("Unable to upload this modified file as this is currently checked out or locked for editing by another user: " ~ localFilePath);
+						statusAddIssue(localFilePath, "locked_online", "info", "The file is checked out or locked for editing online; the upload is retried");
 						// On-demand: retry soon (30 s, 60 s, 120 s, then the monitor interval)
 						if (onDemand) recordLockedUpload(dbItem.driveId, dbItem.id, localFilePath, dur!"seconds"(appConfig.getValueLong("monitor_interval")));
 						uploadFileOneDriveApiInstance.releaseCurlEngine();
@@ -9781,6 +9845,10 @@ class SyncEngine {
 			logKey = generateAlphanumericString();
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
+
+		// D-Bus status: new files waiting to be uploaded in this batch
+		statusSetPendingUploads(newLocalFilesToUploadToOneDrive.length);
+		scope(exit) statusSetPendingUploads(0);
 
 		// Are there any new local items to upload?
 		if (!newLocalFilesToUploadToOneDrive.empty) {
@@ -11371,6 +11439,10 @@ class SyncEngine {
 			displayFunctionProcessingStart(thisFunctionName, logKey);
 		}
 
+		// D-Bus status: this upload is in progress
+		statusTransferBegin(fileToUpload, "upload", fileSizeForStatus(fileToUpload));
+		scope(exit) statusTransferEnd(fileToUpload, "upload");
+
 		// A .nosync marker may have appeared after discovery but before this upload
 		// thread starts. The local boundary always wins.
 		if (pathIsProtectedByNoSync(fileToUpload)) {
@@ -11698,11 +11770,13 @@ class SyncEngine {
 						} else {
 							// skip file upload - insufficient space to upload
 							addLogEntry("Skipping uploading this new file as it exceeds the available free space on Microsoft OneDrive: " ~ fileToUpload);
+							statusAddIssue(fileToUpload, "quota_exceeded", "attention", "There is not enough free space on Microsoft OneDrive to upload this file");
 							uploadFailed = true;
 						}
 					} else {
 						// Skip file upload - too large
 						addLogEntry("Skipping uploading this new file as it exceeds the maximum size allowed by Microsoft OneDrive: " ~ fileToUpload);
+						statusAddIssue(fileToUpload, "too_large", "attention", "The file exceeds the maximum size allowed by Microsoft OneDrive");
 						uploadFailed = true;
 					}
 				} else {
@@ -11718,6 +11792,7 @@ class SyncEngine {
 			} else {
 				// Unable to read local file
 				addLogEntry("Skipping uploading this file as it cannot be read (file permissions or file corruption): " ~ fileToUpload);
+				statusAddIssue(fileToUpload, "permission_denied", "attention", "The local file cannot be read");
 				uploadFailed = true;
 			}
 		} else {
@@ -11833,7 +11908,7 @@ class SyncEngine {
 					// Default operation if not 408,429,503,504 errors
 					// - 408,429,503,504 errors are handled as a retry within oneDriveApiInstance
 					// Display what the error is
-					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 					displayOneDriveErrorMessage(exception.msg, thisFunctionName);
 
 					// OneDrive API Instance Cleanup - Shutdown API, free curl object and memory
@@ -11841,7 +11916,7 @@ class SyncEngine {
 					uploadFileOneDriveApiInstance = null;
 				} catch (FileException exception) {
 					// display the error message
-					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 					displayFileSystemErrorMessage(exception.msg, thisFunctionName, fileToUpload);
 
 					// OneDrive API Instance Cleanup - Shutdown API, free curl object and memory
@@ -11854,7 +11929,7 @@ class SyncEngine {
 						uploadFailed = false;
 						zeroDataTraversal = true;
 					} else {
-						addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+						addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 						displayFileSystemErrorMessage(exception.msg, thisFunctionName, fileToUpload);
 					}
 
@@ -11884,12 +11959,12 @@ class SyncEngine {
 					// Default operation if not 408,429,503,504 errors
 					// - 408,429,503,504 errors are handled as a retry within oneDriveApiInstance
 					// Display what the error is
-					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 					displayOneDriveErrorMessage(exception.msg, thisFunctionName);
 
 				} catch (FileException e) {
 					// display the error message
-					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 					displayFileSystemErrorMessage(e.msg, thisFunctionName, fileToUpload);
 				}
 
@@ -11929,7 +12004,7 @@ class SyncEngine {
 									uploadFailed = false;
 									addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... done", fileTransferNotifications());
 								} else {
-									addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+									addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 									uploadFailed = true;
 								}
 							} else {
@@ -11940,17 +12015,17 @@ class SyncEngine {
 							// Default operation if not 408,429,503,504 errors
 							// - 408,429,503,504 errors are handled as a retry within oneDriveApiInstance
 							// Display what the error is
-							addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+							addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 							displayOneDriveErrorMessage(exception.msg, thisFunctionName);
 						}
 					} else {
 						// No Upload URL or nextExpectedRanges or localPath .. not a valid JSON we can use
 						if (verboseLogging) {addLogEntry("Session data is missing required elements to perform a session upload.", ["verbose"]);}
-						addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+						addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 					}
 				} else {
 					// Create session Upload URL failed
-					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]);
+					addLogEntry("Uploading new file: " ~ fileToUpload ~ " ... failed!", ["info", "notify"]); statusAddIssue(fileToUpload, "upload_failed", "attention", "The new file could not be uploaded");
 				}
 
 				// OneDrive API Instance Cleanup - Shutdown API, free curl object and memory
