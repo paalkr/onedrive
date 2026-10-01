@@ -156,3 +156,44 @@ The engine keeps these in a thread-safe per-item map (driveId, id) exposed throu
 ### Emblems (nautilus owns)
 
 online-only: cloud; hydrated: check; pinned: circled check; syncing and pending: sync arrows; error: an error emblem (e.g. `emblem-important` / `dialog-error-symbolic`, whichever exists in the theme); local (not yet in the DB): sync arrows. Poll interval unchanged; items in `syncing`/`pending` are refreshed every 2 s until they settle.
+
+## Iteration 4: D-Bus status interface (engine owns the service, gui consumes it)
+
+Purpose: give file managers, tray icons and GUIs (the OneDriveGUI fork) a supported way to read sync status, transfers and issues, instead of parsing log output. Session bus only. Works in normal and on-demand mode; on-demand specifics are capability-gated. Off by default upstream-style is not required for the prototype, but the service must never block or slow the sync engine: all D-Bus work runs on its own thread, reading snapshots the engine publishes.
+
+### Naming
+- Bus name per running client instance: `io.github.abraunegg.OneDrive.i<hex>` where `<hex>` is the first 16 hex chars of sha256(absolute confdir path). Clients discover instances by listing names with that prefix.
+- Object path: `/io/github/abraunegg/OneDrive`.
+- Interface: `io.github.abraunegg.OneDrive1` (version 1; incompatible changes get a new interface name).
+
+### Properties (read-only, org.freedesktop.DBus.Properties, with PropertiesChanged)
+- `Version` (s): client version string.
+- `ConfigDir` (s): absolute confdir. `SyncDir` (s): what the user sees (the mount in on-demand mode). `Account` (s): account email/UPN if known. `AccountType` (s): `personal` | `business` | `sharepoint` | `unknown`.
+- `OnDemand` (b). `Capabilities` (as): subset of `ondemand`, `actions`, `issues`, `transfers`, `pause`.
+- `State` (s): `starting` | `idle` | `syncing` | `paused` | `offline` | `error` | `stopping`.
+- `StateDetail` (s): one human sentence for tooltips (e.g. "Uploading 3 files", "Waiting for network").
+- `LastSyncTime` (x): unix seconds of the last completed sync cycle, 0 if none.
+- `QuotaUsed`, `QuotaTotal` (t): bytes, 0 if unknown.
+- `PendingUploads`, `PendingDownloads` (u).
+
+### Methods
+- `GetTransfers() -> a(ssstt)`: (path relative to SyncDir, direction `upload`|`download`|`hydrate`, state `queued`|`active`, bytesDone, bytesTotal).
+- `GetIssues() -> a(sssssx)`: (issueId, path, kind, severity, message, unixTime). severity `info` (handled automatically) or `attention` (needs the user). kinds: `conflict_copy` (info; path = the copy, message names the original), `locked_online` (info while retrying), `deferred_online_change` (info), `upload_failed`, `download_failed`, `invalid_name`, `too_large`, `permission_denied`, `quota_exceeded`, `other` (attention). Bounded list (most recent 500), kept in memory; conflict copies also recovered at startup by scanning the DB for safeBackup names is optional.
+- `DismissIssue(s issueId)`.
+- `SyncNow()`: request an immediate sync cycle (wake the monitor loop).
+- `Pause(u minutes)` / `Resume()`: only if `pause` in Capabilities; pause stops starting new transfers and sync cycles, finishes in-flight ones, State becomes `paused`; minutes 0 = until Resume or restart.
+
+### Signals
+- `IssuesChanged()`, `TransfersChanged()` (rate-limited, at most 2/s), plus PropertiesChanged for State/StateDetail/counters.
+
+### File-level actions
+Stay on the existing xattr interface (`user.onedrive.action`, `user.onedrive.state`, `user.onedrive.weburl`); not duplicated on D-Bus.
+
+## Iteration 4: GUI (gui owns, OneDriveGUI fork paalkr/OneDriveGUI)
+
+- Every new feature is capability-gated: when the profile's client exposes the D-Bus interface, use it; otherwise OneDriveGUI behaves exactly as upstream.
+- When a D-Bus instance for a profile's confdir is already running (e.g. our systemd user unit), the GUI attaches to it and does NOT spawn its own client process for that profile.
+- Tray icon states like the Windows client: synced, syncing, paused, offline, error/attention; tooltip from StateDetail; menu: open folder, view online, pause/resume (if capability), sync now, settings, quit GUI (does not stop a systemd-managed client).
+- Status window per profile: current transfers with progress; an Issues view split into "Handled automatically" (info) and "Needs attention" (attention) with actions: open folder, open file, view online (via xattr weburl in on-demand mode), dismiss.
+- Profile setup: option "Files On-Demand" that writes a profile usable by `onedrive-ondemand@<profile>.service` and offers to enable that unit instead of GUI-managed process start.
+- Folder selection (sync_list) and settings use OneDriveGUI's existing editors.
