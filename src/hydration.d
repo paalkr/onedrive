@@ -497,6 +497,7 @@ final class HydrationService {
 	private OnDemandActionRequest[] actionQueue;
 	private Thread actionWorker;
 	private bool actionWorkerRunning;
+	private bool actionWorkerBusy;
 
 	this(ApplicationConfig appConfig, ItemDatabase itemDB, string backingDir) {
 		this.appConfig = appConfig;
@@ -910,6 +911,25 @@ final class HydrationService {
 		}
 	}
 
+	private void setActionWorkerBusy(bool busy) {
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		actionWorkerBusy = busy;
+		serviceCondition.notifyAll();
+	}
+
+	// Wait until no action is queued or running, at most 'timeout'. Returns false on timeout or shutdown.
+	bool waitForActionsIdle(Duration timeout) {
+		serviceMutex.lock();
+		scope(exit) serviceMutex.unlock();
+		MonoTime deadline = MonoTime.currTime + timeout;
+		while (((actionQueue.length > 0) || actionWorkerBusy) && !shuttingDown) {
+			if (MonoTime.currTime >= deadline) return false;
+			serviceCondition.wait(dur!"msecs"(500));
+		}
+		return !shuttingDown;
+	}
+
 	private bool isShuttingDown() {
 		serviceMutex.lock();
 		scope(exit) serviceMutex.unlock();
@@ -945,11 +965,13 @@ final class HydrationService {
 			// Paused: queued actions wait (reads of online-only files still hydrate on demand)
 			if (!waitWhileStatusPaused()) return;
 			if (!enterDatabase()) return;
+			setActionWorkerBusy(true);
 			try {
 				performAction(request);
 			} catch (Exception e) {
 				addLogEntry("On-demand: action '" ~ to!string(request.action) ~ "' failed: " ~ e.msg);
 			}
+			setActionWorkerBusy(false);
 			leaveDatabase();
 		}
 	}

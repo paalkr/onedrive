@@ -421,6 +421,8 @@ class ApplicationConfig {
 		boolValues["dbus_status"] = true;
 		// Write file manager thumbnails for online-only files from Microsoft OneDrive thumbnails
 		boolValues["on_demand_thumbnails"] = true;
+		// On-demand one-shot resync: rebuild the index, run one full cycle, re-apply pins, then exit (CLI only)
+		boolValues["on_demand_resync_once"] = false;
 		// On-demand CLI commands (path inside the mount); handled before any database or authentication use
 		stringValues["on_demand_cli_download"] = "";
 		stringValues["on_demand_cli_pin"] = "";
@@ -1021,6 +1023,7 @@ class ApplicationConfig {
 				case "force_http_2":
 					addLogEntry("The option '" ~ key ~ "' has been deprecated and will be ignored. Please read the updated documentation and update your client configuration to remove this option.");
 					continue;
+				case "on_demand_resync_once":
 				case "on_demand_cli_download":
 				case "on_demand_cli_pin":
 				case "on_demand_cli_unpin":
@@ -1473,6 +1476,9 @@ class ApplicationConfig {
 				"on-demand",
 					"Present 'sync_dir' as a Files On-Demand mount. Requires --monitor",
 					&boolValues["on_demand"],
+				"on-demand-resync-once",
+					"On-demand: rebuild the local index (--resync without confirmation), run one full sync cycle, re-apply pins, then exit. Requires --on-demand",
+					&boolValues["on_demand_resync_once"],
 				"on-demand-backing-dir",
 					"Specify the local backing directory used when --on-demand is enabled",
 					&stringValues["on_demand_backing_dir"],

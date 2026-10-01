@@ -143,6 +143,9 @@ ThumbnailService onDemandThumbnailService;
 // D-Bus status interface (dbus_status)
 DBusStatusService dbusStatusService;
 bool onDemandMountActive = false;
+// --on-demand-resync-once: exit after the first full sync cycle (and the pin restore) completed
+bool onDemandResyncOnce = false;
+bool onDemandResyncOnceCompleted = false;
 // On-demand local changes drained from onDemandChangeQueue, waiting to be applied
 OnDemandLocalChange[] pendingOnDemandChanges;
 // On-demand local deletions that could not be applied online yet; retried on the next scheduled sync.
@@ -320,6 +323,26 @@ int main(string[] cliArgs) {
 	// Update the current runtime application configuration (default or 'config' file read in options) from any passed in command line arguments
 	appConfig.updateFromArgs(cliArgs);
 	
+	// On-demand one-shot resync: implies --monitor --resync --resync-auth (never an interactive prompt)
+	if (appConfig.getValueBool("on_demand_resync_once")) {
+		if (!appConfig.getValueBool("on_demand")) {
+			addLogEntry("ERROR: --on-demand-resync-once can only be used with --on-demand");
+			return EXIT_FAILURE;
+		}
+		appConfig.setValueBool("monitor", true);
+		appConfig.setValueBool("resync", true);
+		appConfig.setValueBool("resync_auth", true);
+		onDemandResyncOnce = true;
+		// Authentication must already exist: a one-shot run must never wait for an interactive sign-in
+		bool authenticationAvailable = exists(appConfig.refreshTokenFilePath) ||
+			(appConfig.getValueBool("use_intune_sso") && exists(appConfig.intuneAccountDetailsFilePath));
+		if (!authenticationAvailable) {
+			addLogEntry("ERROR: --on-demand-resync-once requires an authenticated profile; run the client interactively once to sign in");
+			return EXIT_FAILURE;
+		}
+		addLogEntry("On-demand: one-shot resync: rebuilding the local index, then exiting after one full sync cycle");
+	}
+	
 	// On-demand CLI commands act on a running mount through extended attributes only: no database,
 	// no authentication, so they run before anything else and work while a monitor process runs
 	if (onDemandCommandRequested(appConfig)) {
@@ -345,7 +368,11 @@ int main(string[] cliArgs) {
 	if (!syncOrMonitorMissing && appConfig.getValueBool("dbus_status")) {
 		string statusSyncDir = appConfig.getValueBool("on_demand") ? appConfig.onDemandMountPoint : runtimeSyncDirectory;
 		statusConfigure(applicationVersion, appConfig.configDirName, statusSyncDir, appConfig.getValueBool("on_demand"));
-		statusSetState("starting", "Starting");
+		if (onDemandResyncOnce) {
+			statusSetState("syncing", "Rebuilding the local index");
+		} else {
+			statusSetState("starting", "Starting");
+		}
 		dbusStatusService = new DBusStatusService(appConfig.configDirName);
 		dbusStatusService.start();
 	}
@@ -1654,7 +1681,7 @@ int main(string[] cliArgs) {
 						if (appConfig.systemTimeAllowsSync()) {
 							// Starting a sync - we are online and the process-visible clock is safe
 							addLogEntry("Starting a sync with Microsoft OneDrive");
-							statusSetState("syncing", "Synchronising with Microsoft OneDrive");
+							statusSetState("syncing", onDemandResyncOnce ? "Rebuilding the local index" : "Synchronising with Microsoft OneDrive");
 
 							// Attempt to reset syncFailures from any prior loop
 							syncEngineInstance.resetSyncFailures();
@@ -1678,6 +1705,17 @@ int main(string[] cliArgs) {
 								performStandardSyncProcess(localPath, filesystemMonitor);
 								// On-demand: after the first cycle following a resync, pin the previously pinned items again
 								if (onDemandMountActive) restoreOnDemandPinsAfterResync();
+								// One-shot resync: wait (bounded) for the pin actions, then leave the monitor loop
+								if (onDemandResyncOnce && !shutdownRequested()) {
+									if ((onDemandHydrationService !is null) && !onDemandHydrationService.waitForActionsIdle(dur!"minutes"(10))) {
+										addLogEntry("WARNING: On-demand: one-shot resync: the pin actions did not finish within 10 minutes; exiting anyway");
+									}
+									if (!shutdownRequested()) {
+										onDemandResyncOnceCompleted = true;
+										performFileSystemMonitoring = false;
+										addLogEntry("On-demand: one-shot resync completed");
+									}
+								}
 							}
 
 							// Handle any new inotify events
@@ -1705,6 +1743,10 @@ int main(string[] cliArgs) {
 						} else {
 							addLogEntry("OneDrive synchronisation is suspended because system time is not currently safe. The monitor process will remain running and revalidate time on the next monitor cycle.");
 							statusSetState("error", "Synchronisation is suspended because the system time is not safe");
+							if (onDemandResyncOnce) {
+								addLogEntry("ERROR: On-demand: one-shot resync: the system time is not safe; exiting without completing");
+								performFileSystemMonitoring = false;
+							}
 						}
 					} else {
 						// Not online. Preserve any previously-latched blocking state while recording
@@ -1712,6 +1754,10 @@ int main(string[] cliArgs) {
 						validateSystemTime(appConfig, monitorServiceProbe, true, false);
 						addLogEntry("Microsoft OneDrive service is not reachable at this time. Will re-try on next sync attempt.");
 						statusSetState("offline", "Waiting for network");
+						if (onDemandResyncOnce) {
+							addLogEntry("ERROR: On-demand: one-shot resync: Microsoft OneDrive is not reachable; exiting without completing");
+							performFileSystemMonitoring = false;
+						}
 					}
 					
 					// Output end of loop processing times
@@ -1955,6 +2001,12 @@ int main(string[] cliArgs) {
 		return EXIT_FAILURE;
 	}
 	
+	// One-shot resync: success only when the cycle and pin restore completed (item-level sync
+	// failures do not count; they must not keep the normal service from starting)
+	if (onDemandResyncOnce) {
+		return onDemandResyncOnceCompleted ? EXIT_SUCCESS : EXIT_FAILURE;
+	}
+
 	// Exit application using exit scope
 	if (!syncEngineInstance.syncFailures && !monitorFailures) {
 		return EXIT_SUCCESS;

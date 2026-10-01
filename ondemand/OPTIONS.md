@@ -219,6 +219,14 @@ Set in `updateFromArgs()` (config.d:1308-1337 and getopt); not accepted in the c
 - `--monitor`: required by on-demand.
 - `--on-demand`, `--on-demand-backing-dir`: CLI forms of the config options.
 - `--resync` (with `--resync-auth`): required after a mode or backing-dir change.
+- `--on-demand-resync-once` (with `--on-demand --confdir X`): one-shot rebuild for helpers and GUIs. It implies `--monitor --resync --resync-auth` (no confirmation prompt) and starts like the monitor (mount, D-Bus State `syncing`, StateDetail "Rebuilding the local index"). It runs the first full sync cycle, re-applies pins and waits up to 10 minutes for the pin actions, then shuts down cleanly. Exit 0 when that completed (item-level sync failures do not count). Exit 1 when:
+  - `--on-demand` is missing;
+  - no stored authentication (it never prompts);
+  - an authentication failure or refused configuration;
+  - Microsoft OneDrive is unreachable or the system time is unsafe at the first cycle;
+  - SIGTERM/SIGINT before completion.
+
+  Ignored with a warning in the config file.
 - `--download`, `--pin`, `--unpin`, `--free`, `--status <path>`: act on a running mount through xattrs only (src/ondemandcli.d). Usable while the monitor runs.
 - `--display-config`, `--display-running-config`: show the on-demand options and dbus_status.
 - `--sync`: refused with on-demand.
