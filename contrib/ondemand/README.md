@@ -93,7 +93,7 @@ This starts the user unit `onedrive-ondemand-resync@<profile>.service` (the inst
 2. runs `onedrive --on-demand --on-demand-resync-once --confdir=~/.config/<profile>`: resync, first full sync and restore of pins, with the mount active,
 3. on success starts the normal unit again; on failure stays in the failed state (`systemctl --user status onedrive-ondemand-resync@<profile>`) and leaves the normal unit stopped.
 
-The command follows the unit's journal until it finishes and exits with the resync's status. Ctrl+C only stops following. `systemctl --user stop onedrive-ondemand-resync@<profile>` cancels a resync (the normal unit then stays stopped).
+The command follows the unit's journal until it finishes and exits with the resync's status. Ctrl+C only stops following. `systemctl --user stop onedrive-ondemand-resync@<profile>` cancels a resync (the normal unit then stays stopped). After a failed or cancelled resync the normal unit can be started by hand (`systemctl --user start onedrive-ondemand.service` or `onedrive-ondemand@<profile>.service`): it rebuilds the index on its first cycle and re-applies the recorded pins. The resync client exits 0 on success and 1 on any failure (no stored sign-in, authentication failure, invalid configuration, OneDrive unreachable, stopped before completion); individual file failures do not count as failure.
 
 ## Logs and troubleshooting
 
