@@ -90,12 +90,16 @@ make install DESTDIR="$STAGE" docdir="$DOCDIR" version="$DESCRIBE"
 # --- on-demand additions ---
 install -m 0755 "$BUILD/contrib/ondemand/onedrive-ondemand-setup" "$STAGE/usr/bin/onedrive-ondemand-setup"
 install -m 0755 "$BUILD/contrib/ondemand/onedrive-ondemand-unmount" "$STAGE/usr/bin/onedrive-ondemand-unmount"
+install -m 0755 "$BUILD/contrib/ondemand/onedrive-ondemand-resync" "$STAGE/usr/bin/onedrive-ondemand-resync"
+mkdir -p "$STAGE/usr/libexec/onedrive-ondemand"
+install -m 0755 "$BUILD/contrib/ondemand/libexec/resync-unit" "$STAGE/usr/libexec/onedrive-ondemand/resync-unit"
 install -m 0644 "$BUILD/contrib/ondemand/systemd/onedrive-ondemand.service" "$STAGE/usr/lib/systemd/user/onedrive-ondemand.service"
 install -m 0644 "$BUILD/contrib/ondemand/systemd/onedrive-ondemand@.service" "$STAGE/usr/lib/systemd/user/onedrive-ondemand@.service"
+install -m 0644 "$BUILD/contrib/ondemand/systemd/onedrive-ondemand-resync@.service" "$STAGE/usr/lib/systemd/user/onedrive-ondemand-resync@.service"
 mkdir -p "$STAGE/usr/share/nautilus-python/extensions"
 install -m 0644 "$BUILD/contrib/nautilus/onedrive-ondemand.py" "$STAGE/usr/share/nautilus-python/extensions/onedrive-ondemand.py"
 install -m 0644 "$BUILD/contrib/ondemand/README.md" "$STAGE$DOCDIR/README.ondemand.md"
-for page in onedrive-ondemand-setup onedrive-ondemand-unmount; do
+for page in onedrive-ondemand-setup onedrive-ondemand-unmount onedrive-ondemand-resync; do
 	install -m 0644 "$BUILD/contrib/ondemand/man/$page.1" "$STAGE/usr/share/man/man1/$page.1"
 	gzip -9n "$STAGE/usr/share/man/man1/$page.1"
 done

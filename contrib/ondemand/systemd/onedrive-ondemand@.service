@@ -12,6 +12,8 @@ Wants=network-online.target
 # FUSE mount would be invisible to the desktop session. RestrictRealtime=,
 # SystemCallFilter= and similar imply NoNewPrivileges=, which stops the
 # setuid fusermount3 helper that mounts on behalf of the user.
+# Skipped (not failed) while onedrive-ondemand-resync@%i.service runs; it starts this unit when done
+ExecCondition=/bin/sh -c 'test ! -e "%t/onedrive-ondemand/%i.resyncing"'
 ExecStartPre=/bin/sh -c 'sleep 15'
 ExecStart=/usr/bin/onedrive --monitor --on-demand --confdir=%h/.config/%i
 # Lazily unmounts sync_dir if the client left a stale mount behind (crash, kill)
