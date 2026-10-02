@@ -564,14 +564,21 @@ final class HydrationService {
 			}
 			directoryStateCacheMutex.unlock();
 
-			bool onlineOnlyBelow = subtreeHasOnlineOnlyItems(itemDB, driveId, id);
-			// A pinned folder with a file freed below it is only partly kept on this device: report it
-			// as hydrated rather than pinned
+			// One pass over the subtree (stops at the first online-only file)
+			SubtreeFiles files;
+			scanSubtreeFiles(driveId, id, backingPathFor(driveId, id), files);
+			bool onlineOnlyBelow = files.anyOnlineOnly;
 			HydrationState state;
 			if (item.hydration == hydrationPinned) {
+				// A pinned folder with a file freed below it is only partly kept on this device: report
+				// it as hydrated rather than pinned
 				state = onlineOnlyBelow ? HydrationState.hydrated : HydrationState.pinned;
+			} else if (onlineOnlyBelow || (files.anyFile && !files.anyLocal)) {
+				// As on Windows: no check mark unless something below is on this device
+				state = HydrationState.onlineOnly;
 			} else {
-				state = onlineOnlyBelow ? HydrationState.onlineOnly : HydrationState.hydrated;
+				// At least one local file and none online-only, or no files at all
+				state = HydrationState.hydrated;
 			}
 			directoryStateCacheMutex.lock();
 			if (directoryStateCache.length >= directoryStateCacheLimit) directoryStateCache = null;
@@ -580,6 +587,31 @@ final class HydrationService {
 			return state;
 		}
 		return hydrationStateFromDatabase(item.hydration);
+	}
+
+	private struct SubtreeFiles {
+		bool anyOnlineOnly;
+		bool anyFile;
+		bool anyLocal;
+	}
+
+	// Walk the database subtree once. A file counts as local when its backing file exists; the
+	// backing path is built while descending, so no per-file path lookup is needed.
+	private void scanSubtreeFiles(string driveId, string id, string directoryBackingPath, ref SubtreeFiles files) {
+		foreach (child; itemDB.selectChildren(driveId, id)) {
+			if (files.anyOnlineOnly) return;
+			string childBackingPath = buildPath(directoryBackingPath, child.name);
+			if (child.type == ItemType.dir) {
+				scanSubtreeFiles(child.driveId, child.id, childBackingPath, files);
+			} else if (child.type == ItemType.file) {
+				files.anyFile = true;
+				if (child.hydration == hydrationOnlineOnly) {
+					files.anyOnlineOnly = true;
+					return;
+				}
+				if (!files.anyLocal && exists(childBackingPath)) files.anyLocal = true;
+			}
+		}
 	}
 
 	// Perform an action requested through the mount or the CLI. Never downloads in the calling
