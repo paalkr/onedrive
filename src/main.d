@@ -2639,9 +2639,11 @@ bool runOnDemandHelper(string[] command, out int status, out string output) {
 // 2. Hydrated files recorded for another location (the backing directory of the previous layout, or
 //    the previous 'sync_dir' after it was changed) are moved into 'sync_dir' with rename(). That needs
 //    the same filesystem and an absent or empty 'sync_dir'; otherwise the start is refused. Nothing is
-//    copied, overwritten, uploaded or deleted, and the database is not changed. A move interrupted
-//    before the marker was rewritten (the recorded directory is gone, 'sync_dir' has the files) is
-//    completed. Under --dry-run nothing is moved: the start is refused instead.
+//    copied, overwritten, uploaded or deleted, and the database is not changed. Before the rename an
+//    intent record (<confdir>/.ondemand-move-intent: source and target) is written; a move interrupted
+//    before the marker was rewritten is completed only when that record proves it. A recorded
+//    directory that is gone without such a record is refused (pointing at --resync), so the database
+//    is never bound to a foreign tree. Under --dry-run nothing is moved: the start is refused instead.
 bool prepareOnDemandPhysicalSyncDir() {
 	string syncDir = appConfig.onDemandMountPoint;
 	string mountPath = onDemandCanonicalPath(syncDir);
@@ -2688,22 +2690,49 @@ bool prepareOnDemandPhysicalSyncDir() {
 			!dirEntries(appConfig.onDemandLegacyBackingDir, SpanMode.shallow, false).empty) {
 		source = appConfig.onDemandLegacyBackingDir;
 	}
+	// The intent record of a move: written before the rename, removed after the marker is rewritten
+	string intentFile = buildPath(appConfig.configDirName, ".ondemand-move-intent");
+	string intentSource, intentTarget;
+	try {
+		if (exists(intentFile)) {
+			auto lines = readText(intentFile).splitLines();
+			if (lines.length >= 2) {
+				intentSource = lines[0];
+				intentTarget = lines[1];
+			}
+		}
+	} catch (Exception e) {
+		intentSource = intentTarget = null;
+	}
+	// A move interrupted after the rename and before the marker was rewritten: the intent record names
+	// this move, its source is gone and 'sync_dir' holds the files. Complete it by rewriting the marker.
+	if (!intentSource.empty && (intentTarget == syncDir) && (source.empty || (source == intentSource)) &&
+			!exists(intentSource) && exists(syncDir) && isDir(syncDir) && !dirEntries(syncDir, SpanMode.shallow, false).empty) {
+		if (dryRun) {
+			addLogEntry("ERROR: An interrupted move of the on-demand files from " ~ intentSource ~ " to 'sync_dir' (" ~ syncDir ~ ") is not completed under --dry-run. Run without --dry-run first.", ["info", "notify"]);
+			return false;
+		}
+		try {
+			std.file.write(marker, syncDir);
+			std.file.write(buildPath(appConfig.configDirName, ".ondemand-moved"), intentSource ~ " -> " ~ syncDir ~ "\n");
+			std.file.remove(intentFile);
+		} catch (Exception e) {
+			addLogEntry("ERROR: Unable to complete the interrupted move of the on-demand files to 'sync_dir' (" ~ syncDir ~ "): " ~ e.msg, ["info", "notify"]);
+			return false;
+		}
+		addLogEntry("On-demand: completed the interrupted move of the hydrated files from " ~ intentSource ~ " to 'sync_dir' (" ~ syncDir ~ "); no files were uploaded, downloaded or deleted");
+		return true;
+	}
 	if (source.empty) return true;
 
 	try {
 		if (!exists(source) || !isDir(source)) {
-			// A move interrupted after the rename and before the marker was rewritten: the recorded
-			// directory is gone and 'sync_dir' holds the files. Complete it by rewriting the marker.
-			if (!recorded.empty && (source == recorded) && exists(syncDir) && isDir(syncDir) &&
-					!dirEntries(syncDir, SpanMode.shallow, false).empty) {
-				if (dryRun) {
-					addLogEntry("ERROR: An interrupted move of the on-demand files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ ") is not completed under --dry-run. Run without --dry-run first.", ["info", "notify"]);
-					return false;
-				}
-				std.file.write(marker, syncDir);
-				addLogEntry("On-demand: completed the interrupted move of the hydrated files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ "); no files were uploaded, downloaded or deleted");
+			// The recorded directory is gone and no intent record proves a move to 'sync_dir': whatever is
+			// in 'sync_dir' is not the tree the database describes, and is never adopted
+			if (!recorded.empty && (source == recorded)) {
+				addLogEntry("ERROR: The item database describes the on-demand files in " ~ source ~ ", which no longer exists, and no interrupted move to 'sync_dir' (" ~ syncDir ~ ") is recorded. The files in 'sync_dir' are not adopted. Re-run the client with '--resync'.", ["info", "notify"]);
+				return false;
 			}
-			// Otherwise there is nothing to move; the database check refuses a database that does not describe 'sync_dir'
 			return true;
 		}
 		if (dryRun) {
@@ -2726,9 +2755,12 @@ bool prepareOnDemandPhysicalSyncDir() {
 		} else {
 			mkdirRecurse(dirName(syncDir));
 		}
+		// The intent record proves this move if the client stops between the rename and the marker
+		std.file.write(intentFile, source ~ "\n" ~ syncDir ~ "\n");
 		try {
 			rename(source, syncDir);
 		} catch (FileException e) {
+			if (exists(intentFile)) std.file.remove(intentFile);
 			if (syncDirRemoved) mkdir(syncDir);
 			addLogEntry("ERROR: Unable to move the on-demand files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ "): " ~ e.msg ~ ". Both must be on the same filesystem; move them yourself, or re-run with --resync.", ["info", "notify"]);
 			return false;
@@ -2738,6 +2770,7 @@ bool prepareOnDemandPhysicalSyncDir() {
 		if (exists(oldStaging)) rmdirRecurse(oldStaging);
 		std.file.write(marker, syncDir);
 		std.file.write(buildPath(appConfig.configDirName, ".ondemand-moved"), source ~ " -> " ~ syncDir ~ "\n");
+		std.file.remove(intentFile);
 		addLogEntry("On-demand: moved the hydrated files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ "); no files were uploaded, downloaded or deleted");
 	} catch (Exception e) {
 		addLogEntry("ERROR: Unable to prepare the on-demand 'sync_dir' (" ~ syncDir ~ "): " ~ e.msg, ["info", "notify"]);

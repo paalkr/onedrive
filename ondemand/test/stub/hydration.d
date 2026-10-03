@@ -121,6 +121,7 @@ final class HydrationService
 	private uint[string] downloads;
 	private uint[string] openCount;
 	private uint[string] scannerCount;   // of openCount, the handles of on-access scanners
+	private bool[string] localContent;   // H items whose local content was created by the mount (not uploaded)
 	private TransientState[string] transient;
 	private bool[string] deferred;
 	__gshared uint webUrlDelayMsecs;
@@ -233,8 +234,22 @@ final class HydrationService
 		}
 		catch (FileException e)
 			throw new HydrationError(errno.EIO, e.msg);
+		// As the real service: the local content exists now, the item is H (and dirty until uploaded)
+		itemDB.setHydration(driveId, id, "H");
+		localContent[key(driveId, id)] = true;
 		stubLog("STUB createEmpty ", itemDB.computePath(driveId, id));
 		return true;
+	}
+
+	void noteLocalContent(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		if (stateLocked(driveId, id) != HydrationState.onlineOnly || !exists(targetOf(driveId, id)))
+			return;
+		itemDB.setHydration(driveId, id, "H");
+		localContent[key(driveId, id)] = true;
+		stubLog("STUB noteLocalContent ", itemDB.computePath(driveId, id));
 	}
 
 	void hydrate(string driveId, string id)
@@ -283,6 +298,7 @@ final class HydrationService
 		lock.lock();
 		relocked = true;
 		downloads[k] = downloads.get(k, 0) + 1;
+		localContent.remove(k);
 		itemDB.setHydration(driveId, id, "H");
 		// As the engine (cbd1508): every download commit is reported to the mount
 		notifyBackingChange("./" ~ rel, OnDemandChangeKind.changed);
@@ -295,6 +311,9 @@ final class HydrationService
 		if (openCount.get(key(driveId, id), 0) > 0)
 			throw new HydrationError(errno.EBUSY, "refused to free open " ~ id);
 		if (stateLocked(driveId, id) != HydrationState.hydrated)
+			return false;
+		// As the real service: a file with local changes that are not uploaded is never freed
+		if (key(driveId, id) in localContent)
 			return false;
 		string target = targetOf(driveId, id);
 		try

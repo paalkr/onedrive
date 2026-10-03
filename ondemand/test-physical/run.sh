@@ -78,6 +78,7 @@ ok "T3 old backing dir and staging leftovers gone" '[ ! -e "$OLD" ] && [ ! -e "$
 ok "T3 marker records sync_dir" '[ "$(cat "$C/items.sqlite3.ondemand")" = "$S" ]'
 ok "T3 database rows and hydration states unchanged" '[ "$(rows "$C/items.sqlite3")" = "$BEFORE" ]'
 ok "T3 logged as a move without transfers" 'grep -q "moved the hydrated files from $OLD" "$C.log"'
+ok "T3 no move intent record left" '[ ! -e "$C/.ondemand-move-intent" ]'
 
 echo "== sync_dir changed: the physical directory moves"
 C="$T/move"; S1="$T/move-old"; S2="$T/sub/move-new"; profile "$C" "$S2"
@@ -132,9 +133,23 @@ echo "== crash between the rename and the marker write"
 C="$T/half"; S="$T/half-sync"; profile "$C" "$S"
 mkdir -p "$S/docs"; echo "moved" > "$S/docs/a.txt"
 "$H/mkdb" "$C/items.sqlite3"; printf '%s' "$T/half-gone" > "$C/items.sqlite3.ondemand"
+printf '%s\n%s\n' "$T/half-gone" "$S" > "$C/.ondemand-move-intent"   # written before the rename
 client "$C"
-ok "T10 interrupted move completed: marker rewritten, files in place" 'grep -q "completed the interrupted move" "$C.log" && [ "$(cat "$C/items.sqlite3.ondemand")" = "$S" ] && [ "$(cat "$S/docs/a.txt")" = moved ]'
+ok "T10 interrupted move completed: marker rewritten, files in place" 'grep -q "completed the interrupted move" "$C.log" && [ "$(cat "$C/items.sqlite3.ondemand")" = "$S" ] && [ "$(cat "$S/docs/a.txt")" = moved ] && [ ! -e "$C/.ondemand-move-intent" ]'
 ok "T10 not steered to --resync, the client continued to authentication" '! grep -qiE "ERROR.*resync" "$C.log" && grep -q "auth token" "$C.log"'
+
+echo "== recorded directory gone without a move intent: sync_dir is a foreign tree"
+C="$T/foreign"; S="$T/foreign-sync"; profile "$C" "$S"
+mkdir -p "$S/docs"; echo "someone else's file" > "$S/docs/hydrated.txt"
+"$H/mkdb" "$C/items.sqlite3"; printf '%s' "$C/ondemand/backing" > "$C/items.sqlite3.ondemand"   # the user deleted it
+client "$C"
+ok "T11 deleted backing dir, existing sync_dir: refused with --resync, nothing adopted" '[ "$(cat "$C.rc")" = 1 ] && grep -q "are not adopted. Re-run the client with .--resync." "$C.log" && [ "$(cat "$C/items.sqlite3.ondemand")" = "$C/ondemand/backing" ] && [ "$(cat "$S/docs/hydrated.txt")" = "someone else'"'"'s file" ]'
+C="$T/other"; S="$T/other-sync"; profile "$C" "$S"
+mkdir -p "$S"; echo "x" > "$S/x.txt"
+"$H/mkdb" "$C/items.sqlite3"; printf '%s' "$T/other-gone" > "$C/items.sqlite3.ondemand"
+printf '%s\n%s\n' "$T/other-gone" "$T/somewhere-else" > "$C/.ondemand-move-intent"
+client "$C"
+ok "T11 an intent record for another target proves nothing: refused" '[ "$(cat "$C.rc")" = 1 ] && grep -q "are not adopted" "$C.log" && [ "$(cat "$C/items.sqlite3.ondemand")" = "$T/other-gone" ]'
 
 echo "== offline deletes and copies (SyncEngine consistency check, no network)"
 "$H/guardtest" "$T/guard" > "$T/guard.out" 2>&1

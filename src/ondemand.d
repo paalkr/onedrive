@@ -983,6 +983,12 @@ final class OnDemandFs : Operations
 				stalePaths.remove(newRel);
 			}
 		}
+		// Saved over an online-only file: its local content now exists (state H), so a stop before
+		// the upload keeps it an edit of that item
+		if (!movesDatabaseItem && replacesDatabaseItem && !srcIsDir && isOnlineOnly(replaced)) {
+			try hydration.noteLocalContent(replaced.driveId, replaced.id);
+			catch (HydrationError e) addLogEntry("On-demand: unable to record the local content of " ~ newRel ~ ": " ~ e.msg);
+		}
 		emit(OnDemandChangeKind.moved, dest, orig);
 	}
 

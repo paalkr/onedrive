@@ -77,6 +77,7 @@ ok "O_TRUNC did not hydrate" '[ "$(downloads docs/trunc.txt)" = 0 ]'
 ok "V12 O_TRUNC used createEmpty" 'grep -q "^STUB createEmpty .*docs/trunc.txt$" "$LOG"'
 ok "O_TRUNC content" '[ "$(t cat "$M/docs/trunc.txt")" = new ] && [ "$(cat "$B/docs/trunc.txt")" = new ]'
 ok "O_TRUNC event changed" 'event "changed ./docs/trunc.txt"'
+ok "N1 O_TRUNC over an online-only file records the local content (hydrated)" '[ "$(xget "$M/docs/trunc.txt" user.onedrive.state)" = hydrated ]'
 
 echo "== in-place write of online-only write-me.txt"
 t sh -c "printf XY | dd of='$M/write-me.txt' bs=1 seek=2 conv=notrunc status=none"
@@ -121,6 +122,7 @@ echo "== V12 truncate -s 0 of online-only file"
 t truncate -s 0 "$M/docs/trunc0.txt"
 ok "V12 truncate 0 used createEmpty, no download" 'grep -q "^STUB createEmpty .*docs/trunc0.txt$" "$LOG" && [ "$(downloads docs/trunc0.txt)" = 0 ]'
 ok "V12 truncate 0 size and event" '[ "$(t stat -c %s "$M/docs/trunc0.txt")" = 0 ] && event "changed ./docs/trunc0.txt"'
+ok "N1 truncate 0 records the local content (hydrated)" '[ "$(xget "$M/docs/trunc0.txt" user.onedrive.state)" = hydrated ]'
 
 echo "== V3 rename onto directories and files judged by the mount view"
 t mkdir "$M/srcdir"
@@ -135,6 +137,7 @@ t sh -c "echo replacement > '$M/repl.txt'"
 ok "V3 file replacing an online-only file is allowed" '[ "$(ren "$M/repl.txt" "$M/docs/victim2.txt")" = OK ] && event "moved ./repl.txt -> ./docs/victim2.txt"'
 ok "V3 replaced file shows the new content, old not downloaded" '[ "$(t cat "$M/docs/victim2.txt")" = replacement ] && [ "$(downloads docs/victim2.txt)" = 0 ]'
 ok "V3 replaced file listed once" '[ "$(t ls "$M/docs" | grep -cx victim2.txt)" = 1 ]'
+ok "N1 a file saved by rename over an online-only file records the local content (hydrated)" '[ "$(xget "$M/docs/victim2.txt" user.onedrive.state)" = hydrated ] && grep -q "^STUB noteLocalContent docs/victim2.txt$" "$LOG"'
 
 echo "== V4 no download through a pending move"
 t mv "$M/hold/d1" "$M/hold/d2"
@@ -477,7 +480,7 @@ ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand:stagi
 echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"

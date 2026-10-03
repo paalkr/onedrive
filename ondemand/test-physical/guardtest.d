@@ -10,6 +10,9 @@
  *   G5 an older copy put at the path of an online-only file: kept as a conflict copy, not uploaded
  *   G6 a copy with the online content at the path of an online-only file: hydrated, not uploaded
  *   G7 control: a change of an online-only file written after the start is still uploaded
+ *   G8 a relative symbolic link is resolved against its own directory (no chdir)
+ *   G9, G10 content created through the mount over an online-only file (O_TRUNC, saved by rename),
+ *      then a stop before the upload: uploaded under its own name at the next start
  * Usage: guardtest <work dir>
  */
 import std.stdio, std.file, std.path, std.datetime, std.conv, std.algorithm;
@@ -184,6 +187,55 @@ void main(string[] args) {
 		std.file.write(buildPath(s.sync, "online.txt"), "edited through the mount");
 		foreach (item; s.db.selectByDriveId("d1")) engine.checkDatabaseItemForConsistency(item);
 		check(engine.databaseItemsWhereContentHasChanged.length == 1 && exists(buildPath(s.sync, "online.txt")), "G7 a change written after the start is still queued for upload, no conflict copy");
+		engine.shutdownProcessPool();
+		s.db.closeDatabaseFile();
+	}
+	{
+		// Finding 3: a relative symbolic link is resolved against its own directory, without chdir
+		auto s = make(buildPath(work, "g8"));
+		mkdirRecurse(buildPath(s.sync, "links"));
+		std.file.write(buildPath(s.sync, "target.txt"), "target");
+		symlink("../target.txt", buildPath(s.sync, "links", "relative.txt"));
+		symlink("../missing.txt", buildPath(s.sync, "links", "dangling.txt"));
+		chdir(s.sync);
+		auto filtering = new ClientSideFiltering(s.cfg);
+		filtering.initialise();   // the skip_file/skip_dir rules are checked after the symlink rule
+		auto engine = new SyncEngine(s.cfg, s.db, filtering);
+		string before = getcwd();
+		bool relativeExcluded = engine.checkPathAgainstClientSideFiltering("links/relative.txt");
+		bool danglingExcluded = engine.checkPathAgainstClientSideFiltering("links/dangling.txt");
+		check(!relativeExcluded && danglingExcluded, "G8 relative symlink resolved against its directory: valid kept, dangling skipped");
+		check(getcwd() == before, "G8 the working directory is unchanged");
+		engine.shutdownProcessPool();
+		s.db.closeDatabaseFile();
+	}
+	foreach (how; ["createEmpty", "saved by rename"]) {
+		// N1: content the mount created over an online-only file, then a stop before the upload. At
+		// the next start it is a modified hydrated file: uploaded under its own name, no conflict copy.
+		string tag = how == "createEmpty" ? "G9" : "G10";
+		auto s = make(buildPath(work, tag == "G9" ? "g9" : "g10"));
+		string target = buildPath(s.sync, "online.txt");
+		auto svc = new HydrationService(s.cfg, s.db, s.sync);
+		if (how == "createEmpty") {
+			svc.createEmpty("d1", "O");
+			std.file.write(target, "edited through the mount");
+		} else {
+			std.file.write(buildPath(s.sync, "save.tmp"), "edited through the mount");
+			rename(buildPath(s.sync, "save.tmp"), target);
+			svc.noteLocalContent("d1", "O");
+		}
+		Item o;
+		s.db.selectById("d1", "O", o);
+		check(o.hydration == "H", tag ~ " " ~ how ~ " over an online-only file: state H at once");
+		svc.shutdown();
+		import core.thread : Thread;
+		import core.time : dur;
+		Thread.sleep(dur!"msecs"(1100));   // the client stopped; this is the next start
+		auto engine = runPass(s);
+		bool queued = engine.databaseItemsWhereContentHasChanged.length == 1 && engine.databaseItemsWhereContentHasChanged[0][1] == "O";
+		bool copies = false;
+		foreach (e; dirEntries(s.sync, SpanMode.shallow)) if (baseName(e.name).startsWith("online-")) copies = true;
+		check(queued && !copies && readText(target) == "edited through the mount", tag ~ " after the restart it is queued for upload under its own name, no conflict copy");
 		engine.shutdownProcessPool();
 		s.db.closeDatabaseFile();
 	}

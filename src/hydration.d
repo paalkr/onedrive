@@ -906,6 +906,9 @@ final class HydrationService {
 	// Create an empty backing file for an online-only item (O_TRUNC / truncate to 0), without a
 	// download. Waits for a hydration commit of the item in progress. Returns false if the item
 	// is not online-only. An existing backing file of an online-only item is truncated.
+	// The item becomes H at once: the local content now exists, and if the client stops before
+	// it is uploaded, the next start treats it as a modified hydrated file (uploaded as a new
+	// version after the usual conflict check), not as a file put over an online-only item.
 	bool createEmpty(string driveId, string id) {
 		lockForStateWrite();
 		scope(exit) unlockForStateWrite();
@@ -929,7 +932,22 @@ final class HydrationService {
 		} catch (FileException e) {
 			throw new HydrationError(EIO, "Unable to create an empty backing file: " ~ e.msg);
 		}
+		itemDB.setHydration(driveId, id, hydrationHydrated);
 		return true;
+	}
+
+	// The mount put local content at the path of an online-only item (a new file saved by rename
+	// over it). As createEmpty: the item becomes H while that file is present, so a stop before the
+	// upload does not turn the edit into a conflict copy at the next start.
+	void noteLocalContent(string driveId, string id) {
+		lockForStateWrite();
+		scope(exit) unlockForStateWrite();
+
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) return;
+		if ((item.type != ItemType.file) || (item.hydration != hydrationOnlineOnly)) return;
+		if (!exists(backingPathFor(driveId, id))) return;
+		itemDB.setHydration(driveId, id, hydrationHydrated);
 	}
 
 	// Cancel waiting callers with EIO, refuse new hydrations, abort in-progress transfers and
