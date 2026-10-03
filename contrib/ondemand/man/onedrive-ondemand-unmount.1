@@ -10,6 +10,8 @@ Reads \fBsync_dir\fR from \fIDIR/config\fR (default
 set it) and, if the onedrive FUSE file system (fuse.onedrive) is still mounted there, unmounts it with
 \fBfusermount3 \-u \-z\fR. Nothing mounted is not an error. The
 onedrive-ondemand systemd user units run it as \fBExecStopPost=\fR.
+The client also unmounts a stale mount itself when it starts. Only the
+mount is removed; the downloaded files in \fBsync_dir\fR underneath stay.
 .SH OPTIONS
 .TP
 \fB\-\-confdir=\fIDIR\fR
