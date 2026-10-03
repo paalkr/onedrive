@@ -1903,23 +1903,77 @@ class OneDriveApi {
 	// On-demand ranged reads: bytes [offset, offset + length) from a pre-authenticated download URL
 	// with an HTTP Range request. One attempt and no retry loop, because the caller is a FUSE read
 	// that must fail fast; no Authorization header (the URL carries its own authorisation).
-	// Returns fewer bytes at the end of the file and none past it (416). A server that ignores the
-	// Range header (200) is answered from the full body. Any other status throws OneDriveException
-	// (401/403/410: the URL has expired). Network failures throw CurlException.
-	ubyte[] downloadRangeByUrl(string downloadUrl, ulong offset, size_t length) {
+	// - At most 'length' bytes are received: a server that ignores Range (200) is cut off once the
+	//   requested range has arrived, so it can never buffer a whole large file.
+	// - 'timeout' limits the whole request; the transfer abort flag (setTransferAbortFlag) aborts it.
+	// - A 206 must start at 'offset' (Content-Range), otherwise OneDriveException 502.
+	// Returns fewer bytes at the end of the file and none past it (416). Any other status throws
+	// OneDriveException (401/403/410: the URL has expired). Network failures throw CurlException.
+	ubyte[] downloadRangeByUrl(string downloadUrl, ulong offset, size_t length, Duration timeout) {
 		if (length == 0) return [];
+		ulong end = offset + length;
+		ubyte[] body;
+		ulong position;        // of the next received byte within the resource
+		bool partial;
+		bool complete;
 		curlEngine.setResponseHolder(null);
-		curlEngine.addRequestHeader("Range", format("bytes=%d-%d", offset, offset + length - 1));
+		curlEngine.addRequestHeader("Range", format("bytes=%d-%d", offset, end - 1));
 		curlEngine.connect(HTTP.Method.get, downloadUrl);
-		CurlResponse response = curlEngine.execute();
-		int code = response.statusLine.code;
-		ubyte[] body = cast(ubyte[]) response.content.dup;
-		if (code == 206) return body.length > length ? body[0 .. length] : body;
-		if (code == 200) {
-			if (offset >= body.length) return [];
-			ulong end = offset + length;
-			return body[cast(size_t) offset .. cast(size_t) (end > body.length ? body.length : end)];
+		auto http = &curlEngine.http();
+		Duration savedTimeout = dur!"seconds"(appConfig.getValueLong("operation_timeout"));
+		scope(exit) {
+			http.operationTimeout = savedTimeout;
+			http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) { return 0; };
+			curlEngine.cleanup();
 		}
+		http.operationTimeout = timeout;
+		if (transferAbortFlag !is null) {
+			http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) {
+				return transferAbortRequested() ? 1 : 0;
+			};
+		}
+		http.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+			partial = (statusLine.code == 206);
+			position = partial ? offset : 0;
+			body = null;
+		};
+		http.onReceive = (ubyte[] data) {
+			// Keep only [offset, end) of the resource; stop the transfer once it has all arrived
+			ulong chunkStart = position;
+			position += data.length;
+			ulong from = (chunkStart < offset) ? offset - chunkStart : 0;
+			ulong to = (position > end) ? end - chunkStart : data.length;
+			if ((from < data.length) && (from < to)) body ~= data[cast(size_t) from .. cast(size_t) to];
+			if (position >= end) {
+				complete = true;
+				return 0;   // aborts the transfer (CURLE_WRITE_ERROR), the range is complete
+			}
+			return data.length;
+		};
+		try {
+			http.perform();
+		} catch (CurlException e) {
+			if (!complete) throw e;
+		}
+		CurlResponse response = curlEngine.response;
+		response.update(http);
+		int code = response.statusLine.code;
+		if (code == 206) {
+			auto contentRange = "content-range" in response.responseHeaders;
+			ulong start;
+			bool valid = false;
+			if (contentRange !is null) {
+				import std.regex : matchFirst;
+				auto m = matchFirst(*contentRange, `^bytes (\d+)-(\d+)/`);
+				if (!m.empty) {
+					start = to!ulong(m[1]);
+					valid = true;
+				}
+			}
+			if (!valid || (start != offset)) throw new OneDriveException(502, "ranged download returned another range than requested", response);
+			return body;
+		}
+		if (code == 200) return body;
 		if (code == 416) return [];
 		throw new OneDriveException(code, "ranged download failed", response);
 	}

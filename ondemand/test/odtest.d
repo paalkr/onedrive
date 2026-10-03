@@ -78,6 +78,11 @@ void main(string[] args)
 		std.file.write(buildPath(remote, rel), content);
 		import std.path : baseName;
 		add(id, parent, baseName(rel), ItemType.file, content.length.to!string);
+		// The online content hash, as the delta records it for an online-only item
+		Item seeded;
+		db.selectById(driveId, id, seeded);
+		seeded.quickXorHash = HydrationService.contentHash(buildPath(remote, rel));
+		db.update(seeded);
 		svc.setStateForTest(driveId, id, rel, HydrationState.onlineOnly);
 	}
 
@@ -105,6 +110,17 @@ void main(string[] args)
 	}
 	onlineFile("f-small", "d-docs", "docs/small.png", "\x89PNG small picture\n");
 	onlineFile("f-off", "d-docs", "docs/offline.bin", "not reachable\n");
+	{
+		import std.format : format;
+		string make(size_t mib, string tag) {
+			string content;
+			foreach (i; 0 .. mib * 1024 * 16) content ~= format("%s%058d\n", tag, i);
+			return content;
+		}
+		onlineFile("f-index", "d-docs", "docs/index.bin", make(6, "idx-"));
+		onlineFile("f-ver", "d-docs", "docs/ver.bin", make(2, "ver-"));
+		onlineFile("f-ver2", "d-docs", "docs/ver2.bin", make(2, "vr2-"));
+	}
 	// V3: a directory whose only child is online-only, and files to rename over
 	add("d-target", "d-docs", "target", ItemType.dir);
 	onlineFile("f-target", "d-target", "docs/target/t.txt", "only child\n");
@@ -262,6 +278,23 @@ void main(string[] args)
 				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!TransientState);
 				// offline~1 / offline~0: ranged reads fail as when Microsoft OneDrive is not reachable
 				if (parts[0] == "offline") HydrationService.rangeOffline = parts[1] == "1";
+				// newversion~<id>~<path> / newremote~<id>~<path>: the online file gets new content of the
+				// same size (paths use % for /); newversion also records it in the database (a delta),
+				// newremote leaves the database behind
+				if (parts[0] == "newversion" || parts[0] == "newremote") {
+					import std.array : replace;
+					string remoteFile = buildPath(remote, parts[2].replace("%", "/"));
+					auto bytes = cast(ubyte[]) std.file.read(remoteFile);
+					foreach (ref b; bytes) b = cast(ubyte) (b ^ 0x5a);
+					std.file.write(remoteFile, bytes);
+					if (parts[0] == "newversion") {
+						Item changed;
+						db.selectById(driveId, parts[1], changed);
+						changed.quickXorHash = HydrationService.contentHash(remoteFile);
+						changed.eTag = changed.eTag ~ "+";
+						db.update(changed);
+					}
+				}
 				remove(entry.name);
 				writeln("CTL ", baseName(entry.name));
 			}

@@ -248,26 +248,34 @@ Hydrated files live in the physical `sync_dir`, with the FUSE mount on top of it
 
 ## Iteration 6: no download without a deliberate user action (ranged reads)
 
-Decided by Pål: a file is only downloaded by a deliberate user action (opening it in an application, Properties, a copy or move, the OneDrive actions). Browsing in a file manager sniffs content types and reads previews; that must not download. The caller cannot tell a sniff from a copy (Nautilus reads both on its `pool-org.gnome.` worker threads), so the read volume decides.
+Decided by Pål: a file is only downloaded by a deliberate user action (opening it in an application, a copy or move, the OneDrive actions). Browsing in a file manager sniffs content types and reads previews; that must not download. The caller cannot tell a sniff from a copy (Nautilus reads both on its `pool-org.gnome.` worker threads), so the read volume decides. Properties in Nautilus runs in the nautilus process: it is served with ranged reads and does not download either, which satisfies the rule.
 
 ### Background readers (ondemand.d)
-- **Classification at open**, for database files: the opener is a background reader when its process comm or executable is in `backgroundReaderNames` (next to the thumbnailer list: nautilus, nemo, caja, thunar, dolphin, pcmanfm, gvfsd*, tracker-*, localsearch*, baloo*, zeitgeist*; `*` is a prefix), or when it is an on-access scanner (`onAccessScannerNames`). The thread comm is not used for this, because file managers read on generic worker threads. Thumbnailers are never background readers; they stay refused.
-- **read() of an online-only file** on a background handle is answered with `HydrationService.readRange()`, without a local file and without a state change. The handle counts the bytes served.
-- **Escalation:** when a handle would read more than `rangedReadLimit` (1 MiB) in total (a copy or move), the item is hydrated normally and the rest is served from the local file. A file at or under 1 MiB read by a background reader stays online-only (accepted).
-- **Unchanged:** writes, truncate, rename, xattr actions, and reads by every other process (they hydrate on the first read, as before).
+- **Classification at open**, for database files, on the process comm and the executable (not the thread comm: file managers read on generic worker threads):
+  - **File managers** (`fileManagerNames`: nautilus, nemo, caja, thunar, dolphin, pcmanfm): served with ranged reads; a handle that would read more than 1 MiB in total (a copy or move) gets the file downloaded normally, and the rest is read from the local file. A file at or under 1 MiB stays online-only (accepted).
+  - **Background services** (`backgroundServiceNames`: gvfsd*, tracker-*, localsearch*, baloo*, zeitgeist*; `*` is a prefix) and **on-access scanners** (`onAccessScannerNames`): served with ranged reads up to 4 MiB per handle, then EIO (logged once per item). They never get a file downloaded.
+  - **Thumbnailers** are never background readers; they stay refused. Every other process downloads on the first read, as before.
+  - The lists are next to the thumbnailer list.
+- **Versions:** a handle records the content version of the bytes it was served (`HydrationService.contentVersionOf`: the content hash, else cTag, else eTag of the database item). If the database item changes version between two reads of the handle, or the file a file manager's escalation downloaded is another version than the part already served, that read and every later read of the handle fail with EIO. Versions are never mixed within a handle.
+- **Unchanged:** writes, truncate, rename and the xattr actions.
 - **Offline:** the read fails with EIO at once.
-- **Log:** `On-demand: served N bytes of <path> to <caller> without downloading` at release (at most once a minute per path), and `On-demand: downloading <path> because <caller> read more than 1 MiB` on escalation. `<caller>` is the caller identity of the hydration log.
+- **Log:** `On-demand: served N bytes of <path> to <caller> without downloading` at release (at most once a minute per path); `On-demand: downloading <path> because <caller> read more than 1 MiB` on escalation; `On-demand: not downloading <path> for <caller>: a background service or scanner is served at most 4 MiB ...` once per item; version failures. `<caller>` is the caller identity of the hydration log.
 
-### HydrationService.readRange(driveId, id, offset, length)
-- Returns the bytes from the cache or Graph; fewer at the end of the file, none past it. Throws HydrationError: EIO (offline or any failed request), ENOENT (gone online).
-- **Graph:** the item's `@microsoft.graph.downloadUrl` from a plain item GET (`OneDriveApi.getDownloadUrlById`, after `probeMicrosoftService`), then `OneDriveApi.downloadRangeByUrl(url, offset, length)`: one GET with `Range: bytes=a-b`, no Authorization header, no retry loop. 206 is used as is; 200 (Range ignored) is sliced; 416 means past the end; any other status throws OneDriveException. A malware-flagged item is refused.
-- **Cache:** 128 KiB blocks per item (one request covers the kernel's read-ahead; a run of missing blocks is one request). Items are dropped 60 s after their last read; all items together are capped at 64 MiB (least recently read first). A new size at a URL refresh drops the item's blocks.
+### HydrationService.readRange(driveId, id, contentVersion, size, offset, length)
+- `contentVersion` and `size` are the database item's. Returns the bytes from the cache or Graph; fewer at the end of the file, none past it. Throws HydrationError: EIO (offline, a version or size mismatch, any failed or short request), ENOENT (gone online).
+- **Graph:** the item's `@microsoft.graph.downloadUrl` from a plain item GET (`OneDriveApi.getDownloadUrlById`), then `OneDriveApi.downloadRangeByUrl(url, offset, length, timeout)`: one GET with `Range: bytes=a-b`, no Authorization header, no retry loop, an overall timeout of 30 s, aborted by shutdown (the transfer abort flag).
+  - At most `length` bytes are received: a server that ignores Range (200) is cut off once the requested range has arrived.
+  - A 206 must start at the requested offset (Content-Range), else an error. 416 means past the end. Any other status is an error. A malware-flagged item is refused.
+- **Version check:** each new download URL comes with the online item's content version and size; they must equal the requested ones, otherwise EIO (the database is behind; the delta brings the new version, and the next handle reads it).
+- **Cache:** 128 KiB blocks per item and content version (a new version drops the item's blocks; a run of missing blocks is one request; a block shorter than expected before the end of the file is an error, not the end). Items are dropped 60 s after their last read; all items together are capped at 64 MiB (least recently read first). A reader pins its item for the whole read, so it is never removed while in use; the byte count is kept under the cache mutex.
 - **URL:** reused for 30 minutes. A 401, 403 or 410 fetches a new URL once and retries.
-- **Offline:** a network failure (curl error, or the probe fails) logs once per item and makes every ranged read fail with EIO for 15 s without a request. The first failing read is bounded by the configured `dns_timeout`/`connect_timeout` of the probe (it fails at once when there is no network at all).
+- **Reachability:** one `probeMicrosoftService` result is reused for 5 s, so a folder listing does not probe once per file.
+- **Offline:** a network failure logs once per item and makes every ranged read fail with EIO for 15 s without a request. The first failing read is bounded by the configured `dns_timeout`/`connect_timeout` of the probe (it fails at once when there is no network at all).
+- **Shutdown:** ranged requests are counted like hydrations; `shutdown()` aborts them and waits for them.
 - **Locks:** only the range cache's mutex and a per-item fetch lock (concurrent readers of an item wait for one request and share its blocks). Never the state lock, the transaction lock or the database lock across network I/O.
-- **Test hooks:** `rangeUrlSource` and `rangeFetch` replace Graph (test-physical rangetest).
+- **Test hooks:** `rangeUrlSource`, `rangeFetch`, `rangeProbe`, `rangeFetchTimeout`, `rangeCacheLimit` (test-physical rangetest).
 
 ### Assumptions about Graph (not verified against a real account)
 - A plain `GET /drives/{d}/items/{i}` returns `@microsoft.graph.downloadUrl` for files, on Personal and Business.
-- That URL accepts `Range` and answers 206, and expires after about an hour (401/403/410 afterwards).
-- If a server ignored Range, the full body would be fetched for each block request (correct, but slow); this is handled, not optimised.
+- That URL accepts `Range` and answers 206 with a Content-Range, and expires after about an hour (401/403/410 afterwards).
+- A download URL keeps serving the version it was issued for, or fails, rather than switching to a newer version within its lifetime. If it switched, blocks of a newer version could be fetched under the old version's key until the URL is refreshed; the version check at each URL refresh (at most every 30 minutes) and the per-handle check against the database bound this, but do not exclude it.

@@ -106,16 +106,26 @@ private final class Handle
 	// Opened by a known on-access scanner (reported to noteOpen/noteClose), and who that was
 	bool openByScanner;
 	string scannerIdentity;
-	// Opened by a background reader (backgroundReaderNames or a scanner): reads of an online-only
-	// file are served with ranged requests until more than rangedReadLimit bytes were read
+	// Opened by a background reader: reads of an online-only file are served with ranged requests.
+	// A file manager's handle (mayEscalate) gets the file downloaded after more than
+	// fileManagerRangedLimit bytes; a background service's or scanner's handle gets EIO after
+	// backgroundRangedLimit bytes.
 	bool background;
+	bool mayEscalate;
 	string callerIdentity;
 	ulong rangedBytes;
 	bool escalated;
+	// The content version of the bytes served so far (HydrationService.contentVersionOf); a handle
+	// never mixes versions: any read after a version change fails with EIO
+	string servedVersion;
+	bool versionChecked;
+	bool versionBroken;
 }
 
-// A background reader that has read more than this from one handle (a copy or move) gets the file downloaded
-private enum ulong rangedReadLimit = 1024 * 1024;
+// A file manager that has read more than this from one handle (a copy or move) gets the file downloaded
+private enum ulong fileManagerRangedLimit = 1024 * 1024;
+// Background services and scanners are never downloaded for; past this they get EIO
+private enum ulong backgroundRangedLimit = 4 * 1024 * 1024;
 
 // Thumbnailers, by full name and by the 15-character /proc/<pid>/comm truncation
 private immutable string[] thumbnailerNames = [
@@ -125,12 +135,17 @@ private immutable string[] thumbnailerNames = [
 	"ffmpegthumbnai", "gnome-thumbnai",
 ];
 
-// File managers and background services that read files without a deliberate user action (content
-// type sniffing, previews, indexing): by full name and by the 15-character comm truncation. Their
-// reads of an online-only file never download it until they read more than rangedReadLimit bytes
-// from one handle (a copy or move). Prefixes end in '*'.
-private immutable string[] backgroundReaderNames = [
+// File managers read files without a deliberate user action (content type sniffing, previews,
+// Properties) and on a copy or move, from the same threads: their reads of an online-only file are
+// served with ranged requests, and only a handle that reads more than fileManagerRangedLimit (a copy
+// or move) gets the file downloaded. By full name and by the 15-character comm truncation.
+private immutable string[] fileManagerNames = [
 	"nautilus", "nemo", "caja", "thunar", "Thunar", "dolphin", "pcmanfm", "pcmanfm-qt",
+];
+
+// Background services (gvfs, indexers, activity logs) are served with ranged requests up to
+// backgroundRangedLimit per handle and never get a file downloaded. Prefixes end in '*'.
+private immutable string[] backgroundServiceNames = [
 	"gvfsd*", "tracker-*", "localsearch*", "baloo*", "zeitgeist*",
 ];
 
@@ -202,14 +217,18 @@ private string callerName(const ref Caller caller, const(string)[] known) {
 	return null;
 }
 
-// Is the caller a background reader (file manager, indexer, on-access scanner)? Matched on the
-// process comm and the executable, not the thread comm: file managers read on worker threads
-// with generic names.
-private bool isBackgroundReader(const ref Caller caller) {
-	if (caller.pid <= 0) return false;
+// The background reader class of a caller. File managers and services are matched on the process
+// comm and the executable, not the thread comm (file managers read on generic worker threads);
+// scanners as for the free wait.
+private enum ReaderClass { normal, fileManager, backgroundService }
+
+private ReaderClass readerClassOf(const ref Caller caller) {
+	if (caller.pid <= 0) return ReaderClass.normal;
 	Caller process = caller;
 	process.threadComm = null;
-	return (callerName(process, backgroundReaderNames) !is null) || (callerName(caller, onAccessScannerNames) !is null);
+	if (callerName(process, fileManagerNames) !is null) return ReaderClass.fileManager;
+	if ((callerName(process, backgroundServiceNames) !is null) || (callerName(caller, onAccessScannerNames) !is null)) return ReaderClass.backgroundService;
+	return ReaderClass.normal;
 }
 
 // readlink of /proc/<pid>/exe appends " (deleted)" when the binary was replaced
@@ -240,6 +259,8 @@ final class OnDemandFs : Operations
 	private bool[string] thumbnailRefusalLogged;
 	// When "served ... without downloading" was last logged per path (at most once a minute)
 	private MonoTime[string] rangedServeLogged;
+	// Paths for which a background service or scanner hit backgroundRangedLimit (logged once)
+	private bool[string] backgroundLimitLogged;
 
 	// Reporting changes made behind the mount's back (notifyBackingChange)
 	private BackgroundFuse mount;
@@ -526,8 +547,10 @@ final class OnDemandFs : Operations
 		h.openByScanner = scanner;
 		if (scanner) h.scannerIdentity = caller.toString();
 		// Thumbnailers stay refused in hydrateIfNeeded; they are never background readers
-		if (isBackgroundReader(caller) && (callerName(caller, thumbnailerNames) is null)) {
+		ReaderClass readerClass = readerClassOf(caller);
+		if ((readerClass != ReaderClass.normal) && (callerName(caller, thumbnailerNames) is null)) {
 			h.background = true;
+			h.mayEscalate = (readerClass == ReaderClass.fileManager);
 			h.callerIdentity = caller.toString();
 		}
 	}
@@ -866,6 +889,7 @@ final class OnDemandFs : Operations
 		ulong served;
 		if (readRanged(path, h, buf, offset, served)) return served;
 		int fd = fdOf(path, h);
+		checkServedVersion(path, h);
 		size_t done = 0;
 		while (done < buf.length) {
 			auto n = pread(fd, buf.ptr + done, buf.length - done, cast(off_t) (offset + done));
@@ -880,34 +904,81 @@ final class OnDemandFs : Operations
 	}
 
 	// A background reader's read of an online-only file: served from Graph with ranged requests,
-	// without a local file. False when the read takes the normal path (not a background handle,
-	// the file is local, or the handle has read more than rangedReadLimit: then it is downloaded).
+	// without a local file. False when the read takes the normal path (not a background handle, the
+	// file is local, or a file manager's handle has read more than fileManagerRangedLimit: then it
+	// is downloaded). EIO when the item's version changed since this handle's earlier reads, and for
+	// a background service or scanner past backgroundRangedLimit.
 	private bool readRanged(const(char)[] path, Handle h, ubyte[] buf, ulong offset, out ulong served) {
 		if (path is null) return false;
 		synchronized (h) {
+			if (h.versionBroken) fail(EIO);
 			if (!h.background || h.escalated || (h.fd != -1)) return false;
 		}
 		if (existsPath(backingPath(path))) return false;
 		Item item;
 		if (!resolve(path, item) || !isOnlineOnly(item)) return false;
 		if (!resolveSettled(path, item)) fail(ENOENT);
+		string contentVersion = HydrationService.contentVersionOf(item);
+		long size = -1;
+		try size = (item.size.length == 0) ? -1 : to!long(item.size); catch (Exception e) {}
 		synchronized (h) {
-			if (h.rangedBytes + buf.length > rangedReadLimit) {
+			if (h.servedVersion.length && (h.servedVersion != contentVersion)) {
+				h.versionBroken = true;
+				addLogEntry("On-demand: " ~ dbPath(path) ~ " changed online while " ~ h.callerIdentity ~ " was reading it; failing that read");
+				fail(EIO);
+			}
+			if (h.mayEscalate && (h.rangedBytes + buf.length > fileManagerRangedLimit)) {
 				h.escalated = true;
 				addLogEntry("On-demand: downloading " ~ dbPath(path) ~ " because " ~ h.callerIdentity ~ " read more than 1 MiB");
 				return false;
 			}
+			if (!h.mayEscalate && (h.rangedBytes + buf.length > backgroundRangedLimit)) {
+				logBackgroundLimitOnce(path, h);
+				fail(EIO);
+			}
 		}
 		ubyte[] data;
 		try {
-			data = hydration.readRange(item.driveId, item.id, offset, buf.length);
+			data = hydration.readRange(item.driveId, item.id, contentVersion, size, offset, buf.length);
 		} catch (HydrationError e) {
 			fail(e.errnoCode == ENOENT ? ENOENT : EIO);
 		}
 		buf[0 .. data.length] = data[];
-		synchronized (h) h.rangedBytes += data.length;
+		synchronized (h) {
+			h.servedVersion = contentVersion;
+			h.rangedBytes += data.length;
+		}
 		served = data.length;
 		return true;
+	}
+
+	// After a handle's ranged reads the rest comes from the local file (escalation, or another
+	// caller downloaded it). It must be the version served so far; otherwise this and every later
+	// read of the handle fails with EIO.
+	private void checkServedVersion(const(char)[] path, Handle h) {
+		synchronized (h) {
+			if (h.versionBroken) fail(EIO);
+			if (h.servedVersion.length == 0 || h.versionChecked) return;
+			h.versionChecked = true;
+		}
+		Item item;
+		bool same = (path !is null) && resolve(path, item) && (HydrationService.contentVersionOf(item) == h.servedVersion);
+		if (!same) {
+			synchronized (h) h.versionBroken = true;
+			addLogEntry("On-demand: the downloaded " ~ (path is null ? h.openId : dbPath(path)) ~ " is another version than the part already read by " ~ h.callerIdentity ~ "; failing that read");
+			fail(EIO);
+		}
+	}
+
+	// Once per item: a background service or scanner reached backgroundRangedLimit
+	private void logBackgroundLimitOnce(const(char)[] path, Handle h) {
+		string rel = dbPath(path);
+		synchronized (thumbnailLogLock) {
+			if (rel in backgroundLimitLogged) return;
+			if (backgroundLimitLogged.length > 10_000) backgroundLimitLogged = null;
+			backgroundLimitLogged[rel] = true;
+		}
+		addLogEntry("On-demand: not downloading " ~ rel ~ " for " ~ h.callerIdentity ~ ": a background service or scanner is served at most 4 MiB of an online-only file");
 	}
 
 	override int write(const(char)[] path, in ubyte[] data, ulong offset, ref fuse_file_info fi) {

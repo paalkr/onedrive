@@ -505,6 +505,51 @@ ctl "offline~0"
 ok "B5 offline: a background read fails with EIO at once ($((T1 - T0)) ms), nothing downloaded" 'echo "$OUT" | grep -q "Input/output error" && [ $((T1 - T0)) -lt 3000 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(xget "$M/docs/offline.bin" user.onedrive.state)" = online-only ]'
 N=$(read_as clamonacc "$M/docs/offline.bin" 100)
 ok "B6 an on-access scanner is a background reader too: served without a download" '[ "$N" = 14 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(ranges docs/offline.bin)" = 1 ]'
+OUT="$(read_as tracker-extract "$M/docs/index.bin" 6291456 2>&1)"
+for i in $(seq 1 30); do grep -q "not downloading ./docs/index.bin for" "$LOG" && break; sleep 0.1; done
+ok "B7 an indexer is never downloaded for: EIO after 4 MiB, still online-only" 'echo "$OUT" | grep -q "Input/output error" && [ "$(downloads docs/index.bin)" = 0 ] && [ ! -e "$B/docs/index.bin" ] && [ "$(xget "$M/docs/index.bin" user.onedrive.state)" = online-only ]'
+ok "B7 logged once with the caller" '[ "$(grep -c "not downloading ./docs/index.bin for pid=[0-9]* thread=tracker-extract process=tracker-extract .*served at most 4 MiB" "$LOG")" = 1 ]'
+# phased <comm> <file> <first bytes> <then offset> <then bytes>: reads, waits for $T/go, then preads again
+phased() {
+	rm -f "$T/go" "$T/phase.out"
+	t python3 -c 'import os, sys, time
+open("/proc/self/comm", "w").write(sys.argv[1])
+fd = os.open(sys.argv[2], os.O_RDONLY)
+first = b""
+while len(first) < int(sys.argv[3]):
+    chunk = os.read(fd, min(131072, int(sys.argv[3]) - len(first)))
+    if not chunk: break
+    first += chunk
+open(sys.argv[6] + ".first", "wb").write(first)
+print("FIRST", len(first), flush=True)
+while not os.path.exists(sys.argv[6] + "/go"): time.sleep(0.05)
+got = b""
+try:
+    pos = int(sys.argv[4])
+    while len(got) < int(sys.argv[5]):
+        chunk = os.pread(fd, min(131072, int(sys.argv[5]) - len(got)), pos + len(got))
+        if not chunk: break
+        got += chunk
+    print("THEN", len(got), flush=True)
+except OSError as e:
+    print("THEN-ERROR", e.errno, len(got), flush=True)
+open(sys.argv[6] + ".then", "wb").write(got)' "$1" "$2" "$3" "$4" "$5" "$T" > "$T/phase.out" 2>&1 &
+	PHASED=$!
+	for i in $(seq 1 100); do grep -q FIRST "$T/phase.out" && break; sleep 0.1; done
+}
+cp "$R/docs/ver.bin" "$T/ver.v1"
+phased nautilus "$M/docs/ver.bin" 4096 1572864 4096
+ctl "newversion~f-ver~docs%ver.bin"
+touch "$T/go"; wait $PHASED
+ok "B8 the item changes online between two reads of one handle: EIO, versions never mixed" 'grep -q "^THEN-ERROR 5 0" "$T/phase.out" && cmp -s "$T.first" <(head -c 4096 "$T/ver.v1")'
+N=$(read_as nautilus "$M/docs/ver.bin" 4096 "$T/ver.head")
+ok "B8 a new handle reads the new version" '[ "$N" = 4096 ] && cmp -s "$T/ver.head" <(head -c 4096 "$R/docs/ver.bin") && [ "$(downloads docs/ver.bin)" = 0 ]'
+cp "$R/docs/ver2.bin" "$T/ver2.v1"
+phased nautilus "$M/docs/ver2.bin" 524288 524288 1572864
+ctl "newremote~f-ver2~docs%ver2.bin"
+touch "$T/go"; wait $PHASED
+ok "B9 the online file changes before the copy escalates: EIO, nothing of the new version is served" 'grep -q "^THEN-ERROR 5" "$T/phase.out" && cmp -s "$T.first" <(head -c 524288 "$T/ver2.v1") && cmp -s "$T.then" <(tail -c +524289 "$T/ver2.v1" | head -c $(stat -c %s "$T.then"))'
+
 
 echo "== stop"
 # F5 R1: stop with replays queued and in flight whose files are gone again
