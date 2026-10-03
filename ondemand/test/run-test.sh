@@ -20,7 +20,7 @@ cleanup() {
 trap cleanup EXIT
 
 # 300 ms artificial download delay so concurrent readers overlap
-timeout 120 "$BIN" "$W" "$M" 300 > "$LOG" 2>&1 &
+timeout 300 "$BIN" "$W" "$M" 300 > "$LOG" 2>&1 &
 PID=$!
 for i in $(seq 1 50); do grep -q READY "$LOG" && break; sleep 0.1; done
 grep -q READY "$LOG" || { echo "not ready"; cat "$LOG"; exit 1; }
@@ -468,6 +468,123 @@ hold_as clamonacc "$M/one.txt" 8
 T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); kill $HOLD 2>/dev/null; wait $HOLD 2>/dev/null
 ok "S a scanner that keeps the file open: EBUSY after about 5 s ($((T1 - T0)) ms)" 'echo "$OUT" | grep -q "Device or resource busy" && [ $((T1 - T0)) -ge 4500 ] && [ $((T1 - T0)) -lt 7000 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
 
+echo "== background readers: ranged reads instead of downloads"
+# read_as <comm> <file> <bytes> [<out>]: a process named <comm> reads <bytes> from the start of <file> in 128 KiB reads
+read_as() {
+	t python3 -c 'import sys
+open("/proc/self/comm", "w").write(sys.argv[1])
+want = int(sys.argv[3]); got = b""
+with open(sys.argv[2], "rb") as f:
+    while len(got) < want:
+        chunk = f.read(min(131072, want - len(got)))
+        if not chunk: break
+        got += chunk
+if len(sys.argv) > 4: open(sys.argv[4], "wb").write(got)
+print(len(got))' "$@"
+}
+ranges() { grep -c "^STUB range $1 " "$LOG"; }
+N=$(read_as nautilus "$M/docs/large.bin" 4096 "$T/head.out")
+ok "B1 a file manager sniffing 4 KB is served by one ranged read" '[ "$N" = 4096 ] && [ "$(ranges docs/large.bin)" = 1 ] && cmp -s "$T/head.out" <(head -c 4096 "$R/docs/large.bin")'
+ok "B1 nothing downloaded: no local file, still online-only" '[ "$(downloads docs/large.bin)" = 0 ] && [ ! -e "$B/docs/large.bin" ] && [ "$(xget "$M/docs/large.bin" user.onedrive.state)" = online-only ]'
+for i in $(seq 1 30); do grep -q "served [0-9]* bytes of ./docs/large.bin to pid=[0-9]* thread=nautilus process=nautilus" "$LOG" && break; sleep 0.1; done
+ok "B1 logged as served without downloading, with the caller" 'grep -qE "^On-demand: served [0-9]+ bytes of ./docs/large.bin to pid=[0-9]+ thread=nautilus process=nautilus .* without downloading$" "$LOG"'
+read_as nautilus "$M/docs/small.png" 4096 >/dev/null & P1=$!
+read_as tracker-extract "$M/docs/small.png" 4096 >/dev/null & P2=$!
+read_as gvfsd-metadata "$M/docs/small.png" 4096 >/dev/null & P3=$!
+wait $P1 $P2 $P3
+ok "B2 three concurrent background readers share one ranged read" '[ "$(ranges docs/small.png)" = 1 ] && [ "$(downloads docs/small.png)" = 0 ] && [ "$(xget "$M/docs/small.png" user.onedrive.state)" = online-only ]'
+N=$(read_as nautilus "$M/docs/large.bin" 3145728 "$T/large.out")
+ok "B3 a background reader reading 3 MiB (a copy) gets the file downloaded" '[ "$N" = 3145728 ] && [ "$(downloads docs/large.bin)" = 1 ] && [ "$(xget "$M/docs/large.bin" user.onedrive.state)" = hydrated ]'
+ok "B3 the content is identical, locally and as read" 'cmp -s "$B/docs/large.bin" "$R/docs/large.bin" && cmp -s "$T/large.out" "$R/docs/large.bin"'
+ok "B3 the escalation is logged with the caller" 'grep -qE "^On-demand: downloading ./docs/large.bin because pid=[0-9]+ thread=nautilus process=nautilus .* read more than 1 MiB$" "$LOG"'
+N=$(read_as reader "$M/docs/small.png" 1)
+ok "B4 any other process reading 1 byte downloads as before" '[ "$N" = 1 ] && [ "$(downloads docs/small.png)" = 1 ] && [ "$(xget "$M/docs/small.png" user.onedrive.state)" = hydrated ]'
+ctl "offline~1"
+T0=$(ms); OUT="$(read_as nautilus "$M/docs/offline.bin" 4096 2>&1)"; T1=$(ms)
+ctl "offline~0"
+ok "B5 offline: a background read fails with EIO at once ($((T1 - T0)) ms), nothing downloaded" 'echo "$OUT" | grep -q "Input/output error" && [ $((T1 - T0)) -lt 3000 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(xget "$M/docs/offline.bin" user.onedrive.state)" = online-only ]'
+sleep 3.2   # no recent lookup of the file by a normal process (the tests' own xattr reads)
+N=$(read_as clamonacc "$M/docs/offline.bin" 100)
+ok "B6 an on-access scanner is a background reader too: served without a download" '[ "$N" = 14 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(ranges docs/offline.bin)" = 1 ]'
+OUT="$(read_as tracker-extract "$M/docs/index.bin" 6291456 2>&1)"
+for i in $(seq 1 30); do grep -q "not downloading ./docs/index.bin for" "$LOG" && break; sleep 0.1; done
+ok "B7 an indexer is never downloaded for: EIO after 4 MiB, still online-only" 'echo "$OUT" | grep -q "Input/output error" && [ "$(downloads docs/index.bin)" = 0 ] && [ ! -e "$B/docs/index.bin" ] && [ "$(xget "$M/docs/index.bin" user.onedrive.state)" = online-only ]'
+ok "B7 logged once with the caller" '[ "$(grep -c "not downloading ./docs/index.bin for pid=[0-9]* thread=tracker-extract process=tracker-extract .*served at most 4 MiB" "$LOG")" = 1 ]'
+# phased <comm> <file> <first bytes> <then offset> <then bytes>: reads, waits for $T/go, then preads again
+phased() {
+	rm -f "$T/go" "$T/phase.out"
+	t python3 -c 'import os, sys, time
+open("/proc/self/comm", "w").write(sys.argv[1])
+fd = os.open(sys.argv[2], os.O_RDONLY)
+first = b""
+while len(first) < int(sys.argv[3]):
+    chunk = os.read(fd, min(131072, int(sys.argv[3]) - len(first)))
+    if not chunk: break
+    first += chunk
+open(sys.argv[6] + ".first", "wb").write(first)
+print("FIRST", len(first), flush=True)
+while not os.path.exists(sys.argv[6] + "/go"): time.sleep(0.05)
+got = b""
+try:
+    pos = int(sys.argv[4])
+    while len(got) < int(sys.argv[5]):
+        chunk = os.pread(fd, min(131072, int(sys.argv[5]) - len(got)), pos + len(got))
+        if not chunk: break
+        got += chunk
+    print("THEN", len(got), flush=True)
+except OSError as e:
+    print("THEN-ERROR", e.errno, len(got), flush=True)
+open(sys.argv[6] + ".then", "wb").write(got)' "$1" "$2" "$3" "$4" "$5" "$T" > "$T/phase.out" 2>&1 &
+	PHASED=$!
+	for i in $(seq 1 100); do grep -q FIRST "$T/phase.out" && break; sleep 0.1; done
+}
+# Scanners during a user's own open read the downloaded file (no 4 MiB limit)
+sleep 1.2   # the kernel's attribute cache of earlier lookups expires
+OUT="$(read_as clamonacc "$M/docs/scan4.bin" 6291456 2>&1)"
+ok "B10 a scanner alone keeps the 4 MiB limit: EIO, nothing downloaded" 'echo "$OUT" | grep -q "Input/output error" && [ "$(downloads docs/scan4.bin)" = 0 ]'
+t python3 -c 'import sys, time; f = open(sys.argv[1], "rb"); print("OPEN", flush=True); time.sleep(4); f.close()' "$M/docs/scan.bin" > "$T/user.out" 2>&1 & USER=$!
+for i in $(seq 1 50); do grep -q OPEN "$T/user.out" && break; sleep 0.1; done
+N=$(read_as clamonacc "$M/docs/scan.bin" 6291456 "$T/scan.out"); wait $USER
+ok "B10 a scanner reading while a user process has the file open: full read from the downloaded file" '[ "$N" = "$(stat -c %s "$R/docs/scan.bin")" ] && cmp -s "$T/scan.out" "$R/docs/scan.bin" && [ "$(downloads docs/scan.bin)" = 1 ] && grep -q "reads ./docs/scan.bin while a user process opens it" "$LOG"'
+t stat "$M/docs/scan2.bin" >/dev/null
+N=$(read_as clamonacc "$M/docs/scan2.bin" 6291456 "$T/scan2.out")
+ok "B11 a scanner reading right after a user process looked the file up: full read, one download" '[ "$N" = "$(stat -c %s "$R/docs/scan2.bin")" ] && cmp -s "$T/scan2.out" "$R/docs/scan2.bin" && [ "$(downloads docs/scan2.bin)" = 1 ]'
+read_as reader "$M/docs/scan3.bin" 1 >/dev/null & READER=$!
+sleep 0.1
+N=$(read_as clamonacc "$M/docs/scan3.bin" 6291456 "$T/scan3.out"); wait $READER
+ok "B12 a scanner joins a download in flight: full read, one download" '[ "$N" = "$(stat -c %s "$R/docs/scan3.bin")" ] && cmp -s "$T/scan3.out" "$R/docs/scan3.bin" && [ "$(downloads docs/scan3.bin)" = 1 ]'
+# Only the item a normal process looked up last, within 1 s, counts as being opened
+sleep 1.2
+t stat "$M/docs/scan5.bin" "$M/docs/scan6.bin" >/dev/null
+read_as clamonacc "$M/docs/scan5.bin" 6291456 > "$T/scan5.n" 2>&1 & S5=$!
+read_as clamonacc "$M/docs/scan6.bin" 6291456 "$T/scan6.out" > "$T/scan6.n" 2>&1 & S6=$!
+wait $S5 $S6
+ok "B13 a bulk stat marks only its last item: the scanner keeps the 4 MiB limit on the earlier one" 'grep -q "Input/output error" "$T/scan5.n" && [ "$(downloads docs/scan5.bin)" = 0 ]'
+ok "B13 and joins the download of the last one" '[ "$(cat "$T/scan6.n")" = "$(stat -c %s "$R/docs/scan6.bin")" ] && cmp -s "$T/scan6.out" "$R/docs/scan6.bin" && [ "$(downloads docs/scan6.bin)" = 1 ]'
+t stat "$M/docs/scan7.bin" >/dev/null
+sleep 1.3
+OUT="$(read_as clamonacc "$M/docs/scan7.bin" 6291456 2>&1)"
+ok "B13 a lookup older than 1 s does not count" 'echo "$OUT" | grep -q "Input/output error" && [ "$(downloads docs/scan7.bin)" = 0 ]'
+# The caller of getattr is looked up in /proc once per thread for a few seconds, not per call
+C0=$(ctl callers >/dev/null; awk '/^CALLERS/{n=$2} END{print n}' "$LOG")
+t python3 -c 'import os, sys
+for i in range(40): os.stat(os.path.join(sys.argv[1], "f%d.txt" % i))' "$M/docs/many"
+C1=$(ctl callers >/dev/null; awk '/^CALLERS/{n=$2} END{print n}' "$LOG")
+ok "B14 40 getattr calls of online-only files by one process: one caller lookup ($((C1 - C0)))" '[ $((C1 - C0)) -ge 1 ] && [ $((C1 - C0)) -le 2 ]'
+cp "$R/docs/ver.bin" "$T/ver.v1"
+phased nautilus "$M/docs/ver.bin" 4096 1572864 4096
+ctl "newversion~f-ver~docs%ver.bin"
+touch "$T/go"; wait $PHASED
+ok "B8 the item changes online between two reads of one handle: EIO, versions never mixed" 'grep -q "^THEN-ERROR 5 0" "$T/phase.out" && cmp -s "$T.first" <(head -c 4096 "$T/ver.v1")'
+N=$(read_as nautilus "$M/docs/ver.bin" 4096 "$T/ver.head")
+ok "B8 a new handle reads the new version" '[ "$N" = 4096 ] && cmp -s "$T/ver.head" <(head -c 4096 "$R/docs/ver.bin") && [ "$(downloads docs/ver.bin)" = 0 ]'
+cp "$R/docs/ver2.bin" "$T/ver2.v1"
+phased nautilus "$M/docs/ver2.bin" 524288 524288 1572864
+ctl "newremote~f-ver2~docs%ver2.bin"
+touch "$T/go"; wait $PHASED
+ok "B9 the online file changes before the copy escalates: EIO, nothing of the new version is served" 'grep -q "^THEN-ERROR 5" "$T/phase.out" && cmp -s "$T.first" <(head -c 524288 "$T/ver2.v1") && cmp -s "$T.then" <(tail -c +524289 "$T/ver2.v1" | head -c $(stat -c %s "$T.then"))'
+
+
 echo "== stop"
 # F5 R1: stop with replays queued and in flight whose files are gone again
 ctl "touchdelay~20"
@@ -497,7 +614,7 @@ ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand:stagi
 echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|hydrating|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|PHYSICAL|CALLERS|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|hydrating|range|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"

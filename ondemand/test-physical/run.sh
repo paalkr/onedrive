@@ -18,7 +18,7 @@ if [ $# -ge 3 ]; then
 else
 	[ -f version ] && [ -d src ] || { echo "run from the repository root after make (needs ./version and src/)"; exit 2; }
 	H="$T/build"; mkdir -p "$H"
-	for helper in mkdb stagingtest guardtest freetest; do
+	for helper in mkdb stagingtest guardtest freetest rangetest; do
 		extra=; [ "$helper" = guardtest ] && extra=src/sync.d
 		ldc2 -w -i -J . -I src -od="$H/obj-$helper" -of="$H/$helper" "ondemand/test-physical/$helper.d" $extra \
 			$(pkg-config --libs-only-l libcurl sqlite3 dbus-1 | sed 's/-l/-L-l/g') -L-ldl || { echo "building $helper failed"; exit 2; }
@@ -162,6 +162,12 @@ echo "== free and on-access scanners (HydrationService)"
 grep -oE "(PASS|FAIL) .*" "$T/free.out" > "$T/free.res"
 grep -q "freetest done" "$T/free.out" || echo "FAIL freetest did not finish" >> "$T/free.res"
 while read -r line; do echo "$line"; case "$line" in PASS*) PASS=$((PASS+1));; FAIL*) FAIL=$((FAIL+1));; esac; done < "$T/free.res"
+
+echo "== ranged reads for background readers (HydrationService, local HTTP server)"
+"$H/rangetest" "$T/range" > "$T/range.out" 2>&1
+grep -oE "(PASS|FAIL) .*" "$T/range.out" > "$T/range.res"
+grep -q "rangetest done" "$T/range.out" || echo "FAIL rangetest did not finish" >> "$T/range.res"
+while read -r line; do echo "$line"; case "$line" in PASS*) PASS=$((PASS+1));; FAIL*) FAIL=$((FAIL+1));; esac; done < "$T/range.res"
 
 echo "== crash between staging and rename"
 "$H/stagingtest" "$T/staging" | grep -E "^(PASS|FAIL)" > "$T/staging.out"

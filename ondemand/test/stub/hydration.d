@@ -148,6 +148,100 @@ final class HydrationService
 		}
 	}
 
+	/* Ranged reads (as the real service): 128 KiB blocks fetched from the fake remote file and
+	   cached per item and content version, so concurrent readers share them; each fetch is logged
+	   as "STUB range". The online version is "q:" + contentHash of the fake remote file: a request
+	   for another version or size fails with EIO, as the real service does when the database is
+	   behind. rangeOffline makes every fetch fail (EIO), as the real service does offline. */
+	__gshared bool rangeOffline;
+	__gshared uint rangeDelayMsecs = 200;
+	private enum size_t rangeBlock = 128 * 1024;
+	private ubyte[][size_t][string] rangeBlocks;
+	private string[string] rangeBlockVersion;
+	private Mutex rangeLock;
+
+	static string contentVersionOf(const ref Item item)
+	{
+		if (item.quickXorHash.length) return "q:" ~ item.quickXorHash;
+		if (item.sha256Hash.length) return "s:" ~ item.sha256Hash;
+		if (item.cTag.length) return "c:" ~ item.cTag;
+		return "e:" ~ item.eTag;
+	}
+
+	bool isHydrating(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		return (key(driveId, id) in inFlight) !is null;
+	}
+
+	ubyte[] readRange(string driveId, string id, string contentVersion, long expectedSize, ulong offset, size_t length, ulong reader)
+	{
+		if (rangeLock is null) synchronized (this) if (rangeLock is null) rangeLock = new Mutex();
+		auto k = key(driveId, id);
+		string source;
+		{
+			lock.lock();
+			scope(exit) lock.unlock();
+			auto remote = k in remotePaths;
+			if (remote is null)
+				throw new HydrationError(errno.EIO, "no fake remote file for " ~ id);
+			source = buildPath(fakeRemoteDir, *remote);
+		}
+		rangeLock.lock();
+		scope(exit) rangeLock.unlock();
+		if (rangeOffline)
+		{
+			stubLog("STUB range offline ", itemDB.computePath(driveId, id));
+			throw new HydrationError(errno.EIO, "offline");
+		}
+		if (!exists(source))
+			throw new HydrationError(errno.ENOENT, "gone online");
+		if (rangeBlockVersion.get(k, null) != contentVersion)
+		{
+			rangeBlocks.remove(k);
+			rangeBlockVersion[k] = contentVersion;
+		}
+		if (length == 0 || expectedSize <= 0 || offset >= cast(ulong) expectedSize) return [];
+		ulong end = offset + length > cast(ulong) expectedSize ? expectedSize : offset + length;
+		size_t first = cast(size_t) (offset / rangeBlock), last = cast(size_t) ((end - 1) / rangeBlock);
+		auto blocks = k in rangeBlocks;
+		size_t missingFrom = size_t.max, missingTo;
+		foreach (b; first .. last + 1)
+			if (blocks is null || (b !in *blocks)) { if (missingFrom == size_t.max) missingFrom = b; missingTo = b; }
+		if (missingFrom != size_t.max)
+		{
+			// One read of the fake remote file: the version check and the served bytes are the same content
+			if (rangeDelayMsecs) Thread.sleep(dur!"msecs"(rangeDelayMsecs));
+			auto content = cast(ubyte[]) std.file.read(source);
+			import std.digest.sha : sha1Of;
+			import std.digest : toHexString;
+			if ("q:" ~ toHexString(sha1Of(content)).idup != contentVersion || cast(long) content.length != expectedSize)
+			{
+				stubLog("STUB range version mismatch ", itemDB.computePath(driveId, id));
+				throw new HydrationError(errno.EIO, "the online file is another version");
+			}
+			stubLog("STUB range ", itemDB.computePath(driveId, id), " ", missingFrom * rangeBlock, " ", (missingTo - missingFrom + 1) * rangeBlock);
+			if (k !in rangeBlocks) rangeBlocks[k] = null;
+			foreach (b; missingFrom .. missingTo + 1)
+			{
+				size_t from = b * rangeBlock;
+				size_t to = from + rangeBlock > content.length ? content.length : from + rangeBlock;
+				if (from <= to) rangeBlocks[k][b] = content[from .. to].dup;
+			}
+		}
+		ubyte[] result;
+		foreach (b; first .. last + 1)
+		{
+			auto data = rangeBlocks[k][b];
+			ulong blockStart = cast(ulong) b * rangeBlock;
+			size_t from = cast(size_t) (offset > blockStart ? offset - blockStart : 0);
+			size_t to = cast(size_t) (end - blockStart < data.length ? end - blockStart : data.length);
+			if (from < to) result ~= data[from .. to];
+		}
+		return result;
+	}
+
 	void setStateForTest(string driveId, string id, string remotePath, HydrationState state)
 	{
 		lock.lock();

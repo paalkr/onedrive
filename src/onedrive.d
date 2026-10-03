@@ -1894,6 +1894,103 @@ class OneDriveApi {
 		return get(websocketEndpoint);
 	}
 
+	// On-demand ranged reads: the item with its short-lived, pre-authenticated download URL
+	// (@microsoft.graph.downloadUrl, returned for files on a plain item GET)
+	JSONValue getDownloadUrlById(string driveId, string id) {
+		return get(driveByIdUrl ~ driveId ~ "/items/" ~ id);
+	}
+
+	// On-demand ranged reads: bytes [offset, offset + length) from a pre-authenticated download URL
+	// with an HTTP Range request. One attempt and no retry loop, because the caller is a FUSE read
+	// that must fail fast; no Authorization header (the URL carries its own authorisation).
+	// - At most 'length' bytes are received: a server that ignores Range (200) is cut off once the
+	//   requested range has arrived, so it can never buffer a whole large file.
+	// - 'timeout' limits the whole request; the transfer abort flag (setTransferAbortFlag) aborts it.
+	// - A 206 must start at 'offset' (Content-Range), otherwise OneDriveException 502.
+	// - 'total' is the size of the resource the server answered from (the total of Content-Range, or
+	//   the Content-Length of a 200 without Content-Encoding), -1 if not given; 'etag' is the
+	//   response's ETag header, if any.
+	// Returns fewer bytes at the end of the file and none past it (416). Any other status throws
+	// OneDriveException (401/403/410: the URL has expired). Network failures throw CurlException.
+	ubyte[] downloadRangeByUrl(string downloadUrl, ulong offset, size_t length, Duration timeout, out long total, out string etag) {
+		total = -1;
+		if (length == 0) return [];
+		ulong end = offset + length;
+		ubyte[] body;
+		ulong position;        // of the next received byte within the resource
+		bool partial;
+		bool complete;
+		curlEngine.setResponseHolder(null);
+		curlEngine.addRequestHeader("Range", format("bytes=%d-%d", offset, end - 1));
+		curlEngine.connect(HTTP.Method.get, downloadUrl);
+		auto http = &curlEngine.http();
+		Duration savedTimeout = dur!"seconds"(appConfig.getValueLong("operation_timeout"));
+		scope(exit) {
+			http.operationTimeout = savedTimeout;
+			http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) { return 0; };
+			curlEngine.cleanup();
+		}
+		http.operationTimeout = timeout;
+		if (transferAbortFlag !is null) {
+			http.onProgress = delegate int(size_t dltotal, size_t dlnow, size_t ultotal, size_t ulnow) {
+				return transferAbortRequested() ? 1 : 0;
+			};
+		}
+		http.onReceiveStatusLine = (HTTP.StatusLine statusLine) {
+			partial = (statusLine.code == 206);
+			position = partial ? offset : 0;
+			body = null;
+		};
+		http.onReceive = (ubyte[] data) {
+			// Keep only [offset, end) of the resource; stop the transfer once it has all arrived
+			ulong chunkStart = position;
+			position += data.length;
+			ulong from = (chunkStart < offset) ? offset - chunkStart : 0;
+			ulong to = (position > end) ? end - chunkStart : data.length;
+			if ((from < data.length) && (from < to)) body ~= data[cast(size_t) from .. cast(size_t) to];
+			if (position >= end) {
+				complete = true;
+				return 0;   // aborts the transfer (CURLE_WRITE_ERROR), the range is complete
+			}
+			return data.length;
+		};
+		try {
+			http.perform();
+		} catch (CurlException e) {
+			if (!complete) throw e;
+		}
+		CurlResponse response = curlEngine.response;
+		response.update(http);
+		int code = response.statusLine.code;
+		if (auto tag = "etag" in response.responseHeaders) etag = *tag;
+		if (code == 206) {
+			auto contentRange = "content-range" in response.responseHeaders;
+			ulong start;
+			bool valid = false;
+			if (contentRange !is null) {
+				import std.regex : matchFirst;
+				auto m = matchFirst(*contentRange, `^bytes (\d+)-(\d+)/(\d+|\*)`);
+				if (!m.empty) {
+					start = to!ulong(m[1]);
+					if (m[3] != "*") total = to!long(m[3]);
+					valid = true;
+				}
+			}
+			if (!valid || (start != offset)) throw new OneDriveException(502, "ranged download returned another range than requested", response);
+			return body;
+		}
+		if (code == 200) {
+			// The Content-Length of an encoded (compressed) body is not the size of the file
+			auto contentLength = ("content-encoding" in response.responseHeaders) ? null : ("content-length" in response.responseHeaders);
+			if (contentLength !is null) {
+				try total = to!long(*contentLength); catch (ConvException e) total = -1;
+			}
+			return body;
+		}
+		if (code == 416) return [];
+		throw new OneDriveException(code, "ranged download failed", response);
+	}
+
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_get_content
 	CurlResponse downloadById(const(char)[] driveId, const(char)[] itemId, string saveToPath, long fileSize, JSONValue onlineHash, long resumeOffset = 0, bool delegate(DownloadCommitInfo) inspectDownloadBeforeCommit = null) {
 		// Set this function name

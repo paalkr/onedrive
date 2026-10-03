@@ -78,6 +78,11 @@ void main(string[] args)
 		std.file.write(buildPath(remote, rel), content);
 		import std.path : baseName;
 		add(id, parent, baseName(rel), ItemType.file, content.length.to!string);
+		// The online content hash, as the delta records it for an online-only item
+		Item seeded;
+		db.selectById(driveId, id, seeded);
+		seeded.quickXorHash = HydrationService.contentHash(buildPath(remote, rel));
+		db.update(seeded);
 		svc.setStateForTest(driveId, id, rel, HydrationState.onlineOnly);
 	}
 
@@ -96,6 +101,38 @@ void main(string[] args)
 	onlineFile("f-write", "root", "write-me.txt", "0123456789\n");
 	onlineFile("f-trunc0", "d-docs", "docs/trunc0.txt", "old content for truncate -s 0\n");
 	onlineFile("f-who", "d-docs", "docs/who.txt", "who reads me\n");
+	// Ranged reads by background readers: a 3 MiB file and a small one
+	{
+		import std.format : format;
+		string large;
+		foreach (i; 0 .. 3 * 1024 * 16) large ~= format("%063d\n", i);
+		onlineFile("f-large", "d-docs", "docs/large.bin", large);
+	}
+	onlineFile("f-small", "d-docs", "docs/small.png", "\x89PNG small picture\n");
+	onlineFile("f-off", "d-docs", "docs/offline.bin", "not reachable\n");
+	// A folder of small online-only files, for the caller cache
+	add("d-many", "d-docs", "many", ItemType.dir);
+	mkdirRecurse(buildPath(remote, "docs/many"));
+	mkdirRecurse(buildPath(backing, "docs/many"));
+	foreach (i; 0 .. 40) onlineFile("f-many" ~ i.to!string, "d-many", "docs/many/f" ~ i.to!string ~ ".txt", "small " ~ i.to!string ~ "\n");
+	{
+		import std.format : format;
+		string make(size_t mib, string tag) {
+			string content;
+			foreach (i; 0 .. mib * 1024 * 16) content ~= format("%s%058d\n", tag, i);
+			return content;
+		}
+		onlineFile("f-index", "d-docs", "docs/index.bin", make(6, "idx-"));
+		onlineFile("f-ver", "d-docs", "docs/ver.bin", make(2, "ver-"));
+		onlineFile("f-ver2", "d-docs", "docs/ver2.bin", make(2, "vr2-"));
+		onlineFile("f-scan", "d-docs", "docs/scan.bin", make(6, "sc1-"));
+		onlineFile("f-scan2", "d-docs", "docs/scan2.bin", make(6, "sc2-"));
+		onlineFile("f-scan3", "d-docs", "docs/scan3.bin", make(6, "sc3-"));
+		onlineFile("f-scan4", "d-docs", "docs/scan4.bin", make(6, "sc4-"));
+		onlineFile("f-scan5", "d-docs", "docs/scan5.bin", make(6, "sc5-"));
+		onlineFile("f-scan6", "d-docs", "docs/scan6.bin", make(6, "sc6-"));
+		onlineFile("f-scan7", "d-docs", "docs/scan7.bin", make(6, "sc7-"));
+	}
 	// V3: a directory whose only child is online-only, and files to rename over
 	add("d-target", "d-docs", "target", ItemType.dir);
 	onlineFile("f-target", "d-target", "docs/target/t.txt", "only child\n");
@@ -251,6 +288,27 @@ void main(string[] args)
 					writeln("EXP ", parts[1], " ", p, " parent=", parentIno, " ino=", ino, " rc=", rc);
 				}
 				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!TransientState);
+				// callers: how many callers the mount looked up in /proc so far
+				if (parts[0] == "callers") writeln("CALLERS ", onDemandCallerLookupsForTest());
+				// offline~1 / offline~0: ranged reads fail as when Microsoft OneDrive is not reachable
+				if (parts[0] == "offline") HydrationService.rangeOffline = parts[1] == "1";
+				// newversion~<id>~<path> / newremote~<id>~<path>: the online file gets new content of the
+				// same size (paths use % for /); newversion also records it in the database (a delta),
+				// newremote leaves the database behind
+				if (parts[0] == "newversion" || parts[0] == "newremote") {
+					import std.array : replace;
+					string remoteFile = buildPath(remote, parts[2].replace("%", "/"));
+					auto bytes = cast(ubyte[]) std.file.read(remoteFile);
+					foreach (ref b; bytes) b = cast(ubyte) (b ^ 0x5a);
+					std.file.write(remoteFile, bytes);
+					if (parts[0] == "newversion") {
+						Item changed;
+						db.selectById(driveId, parts[1], changed);
+						changed.quickXorHash = HydrationService.contentHash(remoteFile);
+						changed.eTag = changed.eTag ~ "+";
+						db.update(changed);
+					}
+				}
 				remove(entry.name);
 				writeln("CTL ", baseName(entry.name));
 			}
