@@ -1040,6 +1040,8 @@ final class HydrationService {
 			if (entry.responseEtag.empty) {
 				entry.responseEtag = etag;
 			} else if (etag != entry.responseEtag) {
+				// Logged with both values, to see on real accounts whether the download host's ETag is stable per version
+				if (!isShuttingDown()) addLogEntry("On-demand: the download URL of " ~ itemDB.computePath(driveId, id) ~ " answered with ETag " ~ etag ~ " after " ~ entry.responseEtag ~ " for the same version; failing that read");
 				dropRangeBlocks(entry);
 				entry.url = null;
 				throw new RangeFetchError(409, "The download URL served another version (ETag changed)");

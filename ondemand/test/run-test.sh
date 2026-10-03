@@ -20,7 +20,7 @@ cleanup() {
 trap cleanup EXIT
 
 # 300 ms artificial download delay so concurrent readers overlap
-timeout 120 "$BIN" "$W" "$M" 300 > "$LOG" 2>&1 &
+timeout 300 "$BIN" "$W" "$M" 300 > "$LOG" 2>&1 &
 PID=$!
 for i in $(seq 1 50); do grep -q READY "$LOG" && break; sleep 0.1; done
 grep -q READY "$LOG" || { echo "not ready"; cat "$LOG"; exit 1; }
@@ -553,6 +553,24 @@ read_as reader "$M/docs/scan3.bin" 1 >/dev/null & READER=$!
 sleep 0.1
 N=$(read_as clamonacc "$M/docs/scan3.bin" 6291456 "$T/scan3.out"); wait $READER
 ok "B12 a scanner joins a download in flight: full read, one download" '[ "$N" = "$(stat -c %s "$R/docs/scan3.bin")" ] && cmp -s "$T/scan3.out" "$R/docs/scan3.bin" && [ "$(downloads docs/scan3.bin)" = 1 ]'
+# Only the item a normal process looked up last, within 1 s, counts as being opened
+sleep 1.2
+t stat "$M/docs/scan5.bin" "$M/docs/scan6.bin" >/dev/null
+read_as clamonacc "$M/docs/scan5.bin" 6291456 > "$T/scan5.n" 2>&1 & S5=$!
+read_as clamonacc "$M/docs/scan6.bin" 6291456 "$T/scan6.out" > "$T/scan6.n" 2>&1 & S6=$!
+wait $S5 $S6
+ok "B13 a bulk stat marks only its last item: the scanner keeps the 4 MiB limit on the earlier one" 'grep -q "Input/output error" "$T/scan5.n" && [ "$(downloads docs/scan5.bin)" = 0 ]'
+ok "B13 and joins the download of the last one" '[ "$(cat "$T/scan6.n")" = "$(stat -c %s "$R/docs/scan6.bin")" ] && cmp -s "$T/scan6.out" "$R/docs/scan6.bin" && [ "$(downloads docs/scan6.bin)" = 1 ]'
+t stat "$M/docs/scan7.bin" >/dev/null
+sleep 1.3
+OUT="$(read_as clamonacc "$M/docs/scan7.bin" 6291456 2>&1)"
+ok "B13 a lookup older than 1 s does not count" 'echo "$OUT" | grep -q "Input/output error" && [ "$(downloads docs/scan7.bin)" = 0 ]'
+# The caller of getattr is looked up in /proc once per thread for a few seconds, not per call
+C0=$(ctl callers >/dev/null; awk '/^CALLERS/{n=$2} END{print n}' "$LOG")
+t python3 -c 'import os, sys
+for i in range(40): os.stat(os.path.join(sys.argv[1], "f%d.txt" % i))' "$M/docs/many"
+C1=$(ctl callers >/dev/null; awk '/^CALLERS/{n=$2} END{print n}' "$LOG")
+ok "B14 40 getattr calls of online-only files by one process: one caller lookup ($((C1 - C0)))" '[ $((C1 - C0)) -ge 1 ] && [ $((C1 - C0)) -le 2 ]'
 cp "$R/docs/ver.bin" "$T/ver.v1"
 phased nautilus "$M/docs/ver.bin" 4096 1572864 4096
 ctl "newversion~f-ver~docs%ver.bin"
@@ -596,7 +614,7 @@ ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand:stagi
 echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|hydrating|range|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|PHYSICAL|CALLERS|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|hydrating|range|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"

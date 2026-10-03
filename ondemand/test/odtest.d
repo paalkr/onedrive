@@ -110,6 +110,11 @@ void main(string[] args)
 	}
 	onlineFile("f-small", "d-docs", "docs/small.png", "\x89PNG small picture\n");
 	onlineFile("f-off", "d-docs", "docs/offline.bin", "not reachable\n");
+	// A folder of small online-only files, for the caller cache
+	add("d-many", "d-docs", "many", ItemType.dir);
+	mkdirRecurse(buildPath(remote, "docs/many"));
+	mkdirRecurse(buildPath(backing, "docs/many"));
+	foreach (i; 0 .. 40) onlineFile("f-many" ~ i.to!string, "d-many", "docs/many/f" ~ i.to!string ~ ".txt", "small " ~ i.to!string ~ "\n");
 	{
 		import std.format : format;
 		string make(size_t mib, string tag) {
@@ -124,6 +129,9 @@ void main(string[] args)
 		onlineFile("f-scan2", "d-docs", "docs/scan2.bin", make(6, "sc2-"));
 		onlineFile("f-scan3", "d-docs", "docs/scan3.bin", make(6, "sc3-"));
 		onlineFile("f-scan4", "d-docs", "docs/scan4.bin", make(6, "sc4-"));
+		onlineFile("f-scan5", "d-docs", "docs/scan5.bin", make(6, "sc5-"));
+		onlineFile("f-scan6", "d-docs", "docs/scan6.bin", make(6, "sc6-"));
+		onlineFile("f-scan7", "d-docs", "docs/scan7.bin", make(6, "sc7-"));
 	}
 	// V3: a directory whose only child is online-only, and files to rename over
 	add("d-target", "d-docs", "target", ItemType.dir);
@@ -280,6 +288,8 @@ void main(string[] args)
 					writeln("EXP ", parts[1], " ", p, " parent=", parentIno, " ino=", ino, " rc=", rc);
 				}
 				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!TransientState);
+				// callers: how many callers the mount looked up in /proc so far
+				if (parts[0] == "callers") writeln("CALLERS ", onDemandCallerLookupsForTest());
 				// offline~1 / offline~0: ranged reads fail as when Microsoft OneDrive is not reachable
 				if (parts[0] == "offline") HydrationService.rangeOffline = parts[1] == "1";
 				// newversion~<id>~<path> / newremote~<id>~<path>: the online file gets new content of the

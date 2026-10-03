@@ -1908,7 +1908,8 @@ class OneDriveApi {
 	// - 'timeout' limits the whole request; the transfer abort flag (setTransferAbortFlag) aborts it.
 	// - A 206 must start at 'offset' (Content-Range), otherwise OneDriveException 502.
 	// - 'total' is the size of the resource the server answered from (the total of Content-Range, or
-	//   the Content-Length of a 200), -1 if not given; 'etag' is the response's ETag header, if any.
+	//   the Content-Length of a 200 without Content-Encoding), -1 if not given; 'etag' is the
+	//   response's ETag header, if any.
 	// Returns fewer bytes at the end of the file and none past it (416). Any other status throws
 	// OneDriveException (401/403/410: the URL has expired). Network failures throw CurlException.
 	ubyte[] downloadRangeByUrl(string downloadUrl, ulong offset, size_t length, Duration timeout, out long total, out string etag) {
@@ -1979,7 +1980,9 @@ class OneDriveApi {
 			return body;
 		}
 		if (code == 200) {
-			if (auto contentLength = "content-length" in response.responseHeaders) {
+			// The Content-Length of an encoded (compressed) body is not the size of the file
+			auto contentLength = ("content-encoding" in response.responseHeaders) ? null : ("content-length" in response.responseHeaders);
+			if (contentLength !is null) {
 				try total = to!long(*contentLength); catch (ConvException e) total = -1;
 			}
 			return body;

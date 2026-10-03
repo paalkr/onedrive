@@ -125,9 +125,11 @@ private final class Handle
 	bool scannerJoinLogged;
 }
 
-// A scanner reading an online-only file that a user process is opening (a recent lookup or open)
-// reads the downloaded file instead of ranges: fanotify scanners read during the user's open
-private enum Duration deliberateAccessWindow = dur!"seconds"(3);
+// A scanner reading an online-only file that a user process is opening reads the downloaded file
+// instead of ranges: fanotify scanners read during the user's open. The opening signal is the item a
+// normal process looked up last (one per process thread), within this window; a bulk stat (ls -l,
+// find, a backup scan) thus marks only its last item
+private enum Duration deliberateAccessWindow = dur!"seconds"(1);
 
 // A file manager that has read more than this from one handle (a copy or move) gets the file downloaded
 private enum ulong fileManagerRangedLimit = 1024 * 1024;
@@ -183,15 +185,55 @@ private struct Caller {
 	}
 }
 
+// Callers looked up in /proc, per thread id, reused for callerCacheTtl: getattr of online-only
+// files and every open look the caller up, and a folder listing makes many such requests
+private enum Duration callerCacheTtl = dur!"seconds"(3);
+private struct CachedCaller { Caller caller; MonoTime at; }
+private __gshared CachedCaller[int] callerCache;
+private __gshared Mutex callerCacheLock;
+private __gshared ulong callerLookups;   // /proc lookups made (tests)
+
+// Created on first use: a module constructor here would form a cycle with hydration's
+private Mutex callerCacheMutex() {
+	import std.concurrency : initOnce;
+	return initOnce!callerCacheLock(new Mutex());
+}
+
+// Test hook: how many callers were looked up in /proc (not served from the cache)
+ulong onDemandCallerLookupsForTest() {
+	synchronized (callerCacheMutex()) return callerLookups;
+}
+
 private Caller currentCaller() {
 	import c.fuse.fuse : fuse_get_context;
-	import std.file : readLink, readText;
-	import std.string : strip, splitLines, startsWith;
 	Caller caller;
 	auto context = fuse_get_context();
 	if (context is null || context.pid <= 0) return caller;
-	caller.pid = context.pid;
-	string proc = "/proc/" ~ to!string(context.pid);
+	auto now = MonoTime.currTime;
+	synchronized (callerCacheMutex()) {
+		if (auto cached = context.pid in callerCache)
+			if (now - cached.at <= callerCacheTtl) return cached.caller;
+	}
+	caller = lookUpCaller(context.pid);
+	synchronized (callerCacheMutex()) {
+		callerLookups++;
+		if (callerCache.length > 4096) {
+			int[] expired;
+			foreach (pid, cached; callerCache) if (now - cached.at > callerCacheTtl) expired ~= pid;
+			foreach (pid; expired) callerCache.remove(pid);
+			if (callerCache.length > 4096) callerCache = null;
+		}
+		callerCache[context.pid] = CachedCaller(caller, now);
+	}
+	return caller;
+}
+
+private Caller lookUpCaller(int pid) {
+	import std.file : readLink, readText;
+	import std.string : strip, splitLines, startsWith;
+	Caller caller;
+	caller.pid = pid;
+	string proc = "/proc/" ~ to!string(pid);
 	try caller.threadComm = readText(proc ~ "/comm").strip; catch (Exception e) {}
 	string tgid, ppid;
 	try {
@@ -268,8 +310,9 @@ final class OnDemandFs : Operations
 	private MonoTime[string] rangedServeLogged;
 	// Paths for which a background service or scanner hit backgroundRangedLimit (logged once)
 	private bool[string] backgroundLimitLogged;
-	// When a normal process last looked up an online-only item (guarded by handleLock)
-	private MonoTime[string] deliberateAccess;
+	// The online-only item each normal process thread looked up last, and when (guarded by handleLock)
+	private struct DeliberateAccess { string key; MonoTime at; }
+	private DeliberateAccess[int] deliberateAccess;
 
 	// Reporting changes made behind the mount's back (notifyBackingChange)
 	private BackgroundFuse mount;
@@ -985,20 +1028,28 @@ final class OnDemandFs : Operations
 		try {
 			if (hydration.isHydrating(item.driveId, item.id)) return true;
 		} catch (HydrationError e) {}
+		string key = itemKey(item);
+		auto now = MonoTime.currTime;
 		synchronized (handleLock) {
-			if (auto at = itemKey(item) in deliberateAccess) return MonoTime.currTime - *at <= deliberateAccessWindow;
+			foreach (access; deliberateAccess)
+				if ((access.key == key) && (now - access.at <= deliberateAccessWindow)) return true;
 		}
 		return false;
 	}
 
-	// getattr/lookup of an online-only file by a normal process (not a background reader, scanner,
-	// thumbnailer or the touch thread): remembered for deliberateInterest
+	// getattr/lookup of an online-only file by a normal process (not a file manager, background
+	// service, scanner, thumbnailer or the touch thread): its last looked-up item, for deliberateInterest
 	private void noteDeliberateAccess(const ref Item item) {
 		Caller caller = currentCaller();
 		if ((caller.pid <= 0) || (readerClassOf(caller) != ReaderClass.normal) || (callerName(caller, thumbnailerNames) !is null)) return;
+		auto now = MonoTime.currTime;
 		synchronized (handleLock) {
-			if (deliberateAccess.length > 10_000) deliberateAccess = null;
-			deliberateAccess[itemKey(item)] = MonoTime.currTime;
+			if (deliberateAccess.length > 1024) {
+				int[] expired;
+				foreach (pid, access; deliberateAccess) if (now - access.at > deliberateAccessWindow) expired ~= pid;
+				foreach (pid; expired) deliberateAccess.remove(pid);
+			}
+			deliberateAccess[caller.pid] = DeliberateAccess(itemKey(item), now);
 		}
 	}
 
