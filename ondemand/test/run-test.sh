@@ -257,6 +257,10 @@ ok "R5 thumbnailer by exe with comm changed to reader: EIO" '! t "$T/bin/evince-
 ok "R5 nothing downloaded for thumbnailers" '[ "$(downloads thumb.jpg)" = 0 ] && [ ! -e "$B/thumb.jpg" ]'
 # The client log is written by a logger thread; wait for it
 for i in $(seq 1 30); do grep -q "not downloading ./thumb.jpg" "$LOG" && break; sleep 0.1; done
+ok "R5 thumbnailer refusal logs the caller identity" 'grep -qE "not downloading ./thumb.jpg for thumbnailer gdk-pixbuf-thum \(pid=[0-9]+ thread=gdk-pixbuf-thum process=gdk-pixbuf-thum exe=[^ ]+ parent=[^ )]+\)" "$LOG"'
+echo "== caller identity of a hydration"
+t python3 -c 'import sys; open("/proc/self/comm", "w").write("who-reader"); open(sys.argv[1]).read()' "$M/docs/who.txt"
+ok "a hydration logs who asked: pid, thread, process, exe and parent" 'grep -qE "^STUB hydrating docs/who.txt requested by pid=[0-9]+ thread=who-reader process=who-reader exe=python3[^ ]* parent=[^ ]+$" "$LOG"'
 sleep 0.5
 ok "R5 one log line per item" '[ "$(grep -c "not downloading ./thumb.jpg for thumbnailer" "$LOG")" = 1 ]'
 grep "not downloading ./thumb.jpg" "$LOG" | sed "s/^/   /"
@@ -493,7 +497,7 @@ ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand:stagi
 echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|hydrating|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"

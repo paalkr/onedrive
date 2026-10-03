@@ -704,8 +704,9 @@ final class HydrationService {
 
 	// Blocks until the file is in the backing dir with a verified hash, the backing mtime set
 	// from the DB, and DB state H (or P if pinned). Concurrent calls for the same item wait on
-	// the one download.
-	void hydrate(string driveId, string id) {
+	// the one download. 'requestedBy' (who asked, e.g. the process behind a FUSE read) is added to
+	// the "hydrating" log line.
+	void hydrate(string driveId, string id, string requestedBy = null) {
 		string key = driveId ~ "/" ~ id;
 		HydrationInFlight entry;
 		bool owner = false;
@@ -743,7 +744,7 @@ final class HydrationService {
 			int errnoCode = 0;
 			string message;
 			try {
-				performHydrate(driveId, id);
+				performHydrate(driveId, id, requestedBy);
 			} catch (HydrationError e) {
 				errnoCode = e.errnoCode;
 				message = e.msg;
@@ -1217,12 +1218,12 @@ final class HydrationService {
 		serviceCondition.notifyAll();
 	}
 
-	private void performHydrate(string driveId, string id) {
+	private void performHydrate(string driveId, string id, string requestedBy) {
 		setTransientState(driveId, id, TransientState.syncing);
 		try {
 			// A concurrent online change can alter the item while it downloads; retry a bounded number of times
 			foreach (attempt; 0 .. 3) {
-				if (performHydrateAttempt(driveId, id)) {
+				if (performHydrateAttempt(driveId, id, requestedBy)) {
 					setTransientState(driveId, id, TransientState.none);
 					return;
 				}
@@ -1366,7 +1367,7 @@ final class HydrationService {
 	}
 
 	// Returns false when the database item changed during the download and the attempt should be repeated
-	private bool performHydrateAttempt(string driveId, string id) {
+	private bool performHydrateAttempt(string driveId, string id, string requestedBy) {
 		Item dbItem;
 		string backingPath;
 		if (!enterDatabase()) throw new HydrationError(EIO, "Hydration service is shutting down");
@@ -1480,7 +1481,7 @@ final class HydrationService {
 			return true;
 		};
 
-		addLogEntry("On-demand: hydrating " ~ backingPath);
+		addLogEntry("On-demand: hydrating " ~ backingPath ~ (requestedBy.empty ? "" : " (requested by " ~ requestedBy ~ ")"));
 		// D-Bus status: this hydration is in progress
 		string statusPath = relativePath(backingPath, backingDir);
 		statusTransferBegin(statusPath, "hydrate", fileSize);
