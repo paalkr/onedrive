@@ -120,6 +120,7 @@ final class HydrationService
 	private bool stopping;
 	private uint[string] downloads;
 	private uint[string] openCount;
+	private uint[string] scannerCount;   // of openCount, the handles of on-access scanners
 	private TransientState[string] transient;
 	private bool[string] deferred;
 	__gshared uint webUrlDelayMsecs;
@@ -331,15 +332,16 @@ final class HydrationService
 
 	/* Open handles through the mount (engine R1): cheap, never throw; while
 	   an item is open dehydrate() and a single-file free throw EBUSY */
-	void noteOpen(string driveId, string id)
+	void noteOpen(string driveId, string id, bool onAccessScanner = false)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
 		openCount[key(driveId, id)] = openCount.get(key(driveId, id), 0) + 1;
-		stubLog("STUB noteOpen ", id, " ", openCount[key(driveId, id)]);
+		if (onAccessScanner) scannerCount[key(driveId, id)] = scannerCount.get(key(driveId, id), 0) + 1;
+		stubLog("STUB noteOpen ", id, " ", openCount[key(driveId, id)], onAccessScanner ? " scanner" : "");
 	}
 
-	void noteClose(string driveId, string id)
+	void noteClose(string driveId, string id, bool onAccessScanner = false)
 	{
 		lock.lock();
 		scope(exit) lock.unlock();
@@ -349,7 +351,8 @@ final class HydrationService
 			stubLog("STUB noteClose UNBALANCED ", id);
 			return;
 		}
-		if (--openCount[k] == 0) openCount.remove(k);
+		if (onAccessScanner && scannerCount.get(k, 0) > 0 && --scannerCount[k] == 0) scannerCount.remove(k);
+		if (--openCount[k] == 0) { openCount.remove(k); scannerCount.remove(k); }
 		bool changeFirst;
 		string rel = "./" ~ itemDB.computePath(driveId, id);
 		synchronized (historyLock) changeFirst = (rel in pushedPaths) !is null;
@@ -367,6 +370,29 @@ final class HydrationService
 		lock.lock();
 		scope(exit) lock.unlock();
 		return openCount.get(key(driveId, id), 0) > 0;
+	}
+
+	/* As the real service: a free waits up to 5 s while only on-access scanners hold the file */
+	private bool openOnlyByScanners(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		auto k = key(driveId, id);
+		return openCount.get(k, 0) > 0 && scannerCount.get(k, 0) >= openCount[k];
+	}
+
+	private void waitForScanners(string driveId, string id)
+	{
+		import core.thread : Thread;
+		import core.time : MonoTime, dur;
+		auto deadline = MonoTime.currTime + dur!"msecs"(5000);
+		bool waited;
+		while (isOpen(driveId, id) && openOnlyByScanners(driveId, id) && MonoTime.currTime < deadline)
+		{
+			waited = true;
+			Thread.sleep(dur!"msecs"(100));
+		}
+		if (waited) stubLog("STUB free waited for scanner ", id, isOpen(driveId, id) ? " still open" : " closed");
 	}
 
 	/* Iteration 3: transient sync states, deferred online changes, web URL */
@@ -445,6 +471,7 @@ final class HydrationService
 				case OnDemandAction.pin: pin(driveId, id); break;
 				case OnDemandAction.unpin: unpin(driveId, id); break;
 				case OnDemandAction.free:
+					waitForScanners(driveId, id);
 					if (isOpen(driveId, id))
 						throw new HydrationError(errno.EBUSY, "refused to free open " ~ id);
 					if (pinnedOrPinnedAncestor(driveId, id))

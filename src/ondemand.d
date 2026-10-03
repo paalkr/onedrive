@@ -103,6 +103,8 @@ private final class Handle
 	// The database item reported to HydrationService.noteOpen(), closed on release
 	string openDriveId;
 	string openId;
+	// Opened by a known on-access scanner (reported to noteOpen/noteClose)
+	bool openByScanner;
 }
 
 // Thumbnailers, by full name and by the 15-character /proc/<pid>/comm truncation
@@ -113,22 +115,49 @@ private immutable string[] thumbnailerNames = [
 	"ffmpegthumbnai", "gnome-thumbnai",
 ];
 
+// On-access scanners (EDR and antivirus) that read a newly written file by its path, which goes
+// through the mount: by full name and by the 15-character /proc/<pid>/comm truncation
+private immutable string[] onAccessScannerNames = [
+	"falcon-sensor", "falcon-sensor-bpf", "falcon-sensor-b", "falcond",   // CrowdStrike Falcon
+	"falcon-fuse",                                                         // CrowdStrike Falcon, reads on FUSE mounts
+	"clamonacc", "clamd",                                                  // ClamAV on-access scanning
+	"wdavdaemon", "mdatp",                                                 // Microsoft Defender for Endpoint
+	"savscand", "sophos_threat_detector", "sophos_threat_d",              // Sophos
+	"esets_daemon", "esets_scanner",                                       // ESET
+];
+
 // Is the process that sent the current FUSE request a thumbnailer? pid 0 (not visible in our
 // pid namespace) or an unreadable /proc entry counts as not a thumbnailer.
 private string thumbnailerCaller() {
+	return callerNamed(thumbnailerNames);
+}
+
+// Is the process that sent the current FUSE request a known on-access scanner? Same rules.
+private string onAccessScannerCaller() {
+	return callerNamed(onAccessScannerNames);
+}
+
+// The name in 'known' of the process that sent the current FUSE request, or null. The request
+// carries a thread id: the thread's comm, the comm of its process (scanners name their threads
+// differently) and the executable are compared.
+private string callerNamed(const(string)[] known) {
 	import c.fuse.fuse : fuse_get_context;
 	import std.file : readLink, readText;
-	import std.string : strip;
+	import std.string : strip, splitLines, startsWith;
 	auto context = fuse_get_context();
 	if (context is null || context.pid <= 0) return null;
 	string proc = "/proc/" ~ to!string(context.pid);
 	string[] names;
 	try names ~= readText(proc ~ "/comm").strip; catch (Exception e) {}
+	try {
+		foreach (line; readText(proc ~ "/status").splitLines())
+			if (line.startsWith("Tgid:")) names ~= readText("/proc/" ~ line[5 .. $].strip ~ "/comm").strip;
+	} catch (Exception e) {}
 	// comm can be changed by the process and is truncated; the executable is the backstop
 	try names ~= baseName(readLink(proc ~ "/exe")).chompDeleted; catch (Exception e) {}
 	foreach (name; names)
-		foreach (known; thumbnailerNames)
-			if (name == known) return name;
+		foreach (candidate; known)
+			if (name == candidate) return name;
 	return null;
 }
 
@@ -430,14 +459,16 @@ final class OnDemandFs : Operations
 	private void noteOpened(const(char)[] path, Handle h) {
 		Item item;
 		if (!resolve(path, item) || item.type != ItemType.file) return;
+		bool scanner = onAccessScannerCaller() !is null;
 		try {
-			hydration.noteOpen(item.driveId, item.id);
+			hydration.noteOpen(item.driveId, item.id, scanner);
 		} catch (HydrationError e) {
 			// Removed from the database since it was resolved
 			return;
 		}
 		h.openDriveId = item.driveId;
 		h.openId = item.id;
+		h.openByScanner = scanner;
 	}
 
 	private Handle handleOf(ref fuse_file_info fi) {
@@ -831,7 +862,7 @@ final class OnDemandFs : Operations
 		if (h.written && path !is null) emit(OnDemandChangeKind.changed, path);
 		// The item recorded at open, even if it has been moved or deleted since
 		if (h.openId.length) {
-			try hydration.noteClose(h.openDriveId, h.openId);
+			try hydration.noteClose(h.openDriveId, h.openId, h.openByScanner);
 			catch (HydrationError e) addLogEntry("On-demand: noteClose failed for " ~ h.openId ~ ": " ~ e.msg);
 		}
 	}

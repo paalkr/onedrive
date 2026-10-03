@@ -18,7 +18,7 @@ if [ $# -ge 3 ]; then
 else
 	[ -f version ] && [ -d src ] || { echo "run from the repository root after make (needs ./version and src/)"; exit 2; }
 	H="$T/build"; mkdir -p "$H"
-	for helper in mkdb stagingtest guardtest; do
+	for helper in mkdb stagingtest guardtest freetest; do
 		extra=; [ "$helper" = guardtest ] && extra=src/sync.d
 		ldc2 -w -i -J . -I src -od="$H/obj-$helper" -of="$H/$helper" "ondemand/test-physical/$helper.d" $extra \
 			$(pkg-config --libs-only-l libcurl sqlite3 dbus-1 | sed 's/-l/-L-l/g') -L-ldl || { echo "building $helper failed"; exit 2; }
@@ -141,6 +141,12 @@ echo "== offline deletes and copies (SyncEngine consistency check, no network)"
 grep -oE "(PASS|FAIL) .*" "$T/guard.out" > "$T/guard.res"
 grep -q "guardtest done" "$T/guard.out" || echo "FAIL guardtest did not finish" >> "$T/guard.res"
 while read -r line; do echo "$line"; case "$line" in PASS*) PASS=$((PASS+1));; FAIL*) FAIL=$((FAIL+1));; esac; done < "$T/guard.res"
+
+echo "== free and on-access scanners (HydrationService)"
+"$H/freetest" "$T/free" > "$T/free.out" 2>&1
+grep -oE "(PASS|FAIL) .*" "$T/free.out" > "$T/free.res"
+grep -q "freetest done" "$T/free.out" || echo "FAIL freetest did not finish" >> "$T/free.res"
+while read -r line; do echo "$line"; case "$line" in PASS*) PASS=$((PASS+1));; FAIL*) FAIL=$((FAIL+1));; esac; done < "$T/free.res"
 
 echo "== crash between staging and rename"
 "$H/stagingtest" "$T/staging" | grep -E "^(PASS|FAIL)" > "$T/staging.out"

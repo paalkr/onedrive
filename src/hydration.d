@@ -135,6 +135,11 @@ final class OnDemandChangeQueue {
 private __gshared Mutex onDemandStateMutex;
 // Open file handles per item ("driveId/id"), reported by the FUSE layer; guarded by onDemandStateMutex
 private __gshared int[string] onDemandOpenHandles;
+// Of those, the handles opened by a known on-access scanner (onDemandScannerNames); same guard
+private __gshared int[string] onDemandScannerHandles;
+
+// How long "free up space" waits for handles that only on-access scanners hold before refusing (EBUSY)
+enum uint onDemandScannerWaitMsecs = 5000;
 
 shared static this() {
 	onDemandStateMutex = new Mutex();
@@ -532,22 +537,33 @@ final class HydrationService {
 	}
 
 	// An open or create of a handle on this item (FUSE layer). A file with open handles is never dehydrated.
-	void noteOpen(string driveId, string id) {
+	// 'onAccessScanner': the handle belongs to a known on-access scanner (a short read of a new file);
+	// "free up space" waits a little for such handles instead of refusing at once.
+	void noteOpen(string driveId, string id, bool onAccessScanner = false) {
 		onDemandStateMutex.lock();
 		scope(exit) onDemandStateMutex.unlock();
-		onDemandOpenHandles[itemKey(driveId, id)]++;
+		string key = itemKey(driveId, id);
+		onDemandOpenHandles[key]++;
+		if (onAccessScanner) onDemandScannerHandles[key]++;
 	}
 
-	// The release of a handle counted by noteOpen(). An unmatched call is ignored.
-	void noteClose(string driveId, string id) {
+	// The release of a handle counted by noteOpen(), with the same 'onAccessScanner'. An unmatched call is ignored.
+	void noteClose(string driveId, string id, bool onAccessScanner = false) {
 		bool lastClose = false;
 		{
 			onDemandStateMutex.lock();
 			scope(exit) onDemandStateMutex.unlock();
 			string key = itemKey(driveId, id);
+			if (onAccessScanner && ((key in onDemandOpenHandles) !is null)) {
+				if (auto scanners = key in onDemandScannerHandles) {
+					if (*scanners <= 1) onDemandScannerHandles.remove(key);
+					else (*scanners)--;
+				}
+			}
 			if (auto count = key in onDemandOpenHandles) {
 				if (*count <= 1) {
 					onDemandOpenHandles.remove(key);
+					onDemandScannerHandles.remove(key);
 					lastClose = true;
 				} else {
 					(*count)--;
@@ -651,7 +667,7 @@ final class HydrationService {
 				case OnDemandAction.free:
 					// As on Windows, freeing a file removes its own pin, and also frees a file that is kept
 					// only because its folder is pinned (the folder then holds this one online-only file)
-					if (!dehydrateFile(driveId, id, true)) {
+					if (!dehydrateWaitingForScanners(driveId, id, true)) {
 						throw new HydrationError(EBUSY, "The file has local changes that are not uploaded");
 					}
 					return;
@@ -762,6 +778,35 @@ final class HydrationService {
 	// change. Deletes the backing file, sets DB state O. Returns false if refused (dirty, pinned).
 	bool dehydrate(string driveId, string id) {
 		return dehydrateFile(driveId, id, false);
+	}
+
+	// dehydrateFile() for "free up space" requested by the user. A file that is open only by on-access
+	// scanners (they read a newly written file for a moment) is retried for up to
+	// onDemandScannerWaitMsecs before EBUSY. Any other open handle refuses at once.
+	private bool dehydrateWaitingForScanners(string driveId, string id, bool explicitRequest) {
+		auto deadline = MonoTime.currTime + dur!"msecs"(onDemandScannerWaitMsecs);
+		bool waited = false;
+		while (true) {
+			try {
+				bool freed = dehydrateFile(driveId, id, explicitRequest);
+				if (waited) addLogEntry("On-demand: free up space waited for an on-access scanner to close " ~ itemDB.computePath(driveId, id));
+				return freed;
+			} catch (HydrationError e) {
+				if ((e.errnoCode != EBUSY) || !openOnlyByScanners(driveId, id) || (MonoTime.currTime >= deadline)) throw e;
+			}
+			waited = true;
+			Thread.sleep(dur!"msecs"(100));
+		}
+	}
+
+	// Are all open handles on this item held by on-access scanners?
+	private bool openOnlyByScanners(string driveId, string id) {
+		onDemandStateMutex.lock();
+		scope(exit) onDemandStateMutex.unlock();
+		string key = itemKey(driveId, id);
+		auto open = key in onDemandOpenHandles;
+		auto scanners = key in onDemandScannerHandles;
+		return (open !is null) && (scanners !is null) && (*scanners >= *open);
 	}
 
 	// dehydrate(); with 'explicitRequest' (free up space on this file) a pin of the file itself or of a
@@ -1091,7 +1136,7 @@ final class HydrationService {
 				dehydrateSubtree(child.driveId, child.id);
 			} else if (child.type == ItemType.file) {
 				try {
-					if (!dehydrate(child.driveId, child.id)) {
+					if (!dehydrateWaitingForScanners(child.driveId, child.id, false)) {
 						addLogEntry("On-demand: free up space refused, the file stays local (pinned or local changes): " ~ itemDB.computePath(child.driveId, child.id));
 					}
 				} catch (HydrationError e) {

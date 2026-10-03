@@ -184,9 +184,9 @@ ok "I2 st_blocks of hydrated file from backing file" '[ "$(t stat -c %b "$M/docs
 
 echo "== I2 user.onedrive.action on a file"
 act() { xset "$1" user.onedrive.action "$2"; }
-# Free of a file that was just hydrated. An on-access scanner (fanotify) reads a newly written
-# physical file by its path, which goes through the mount, so the file can be open for a moment
-# and free refuses with EBUSY. Retries while it is busy, for up to 6 s.
+# Free of a file that was just hydrated. The real on-access scanner (CrowdStrike reads FUSE files as
+# falcon-fuse) opens a newly written file through the mount; the client waits up to 5 s for such
+# handles, but on a busy machine the scanner was seen holding the file longer. Retries while busy, up to 6 s more.
 act_free_after_hydrate() {
 	local out
 	for i in $(seq 1 30); do
@@ -425,6 +425,29 @@ ok "N GIO reports created, renamed/moved and deleted" 'grep -q "n1.txt: created"
 echo "== events seen"
 grep '^EVENT' "$LOG"
 
+echo "== free waits for on-access scanners only"
+# hold_as <comm> <file> <seconds>: a process named <comm> opens <file> through the mount and holds it
+hold_as() {
+	t python3 -c 'import sys, time
+open("/proc/self/comm", "w").write(sys.argv[1])
+f = open(sys.argv[2], "rb"); print("OPEN", flush=True); time.sleep(float(sys.argv[3])); f.close()' "$1" "$2" "$3" > "$T/hold.out" 2>&1 &
+	HOLD=$!
+	for i in $(seq 1 50); do grep -q OPEN "$T/hold.out" && break; sleep 0.1; done
+}
+ms() { echo $(( $(date +%s%N) / 1000000 )); }
+[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ] || act "$M/one.txt" download
+hold_as clamonacc "$M/one.txt" 1.5
+ok "S open by a scanner name is classified as an on-access scanner" 'grep -q "^STUB noteOpen f-one [0-9]* scanner" "$LOG"'
+T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); wait $HOLD
+ok "S free while only a scanner holds the file: waits, then frees ($((T1 - T0)) ms)" '[ -z "$OUT" ] && [ $((T1 - T0)) -ge 800 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = online-only ] && grep -q "STUB free waited for scanner f-one closed" "$LOG"'
+act "$M/one.txt" download
+hold_as editor-proc "$M/one.txt" 3
+T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); wait $HOLD
+ok "S free while a user process holds the file: EBUSY at once ($((T1 - T0)) ms)" 'echo "$OUT" | grep -q "Device or resource busy" && [ $((T1 - T0)) -lt 1000 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
+hold_as clamonacc "$M/one.txt" 8
+T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); kill $HOLD 2>/dev/null; wait $HOLD 2>/dev/null
+ok "S a scanner that keeps the file open: EBUSY after about 5 s ($((T1 - T0)) ms)" 'echo "$OUT" | grep -q "Device or resource busy" && [ $((T1 - T0)) -ge 4500 ] && [ $((T1 - T0)) -lt 7000 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
+
 echo "== stop"
 # F5 R1: stop with replays queued and in flight whose files are gone again
 ctl "touchdelay~20"
@@ -454,7 +477,7 @@ ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand:stagi
 echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|action|noteOpen|noteClose [^U])|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|createEmpty|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"
