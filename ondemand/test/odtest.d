@@ -96,6 +96,15 @@ void main(string[] args)
 	onlineFile("f-write", "root", "write-me.txt", "0123456789\n");
 	onlineFile("f-trunc0", "d-docs", "docs/trunc0.txt", "old content for truncate -s 0\n");
 	onlineFile("f-who", "d-docs", "docs/who.txt", "who reads me\n");
+	// Ranged reads by background readers: a 3 MiB file and a small one
+	{
+		import std.format : format;
+		string large;
+		foreach (i; 0 .. 3 * 1024 * 16) large ~= format("%063d\n", i);
+		onlineFile("f-large", "d-docs", "docs/large.bin", large);
+	}
+	onlineFile("f-small", "d-docs", "docs/small.png", "\x89PNG small picture\n");
+	onlineFile("f-off", "d-docs", "docs/offline.bin", "not reachable\n");
 	// V3: a directory whose only child is online-only, and files to rename over
 	add("d-target", "d-docs", "target", ItemType.dir);
 	onlineFile("f-target", "d-target", "docs/target/t.txt", "only child\n");
@@ -251,6 +260,8 @@ void main(string[] args)
 					writeln("EXP ", parts[1], " ", p, " parent=", parentIno, " ino=", ino, " rc=", rc);
 				}
 				if (parts[0] == "transient") svc.setTransientForTest(driveId, parts[1], parts[2].to!TransientState);
+				// offline~1 / offline~0: ranged reads fail as when Microsoft OneDrive is not reachable
+				if (parts[0] == "offline") HydrationService.rangeOffline = parts[1] == "1";
 				remove(entry.name);
 				writeln("CTL ", baseName(entry.name));
 			}

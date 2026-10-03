@@ -106,7 +106,16 @@ private final class Handle
 	// Opened by a known on-access scanner (reported to noteOpen/noteClose), and who that was
 	bool openByScanner;
 	string scannerIdentity;
+	// Opened by a background reader (backgroundReaderNames or a scanner): reads of an online-only
+	// file are served with ranged requests until more than rangedReadLimit bytes were read
+	bool background;
+	string callerIdentity;
+	ulong rangedBytes;
+	bool escalated;
 }
+
+// A background reader that has read more than this from one handle (a copy or move) gets the file downloaded
+private enum ulong rangedReadLimit = 1024 * 1024;
 
 // Thumbnailers, by full name and by the 15-character /proc/<pid>/comm truncation
 private immutable string[] thumbnailerNames = [
@@ -114,6 +123,15 @@ private immutable string[] thumbnailerNames = [
 	"ffmpegthumbnailer", "gnome-thumbnailer", "tumblerd",
 	"gdk-pixbuf-thum", "evince-thumbnai", "totem-video-thu", "ffmpegthumbnail",
 	"ffmpegthumbnai", "gnome-thumbnai",
+];
+
+// File managers and background services that read files without a deliberate user action (content
+// type sniffing, previews, indexing): by full name and by the 15-character comm truncation. Their
+// reads of an online-only file never download it until they read more than rangedReadLimit bytes
+// from one handle (a copy or move). Prefixes end in '*'.
+private immutable string[] backgroundReaderNames = [
+	"nautilus", "nemo", "caja", "thunar", "Thunar", "dolphin", "pcmanfm", "pcmanfm-qt",
+	"gvfsd*", "tracker-*", "localsearch*", "baloo*", "zeitgeist*",
 ];
 
 // On-access scanners (EDR and antivirus) that read a newly written file by its path, which goes
@@ -175,10 +193,23 @@ private Caller currentCaller() {
 // is truncated; the executable is the backstop). pid 0 or unreadable /proc entries match nothing.
 private string callerName(const ref Caller caller, const(string)[] known) {
 	if (caller.pid <= 0) return null;
-	foreach (name; [caller.threadComm, caller.processComm, caller.exe])
-		foreach (candidate; known)
-			if (name.length && (name == candidate)) return name;
+	foreach (name; [caller.threadComm, caller.processComm, caller.exe]) {
+		if (name.length == 0) continue;
+		foreach (candidate; known) {
+			if (candidate.endsWith("*") ? name.startsWith(candidate[0 .. $ - 1]) : (name == candidate)) return name;
+		}
+	}
 	return null;
+}
+
+// Is the caller a background reader (file manager, indexer, on-access scanner)? Matched on the
+// process comm and the executable, not the thread comm: file managers read on worker threads
+// with generic names.
+private bool isBackgroundReader(const ref Caller caller) {
+	if (caller.pid <= 0) return false;
+	Caller process = caller;
+	process.threadComm = null;
+	return (callerName(process, backgroundReaderNames) !is null) || (callerName(caller, onAccessScannerNames) !is null);
 }
 
 // readlink of /proc/<pid>/exe appends " (deleted)" when the binary was replaced
@@ -207,6 +238,8 @@ final class OnDemandFs : Operations
 
 	private Mutex thumbnailLogLock;
 	private bool[string] thumbnailRefusalLogged;
+	// When "served ... without downloading" was last logged per path (at most once a minute)
+	private MonoTime[string] rangedServeLogged;
 
 	// Reporting changes made behind the mount's back (notifyBackingChange)
 	private BackgroundFuse mount;
@@ -492,6 +525,11 @@ final class OnDemandFs : Operations
 		h.openId = item.id;
 		h.openByScanner = scanner;
 		if (scanner) h.scannerIdentity = caller.toString();
+		// Thumbnailers stay refused in hydrateIfNeeded; they are never background readers
+		if (isBackgroundReader(caller) && (callerName(caller, thumbnailerNames) is null)) {
+			h.background = true;
+			h.callerIdentity = caller.toString();
+		}
 	}
 
 	// The on-access scanners that hold the item open now, for a refusal log line
@@ -824,7 +862,10 @@ final class OnDemandFs : Operations
 	}
 
 	override ulong read(const(char)[] path, ubyte[] buf, ulong offset, ref fuse_file_info fi) {
-		int fd = fdOf(path, handleOf(fi));
+		auto h = handleOf(fi);
+		ulong served;
+		if (readRanged(path, h, buf, offset, served)) return served;
+		int fd = fdOf(path, h);
 		size_t done = 0;
 		while (done < buf.length) {
 			auto n = pread(fd, buf.ptr + done, buf.length - done, cast(off_t) (offset + done));
@@ -836,6 +877,37 @@ final class OnDemandFs : Operations
 			done += n;
 		}
 		return done;
+	}
+
+	// A background reader's read of an online-only file: served from Graph with ranged requests,
+	// without a local file. False when the read takes the normal path (not a background handle,
+	// the file is local, or the handle has read more than rangedReadLimit: then it is downloaded).
+	private bool readRanged(const(char)[] path, Handle h, ubyte[] buf, ulong offset, out ulong served) {
+		if (path is null) return false;
+		synchronized (h) {
+			if (!h.background || h.escalated || (h.fd != -1)) return false;
+		}
+		if (existsPath(backingPath(path))) return false;
+		Item item;
+		if (!resolve(path, item) || !isOnlineOnly(item)) return false;
+		if (!resolveSettled(path, item)) fail(ENOENT);
+		synchronized (h) {
+			if (h.rangedBytes + buf.length > rangedReadLimit) {
+				h.escalated = true;
+				addLogEntry("On-demand: downloading " ~ dbPath(path) ~ " because " ~ h.callerIdentity ~ " read more than 1 MiB");
+				return false;
+			}
+		}
+		ubyte[] data;
+		try {
+			data = hydration.readRange(item.driveId, item.id, offset, buf.length);
+		} catch (HydrationError e) {
+			fail(e.errnoCode == ENOENT ? ENOENT : EIO);
+		}
+		buf[0 .. data.length] = data[];
+		synchronized (h) h.rangedBytes += data.length;
+		served = data.length;
+		return true;
 	}
 
 	override int write(const(char)[] path, in ubyte[] data, ulong offset, ref fuse_file_info fi) {
@@ -877,6 +949,18 @@ final class OnDemandFs : Operations
 		}
 	}
 
+	private void logRangedServe(const(char)[] path, Handle h) {
+		string rel = dbPath(path);
+		auto now = MonoTime.currTime;
+		synchronized (thumbnailLogLock) {
+			if (auto last = rel in rangedServeLogged)
+				if (now - *last < dur!"seconds"(60)) return;
+			if (rangedServeLogged.length > 10_000) rangedServeLogged = null;
+			rangedServeLogged[rel] = now;
+		}
+		addLogEntry("On-demand: served " ~ to!string(h.rangedBytes) ~ " bytes of " ~ rel ~ " to " ~ h.callerIdentity ~ " without downloading");
+	}
+
 	override void release(const(char)[] path, ref fuse_file_info fi) {
 		Handle h;
 		synchronized (handleLock) {
@@ -890,6 +974,7 @@ final class OnDemandFs : Operations
 			h.fd = -1;
 		}
 		if (h.touch) return;
+		if (h.rangedBytes && !h.escalated && path !is null) logRangedServe(path, h);
 		// The change first: the last noteClose lets the engine apply an online change it
 		// deferred while the file was open, and it must already know about the local edit.
 		// A null path means the file was unlinked while open; the delete was already reported.

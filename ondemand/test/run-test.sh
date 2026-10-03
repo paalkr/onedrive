@@ -468,6 +468,44 @@ hold_as clamonacc "$M/one.txt" 8
 T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); kill $HOLD 2>/dev/null; wait $HOLD 2>/dev/null
 ok "S a scanner that keeps the file open: EBUSY after about 5 s ($((T1 - T0)) ms)" 'echo "$OUT" | grep -q "Device or resource busy" && [ $((T1 - T0)) -ge 4500 ] && [ $((T1 - T0)) -lt 7000 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
 
+echo "== background readers: ranged reads instead of downloads"
+# read_as <comm> <file> <bytes> [<out>]: a process named <comm> reads <bytes> from the start of <file> in 128 KiB reads
+read_as() {
+	t python3 -c 'import sys
+open("/proc/self/comm", "w").write(sys.argv[1])
+want = int(sys.argv[3]); got = b""
+with open(sys.argv[2], "rb") as f:
+    while len(got) < want:
+        chunk = f.read(min(131072, want - len(got)))
+        if not chunk: break
+        got += chunk
+if len(sys.argv) > 4: open(sys.argv[4], "wb").write(got)
+print(len(got))' "$@"
+}
+ranges() { grep -c "^STUB range $1 " "$LOG"; }
+N=$(read_as nautilus "$M/docs/large.bin" 4096 "$T/head.out")
+ok "B1 a file manager sniffing 4 KB is served by one ranged read" '[ "$N" = 4096 ] && [ "$(ranges docs/large.bin)" = 1 ] && cmp -s "$T/head.out" <(head -c 4096 "$R/docs/large.bin")'
+ok "B1 nothing downloaded: no local file, still online-only" '[ "$(downloads docs/large.bin)" = 0 ] && [ ! -e "$B/docs/large.bin" ] && [ "$(xget "$M/docs/large.bin" user.onedrive.state)" = online-only ]'
+for i in $(seq 1 30); do grep -q "served [0-9]* bytes of ./docs/large.bin to pid=[0-9]* thread=nautilus process=nautilus" "$LOG" && break; sleep 0.1; done
+ok "B1 logged as served without downloading, with the caller" 'grep -qE "^On-demand: served [0-9]+ bytes of ./docs/large.bin to pid=[0-9]+ thread=nautilus process=nautilus .* without downloading$" "$LOG"'
+read_as nautilus "$M/docs/small.png" 4096 >/dev/null & P1=$!
+read_as tracker-extract "$M/docs/small.png" 4096 >/dev/null & P2=$!
+read_as gvfsd-metadata "$M/docs/small.png" 4096 >/dev/null & P3=$!
+wait $P1 $P2 $P3
+ok "B2 three concurrent background readers share one ranged read" '[ "$(ranges docs/small.png)" = 1 ] && [ "$(downloads docs/small.png)" = 0 ] && [ "$(xget "$M/docs/small.png" user.onedrive.state)" = online-only ]'
+N=$(read_as nautilus "$M/docs/large.bin" 3145728 "$T/large.out")
+ok "B3 a background reader reading 3 MiB (a copy) gets the file downloaded" '[ "$N" = 3145728 ] && [ "$(downloads docs/large.bin)" = 1 ] && [ "$(xget "$M/docs/large.bin" user.onedrive.state)" = hydrated ]'
+ok "B3 the content is identical, locally and as read" 'cmp -s "$B/docs/large.bin" "$R/docs/large.bin" && cmp -s "$T/large.out" "$R/docs/large.bin"'
+ok "B3 the escalation is logged with the caller" 'grep -qE "^On-demand: downloading ./docs/large.bin because pid=[0-9]+ thread=nautilus process=nautilus .* read more than 1 MiB$" "$LOG"'
+N=$(read_as reader "$M/docs/small.png" 1)
+ok "B4 any other process reading 1 byte downloads as before" '[ "$N" = 1 ] && [ "$(downloads docs/small.png)" = 1 ] && [ "$(xget "$M/docs/small.png" user.onedrive.state)" = hydrated ]'
+ctl "offline~1"
+T0=$(ms); OUT="$(read_as nautilus "$M/docs/offline.bin" 4096 2>&1)"; T1=$(ms)
+ctl "offline~0"
+ok "B5 offline: a background read fails with EIO at once ($((T1 - T0)) ms), nothing downloaded" 'echo "$OUT" | grep -q "Input/output error" && [ $((T1 - T0)) -lt 3000 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(xget "$M/docs/offline.bin" user.onedrive.state)" = online-only ]'
+N=$(read_as clamonacc "$M/docs/offline.bin" 100)
+ok "B6 an on-access scanner is a background reader too: served without a download" '[ "$N" = 14 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(ranges docs/offline.bin)" = 1 ]'
+
 echo "== stop"
 # F5 R1: stop with replays queued and in flight whose files are gone again
 ctl "touchdelay~20"
@@ -497,7 +535,7 @@ ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand:stagi
 echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"
-grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|hydrating|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
+grep -vE '^(READY|PHYSICAL|EVENT|APPLIED|CHANGED|BURST|CTL|STUB webUrlOf|STUB reevaluate|STUB (download|hydrating|range|createEmpty|noteLocalContent|action|noteOpen|noteClose [^U]|free waited)|DOWNLOADS|STOPPED)' "$LOG"
 echo "== $PASS passed, $FAIL failed"
 trap - EXIT
 [ "$FAIL" = 0 ] && rm -rf "$T"

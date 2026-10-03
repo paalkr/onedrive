@@ -1894,6 +1894,36 @@ class OneDriveApi {
 		return get(websocketEndpoint);
 	}
 
+	// On-demand ranged reads: the item with its short-lived, pre-authenticated download URL
+	// (@microsoft.graph.downloadUrl, returned for files on a plain item GET)
+	JSONValue getDownloadUrlById(string driveId, string id) {
+		return get(driveByIdUrl ~ driveId ~ "/items/" ~ id);
+	}
+
+	// On-demand ranged reads: bytes [offset, offset + length) from a pre-authenticated download URL
+	// with an HTTP Range request. One attempt and no retry loop, because the caller is a FUSE read
+	// that must fail fast; no Authorization header (the URL carries its own authorisation).
+	// Returns fewer bytes at the end of the file and none past it (416). A server that ignores the
+	// Range header (200) is answered from the full body. Any other status throws OneDriveException
+	// (401/403/410: the URL has expired). Network failures throw CurlException.
+	ubyte[] downloadRangeByUrl(string downloadUrl, ulong offset, size_t length) {
+		if (length == 0) return [];
+		curlEngine.setResponseHolder(null);
+		curlEngine.addRequestHeader("Range", format("bytes=%d-%d", offset, offset + length - 1));
+		curlEngine.connect(HTTP.Method.get, downloadUrl);
+		CurlResponse response = curlEngine.execute();
+		int code = response.statusLine.code;
+		ubyte[] body = cast(ubyte[]) response.content.dup;
+		if (code == 206) return body.length > length ? body[0 .. length] : body;
+		if (code == 200) {
+			if (offset >= body.length) return [];
+			ulong end = offset + length;
+			return body[cast(size_t) offset .. cast(size_t) (end > body.length ? body.length : end)];
+		}
+		if (code == 416) return [];
+		throw new OneDriveException(code, "ranged download failed", response);
+	}
+
 	// https://docs.microsoft.com/en-us/onedrive/developer/rest-api/api/driveitem_get_content
 	CurlResponse downloadById(const(char)[] driveId, const(char)[] itemId, string saveToPath, long fileSize, JSONValue onlineHash, long resumeOffset = 0, bool delegate(DownloadCommitInfo) inspectDownloadBeforeCommit = null) {
 		// Set this function name

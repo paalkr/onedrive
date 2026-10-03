@@ -14,6 +14,7 @@ import std.datetime;
 import std.exception;
 import std.file;
 import std.json;
+import std.net.curl : CurlException;
 import std.path;
 import std.string;
 import std.uni;
@@ -36,6 +37,16 @@ enum string hydrationHydrated = "H";
 enum string hydrationPinned = "P";
 
 // Error raised to FUSE callers. errnoCode: ENETUNREACH/EIO offline, ENOENT gone online, EIO other
+// A failed ranged read request: the HTTP status, or 0 for a network failure
+class RangeFetchError : Exception {
+	int httpStatus;
+
+	this(int httpStatus, string msg, string file = __FILE__, size_t line = __LINE__) {
+		super(msg, file, line);
+		this.httpStatus = httpStatus;
+	}
+}
+
 class HydrationError : Exception {
 	int errnoCode;
 
@@ -534,6 +545,7 @@ final class HydrationService {
 		serviceMutex = new Mutex();
 		serviceCondition = new Condition(serviceMutex);
 		directoryStateCacheMutex = new Mutex();
+		rangeMutex = new Mutex();
 	}
 
 	// An open or create of a handle on this item (FUSE layer). A file with open handles is never dehydrated.
@@ -773,6 +785,208 @@ final class HydrationService {
 		}
 		if (!entry.done) throw new HydrationError(EIO, "Hydration service is shutting down");
 		if (entry.errnoCode != 0) throw new HydrationError(entry.errnoCode, entry.message);
+	}
+
+	// Ranged reads for background readers (file managers, indexers, scanners: see ondemand.d).
+	// read() of an online-only file is answered from Graph with HTTP Range requests on the item's
+	// pre-authenticated download URL, without a local file and without changing the state. Fetched
+	// blocks are cached in memory per item for a short time, so a content-type sniff costs one
+	// request and concurrent readers share it. Lock rules: only the range cache's own locks are
+	// used; never the state lock, the transaction lock or the database lock across network I/O.
+	enum size_t rangeBlockSize = 128 * 1024;                   // one request covers the kernel's read-ahead
+	enum size_t rangeCacheLimit = 64 * 1024 * 1024;            // all items together
+	enum Duration rangeCacheTtl = dur!"seconds"(60);           // after the last read of an item
+	enum Duration rangeUrlTtl = dur!"minutes"(30);             // download URLs expire after about an hour
+	enum Duration rangeOfflineBackoff = dur!"seconds"(15);     // fail fast after a network failure
+
+	// Test hooks. rangeUrlSource returns the download URL and size of an item; rangeFetch returns
+	// bytes [offset, offset + length) of a URL. Both throw RangeFetchError. Null = Graph.
+	string delegate(string driveId, string id, out long size) rangeUrlSource;
+	ubyte[] delegate(string url, ulong offset, size_t length) rangeFetch;
+
+	private final class RangeItem {
+		Mutex fetchLock;
+		string url;
+		MonoTime urlAt;
+		long size = -1;
+		ubyte[][size_t] blocks;
+		size_t bytes;
+		MonoTime lastUse;
+		this() { fetchLock = new Mutex(); }
+	}
+	private RangeItem[string] rangeItems;
+	private size_t rangeCacheBytes;
+	private Mutex rangeMutex;
+	private MonoTime rangeOfflineUntil;
+	private string[] rangeOfflineLogged;
+
+	// Bytes [offset, offset + length) of an online-only file, from the cache or Graph. Fewer bytes
+	// at the end of the file. Throws HydrationError: EIO when offline (fast, after the first
+	// failure), ENOENT when the item is gone online.
+	ubyte[] readRange(string driveId, string id, ulong offset, size_t length) {
+		if (isShuttingDown()) throw new HydrationError(EIO, "Hydration service is shutting down");
+		if (length == 0) return [];
+		string key = itemKey(driveId, id);
+		RangeItem entry;
+		synchronized (rangeMutex) {
+			purgeRangeCacheLocked(null);
+			if (auto existing = key in rangeItems) entry = *existing;
+			else rangeItems[key] = entry = new RangeItem();
+			entry.lastUse = MonoTime.currTime;
+		}
+		entry.fetchLock.lock();
+		scope(exit) entry.fetchLock.unlock();
+		synchronized (rangeMutex) {
+			if (MonoTime.currTime < rangeOfflineUntil) throw new HydrationError(EIO, "Microsoft OneDrive is not reachable");
+		}
+		try {
+			if (entry.url.empty || (MonoTime.currTime - entry.urlAt > rangeUrlTtl)) refreshRangeUrl(driveId, id, entry);
+			if ((entry.size >= 0) && (offset >= cast(ulong) entry.size)) return [];
+			ulong end = offset + length;
+			if ((entry.size >= 0) && (end > cast(ulong) entry.size)) end = entry.size;
+			size_t first = cast(size_t) (offset / rangeBlockSize);
+			size_t last = cast(size_t) ((end - 1) / rangeBlockSize);
+			// Fetch each run of missing blocks with one request
+			size_t block = first;
+			while (block <= last) {
+				if (block in entry.blocks) { block++; continue; }
+				size_t runEnd = block;
+				while ((runEnd + 1 <= last) && ((runEnd + 1) !in entry.blocks)) runEnd++;
+				fetchRangeBlocks(driveId, id, entry, block, runEnd);
+				block = runEnd + 1;
+			}
+			ubyte[] result;
+			foreach (b; first .. last + 1) {
+				ubyte[] data = entry.blocks.get(b, null);
+				ulong blockStart = cast(ulong) b * rangeBlockSize;
+				ulong from = (offset > blockStart) ? offset - blockStart : 0;
+				ulong to = (end - blockStart < data.length) ? end - blockStart : data.length;
+				if (from < to) result ~= data[cast(size_t) from .. cast(size_t) to];
+				if (data.length < rangeBlockSize) break;   // the end of the file
+			}
+			synchronized (rangeMutex) purgeRangeCacheLocked(entry);
+			return result;
+		} catch (RangeFetchError e) {
+			if (e.httpStatus == 404) throw new HydrationError(ENOENT, "Item no longer exists online");
+			if (e.httpStatus == 0) {
+				bool first;
+				synchronized (rangeMutex) {
+					rangeOfflineUntil = MonoTime.currTime + rangeOfflineBackoff;
+					first = !canFind(rangeOfflineLogged, key);
+					if (first) rangeOfflineLogged ~= key;
+				}
+				if (first) addLogEntry("On-demand: unable to read " ~ itemDB.computePath(driveId, id) ~ " from Microsoft OneDrive without downloading it (offline?): " ~ e.msg);
+			}
+			throw new HydrationError(EIO, "Ranged read failed: " ~ e.msg);
+		}
+	}
+
+	// Caller holds the item's fetchLock
+	private void refreshRangeUrl(string driveId, string id, RangeItem entry) {
+		long size;
+		entry.url = (rangeUrlSource !is null) ? rangeUrlSource(driveId, id, size) : graphRangeUrl(driveId, id, size);
+		entry.urlAt = MonoTime.currTime;
+		if ((entry.size >= 0) && (entry.size != size)) {
+			// A new online version: blocks of the old one must not be mixed in
+			synchronized (rangeMutex) rangeCacheBytes -= entry.bytes;
+			entry.blocks = null;
+			entry.bytes = 0;
+		}
+		entry.size = size;
+	}
+
+	// Caller holds the item's fetchLock. One request for blocks first .. last; an expired URL
+	// (401, 403, 410) is fetched again once.
+	private void fetchRangeBlocks(string driveId, string id, RangeItem entry, size_t first, size_t last) {
+		ulong offset = cast(ulong) first * rangeBlockSize;
+		size_t length = (last - first + 1) * rangeBlockSize;
+		ubyte[] data;
+		foreach (attempt; 0 .. 2) {
+			try {
+				data = (rangeFetch !is null) ? rangeFetch(entry.url, offset, length) : graphRangeFetch(entry.url, offset, length);
+				break;
+			} catch (RangeFetchError e) {
+				bool expired = (e.httpStatus == 401) || (e.httpStatus == 403) || (e.httpStatus == 410);
+				if (!expired || (attempt == 1)) throw e;
+				refreshRangeUrl(driveId, id, entry);
+			}
+		}
+		size_t added;
+		foreach (b; first .. last + 1) {
+			size_t from = (b - first) * rangeBlockSize;
+			if (from > data.length) break;
+			size_t to = (from + rangeBlockSize < data.length) ? from + rangeBlockSize : data.length;
+			entry.blocks[b] = data[from .. to].dup;
+			added += to - from;
+			if (to - from < rangeBlockSize) break;
+		}
+		entry.bytes += added;
+		synchronized (rangeMutex) rangeCacheBytes += added;
+	}
+
+	// Caller holds rangeMutex. Drops items not read for rangeCacheTtl, then the least recently
+	// read ones while the cache is over its limit (never 'keep', the item being read).
+	private void purgeRangeCacheLocked(RangeItem keep) {
+		auto now = MonoTime.currTime;
+		string[] expired;
+		foreach (k, item; rangeItems)
+			if ((item !is keep) && (now - item.lastUse > rangeCacheTtl)) expired ~= k;
+		foreach (k; expired) {
+			rangeCacheBytes -= rangeItems[k].bytes;
+			rangeItems.remove(k);
+		}
+		while (rangeCacheBytes > rangeCacheLimit) {
+			string oldest;
+			MonoTime oldestUse = MonoTime.max;
+			foreach (k, item; rangeItems)
+				if ((item !is keep) && (item.lastUse < oldestUse)) { oldest = k; oldestUse = item.lastUse; }
+			if (oldest.empty) break;
+			rangeCacheBytes -= rangeItems[oldest].bytes;
+			rangeItems.remove(oldest);
+		}
+	}
+
+	// The download URL and size of an item from Graph (a plain item GET returns the URL for files)
+	private string graphRangeUrl(string driveId, string id, out long size) {
+		if (!probeMicrosoftService(appConfig, false).reachable) throw new RangeFetchError(0, "Microsoft OneDrive is not reachable");
+		OneDriveApi api = new OneDriveApi(appConfig);
+		scope(exit) {
+			api.releaseCurlEngine();
+			api = null;
+		}
+		JSONValue onlineItem;
+		try {
+			api.initialise();
+			api.setTransferAbortFlag(&abortTransfers);
+			onlineItem = api.getDownloadUrlById(driveId, id);
+		} catch (OneDriveException e) {
+			throw new RangeFetchError(e.httpStatusCode, "Unable to query the online item");
+		} catch (CurlException e) {
+			throw new RangeFetchError(0, e.msg);
+		}
+		if ((onlineItem.type != JSONType.object) || isItemDeleted(onlineItem)) throw new RangeFetchError(404, "Item no longer exists online");
+		if (isMalware(onlineItem)) throw new RangeFetchError(451, "Online item is flagged as malware");
+		auto url = "@microsoft.graph.downloadUrl" in onlineItem;
+		if ((url is null) || (url.type != JSONType.string)) throw new RangeFetchError(500, "The online item has no download URL");
+		size = hasFileSize(onlineItem) ? onlineItem["size"].integer : -1;
+		return url.str;
+	}
+
+	private ubyte[] graphRangeFetch(string url, ulong offset, size_t length) {
+		OneDriveApi api = new OneDriveApi(appConfig);
+		scope(exit) {
+			api.releaseCurlEngine();
+			api = null;
+		}
+		try {
+			api.initialise();
+			api.setTransferAbortFlag(&abortTransfers);
+			return api.downloadRangeByUrl(url, offset, length);
+		} catch (OneDriveException e) {
+			throw new RangeFetchError(e.httpStatusCode, "HTTP " ~ to!string(e.httpStatusCode));
+		} catch (CurlException e) {
+			throw new RangeFetchError(0, e.msg);
+		}
 	}
 
 	// Free up space. Only if the backing file matches the DB hash and has no pending local
