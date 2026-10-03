@@ -264,6 +264,9 @@ void main(string[] args)
 				// The engine uploaded the new content of the destination item
 				if (db.selectByPath(c.path, driveId, item)) {
 					item.eTag = item.eTag ~ "+";
+					// As saveItem after an upload: the database hash is that of the uploaded content
+					string uploaded = buildPath(backing, c.path);
+					if (exists(uploaded)) item.quickXorHash = HydrationService.contentHash(uploaded);
 					db.update(item);
 					writeln("CHANGED ", c.path);
 				} else {

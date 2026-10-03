@@ -2747,7 +2747,7 @@ bool prepareOnDemandPhysicalSyncDir() {
 				return false;
 			}
 			if (!dirEntries(syncDir, SpanMode.shallow, false).empty) {
-				addLogEntry("ERROR: The on-demand files are in " ~ source ~ ", but 'sync_dir' (" ~ syncDir ~ ") already contains files. Move them yourself (never overwrite), or re-run with --resync.", ["info", "notify"]);
+				addLogEntry("ERROR: The on-demand files are in " ~ source ~ ", but 'sync_dir' (" ~ syncDir ~ ") already contains files, and nothing is moved or overwritten. Empty 'sync_dir' or choose another one, or re-run with '--resync'.", ["info", "notify"]);
 				return false;
 			}
 			rmdir(syncDir);
@@ -2762,7 +2762,7 @@ bool prepareOnDemandPhysicalSyncDir() {
 		} catch (FileException e) {
 			if (exists(intentFile)) std.file.remove(intentFile);
 			if (syncDirRemoved) mkdir(syncDir);
-			addLogEntry("ERROR: Unable to move the on-demand files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ "): " ~ e.msg ~ ". Both must be on the same filesystem; move them yourself, or re-run with --resync.", ["info", "notify"]);
+			addLogEntry("ERROR: Unable to move the on-demand files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ "): " ~ e.msg ~ ". Both must be on the same filesystem; otherwise re-run with '--resync'.", ["info", "notify"]);
 			return false;
 		}
 		// Leftovers of the previous layout's hydration staging (never visible, never uploaded)

@@ -121,7 +121,6 @@ final class HydrationService
 	private uint[string] downloads;
 	private uint[string] openCount;
 	private uint[string] scannerCount;   // of openCount, the handles of on-access scanners
-	private bool[string] localContent;   // H items whose local content was created by the mount (not uploaded)
 	private TransientState[string] transient;
 	private bool[string] deferred;
 	__gshared uint webUrlDelayMsecs;
@@ -155,6 +154,33 @@ final class HydrationService
 		scope(exit) lock.unlock();
 		itemDB.setHydration(driveId, id, dbValue(state));
 		remotePaths[key(driveId, id)] = remotePath;
+		// A local file seeded as hydrated or pinned holds the online content
+		if (state != HydrationState.onlineOnly && exists(targetOf(driveId, id))) storeHash(driveId, id);
+	}
+
+	/* The hash rule of the real service: a file is freed only when its local content matches the
+	   hash stored in the database (by the download, or by the upload of a local change). The stub's
+	   hash is a SHA-1 of the content, kept in the item's quickXorHash column. */
+	static string contentHash(string path)
+	{
+		import std.digest.sha : sha1Of;
+		import std.digest : toHexString;
+		return toHexString(sha1Of(cast(ubyte[]) std.file.read(path))).idup;
+	}
+
+	private void storeHash(string driveId, string id)
+	{
+		Item item;
+		if (!itemDB.selectById(driveId, id, item)) return;
+		item.quickXorHash = contentHash(targetOf(driveId, id));
+		itemDB.update(item);
+	}
+
+	private bool matchesStoredHash(string driveId, string id)
+	{
+		Item item;
+		string target = targetOf(driveId, id);
+		return itemDB.selectById(driveId, id, item) && exists(target) && contentHash(target) == item.quickXorHash;
 	}
 
 	uint downloadCount(string driveId, string id)
@@ -234,9 +260,8 @@ final class HydrationService
 		}
 		catch (FileException e)
 			throw new HydrationError(errno.EIO, e.msg);
-		// As the real service: the local content exists now, the item is H (and dirty until uploaded)
+		// As the real service: the local content exists now, the item is H (and differs from the stored hash until uploaded)
 		itemDB.setHydration(driveId, id, "H");
-		localContent[key(driveId, id)] = true;
 		stubLog("STUB createEmpty ", itemDB.computePath(driveId, id));
 		return true;
 	}
@@ -248,7 +273,6 @@ final class HydrationService
 		if (stateLocked(driveId, id) != HydrationState.onlineOnly || !exists(targetOf(driveId, id)))
 			return;
 		itemDB.setHydration(driveId, id, "H");
-		localContent[key(driveId, id)] = true;
 		stubLog("STUB noteLocalContent ", itemDB.computePath(driveId, id));
 	}
 
@@ -298,8 +322,8 @@ final class HydrationService
 		lock.lock();
 		relocked = true;
 		downloads[k] = downloads.get(k, 0) + 1;
-		localContent.remove(k);
 		itemDB.setHydration(driveId, id, "H");
+		storeHash(driveId, id);
 		// As the engine (cbd1508): every download commit is reported to the mount
 		notifyBackingChange("./" ~ rel, OnDemandChangeKind.changed);
 	}
@@ -313,7 +337,7 @@ final class HydrationService
 		if (stateLocked(driveId, id) != HydrationState.hydrated)
 			return false;
 		// As the real service: a file with local changes that are not uploaded is never freed
-		if (key(driveId, id) in localContent)
+		if (exists(targetOf(driveId, id)) && !matchesStoredHash(driveId, id))
 			return false;
 		string target = targetOf(driveId, id);
 		try

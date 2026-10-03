@@ -273,6 +273,7 @@ ok "RO state pinned at once" '[ "$(xget "$M/pinned.xlsx" user.onedrive.state)" =
 for i in $(seq 1 30); do grep -q "^CHANGED ./pinned.xlsx" "$LOG" && break; sleep 0.1; done
 ok "RO after the engine processed it: still hydrated / pinned" 'grep -q "^CHANGED ./report.xlsx" "$LOG" && grep -q "^CHANGED ./pinned.xlsx" "$LOG" && [ "$(xget "$M/report.xlsx" user.onedrive.state)" = hydrated ] && [ "$(xget "$M/pinned.xlsx" user.onedrive.state)" = pinned ]'
 ok "RO listed once, content kept" '[ "$(t ls "$M" | grep -cx pinned.xlsx)" = 1 ] && [ "$(t cat "$M/pinned.xlsx")" = "saved pinned" ]'
+ok "RO free after the upload stored the new hash: allowed (hash rule)" '[ -z "$(act "$M/report.xlsx" free)" ] && [ "$(xget "$M/report.xlsx" user.onedrive.state)" = online-only ]'
 
 echo "== RO rename of a DB file over a DB file, destination changed by the engine"
 ok "RO rename src2 over pinned dst2" '[ "$(ren "$M/etag/src2.txt" "$M/etag/dst2.txt")" = OK ]'
@@ -447,6 +448,18 @@ act "$M/one.txt" download
 hold_as editor-proc "$M/one.txt" 3
 T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); wait $HOLD
 ok "S free while a user process holds the file: EBUSY at once ($((T1 - T0)) ms)" 'echo "$OUT" | grep -q "Device or resource busy" && [ $((T1 - T0)) -lt 1000 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
+# The scanner's close must not wait for the free (setxattr) in progress: it closes after 1 s while
+# the free waits, the close returns at once and the free then succeeds
+t python3 -c 'import os, sys, time
+open("/proc/self/comm", "w").write("clamonacc")
+fd = os.open(sys.argv[1], os.O_RDONLY); print("OPEN", flush=True); time.sleep(1)
+t0 = time.monotonic(); os.close(fd); print("CLOSE %d" % ((time.monotonic() - t0) * 1000), flush=True)' "$M/one.txt" > "$T/hold.out" 2>&1 &
+HOLD=$!
+for i in $(seq 1 50); do grep -q OPEN "$T/hold.out" && break; sleep 0.1; done
+T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); wait $HOLD
+CLOSE_MS=$(awk '/^CLOSE/{print $2}' "$T/hold.out")
+ok "S the scanner's close during a free returns at once (${CLOSE_MS} ms), the free then succeeds ($((T1 - T0)) ms)" '[ -n "$CLOSE_MS" ] && [ "$CLOSE_MS" -lt 300 ] && [ -z "$OUT" ] && [ $((T1 - T0)) -lt 3000 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = online-only ]'
+act "$M/one.txt" download
 hold_as clamonacc "$M/one.txt" 8
 T0=$(ms); OUT="$(act "$M/one.txt" free)"; T1=$(ms); kill $HOLD 2>/dev/null; wait $HOLD 2>/dev/null
 ok "S a scanner that keeps the file open: EBUSY after about 5 s ($((T1 - T0)) ms)" 'echo "$OUT" | grep -q "Device or resource busy" && [ $((T1 - T0)) -ge 4500 ] && [ $((T1 - T0)) -lt 7000 ] && [ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ]'
