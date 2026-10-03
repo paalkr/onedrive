@@ -2,6 +2,12 @@
 
 A `.deb` of this fork of the abraunegg/onedrive client with Files On-Demand: the configured `sync_dir` is a FUSE mount, files are downloaded when first opened, and files and folders can be pinned ("always keep on this device") or freed. Built and tested on Ubuntu 24.04 (amd64).
 
+## Layout
+
+`sync_dir` is an ordinary directory that holds the downloaded (hydrated) files, and the client mounts the FUSE file system on top of it while it runs. Through the mount you see every file, online-only ones included. When the client is stopped the mount is gone, and `sync_dir` shows only the hydrated files, which stay readable. Online-only files exist only in OneDrive and the client's database.
+
+Profiles from the earlier layout kept the hydrated files in a separate backing directory (`~/.config/<profile>/ondemand/backing`, or `on_demand_backing_dir`). At the first start of this version the client moves that directory into `sync_dir` with `rename()`. Nothing is uploaded, downloaded or deleted. The move needs the same filesystem and an empty or absent `sync_dir`, otherwise the start is refused (see below). `on_demand_backing_dir` is deprecated and only used as the source of that one-time move. Remove it from the config afterwards.
+
 ## Build
 
 Build dependencies: `git`, `ldc` (ldc2 >= 1.36), `libcurl4-openssl-dev`, `libsqlite3-dev`, `libdbus-1-dev`, `libfuse3-dev`, `pkg-config`, `dpkg-dev` (for `dpkg-shlibdeps`; without it Depends is derived from `ldd`).
@@ -46,7 +52,7 @@ onedrive-ondemand-setup
 It asks for:
 
 - the profile name (default `onedrive-ondemand`, stored in `~/.config/onedrive-ondemand`),
-- the folder where OneDrive appears (default `~/OneDrive`; it must be empty or not exist yet, because the mount hides what is in it),
+- the folder where OneDrive appears (default `~/OneDrive`). It may already contain files. They stay visible in the mount and are compared with OneDrive on the first `--resync`, like in a normal synchronisation (for example, files that are not in OneDrive are uploaded). The interactive setup asks for confirmation.
 - optionally a list of OneDrive folders to show (written to `sync_list`),
 - optionally the work or school account options `application_id`, `azure_tenant_id`, `use_intune_sso`.
 
@@ -60,7 +66,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now onedrive-ondemand.service
 ```
 
-At the end it offers to run step 2 for you. Running the setup again is safe: an identical profile is left alone, an existing authorisation is reused, and an enabled service is reported. A profile with different settings is only overwritten with `--force` (the old files are kept as `config.bak.N`). Changing `sync_dir` or `sync_list` of a profile that has synchronised needs a `--resync`.
+At the end it offers to run step 2 for you. Running the setup again is safe: an identical profile is left alone, an existing authorisation is reused, and an enabled service is reported. A profile with different settings is only overwritten with `--force` (the old files are kept as `config.bak.N`). Changing `sync_list` of a profile that has synchronised needs a `--resync`. Changing `sync_dir` moves the folder at the next start when the new path is on the same filesystem and empty or absent; otherwise the start is refused and a `--resync` is needed.
 
 For scripts: `onedrive-ondemand-setup --non-interactive [--profile NAME] [--mount DIR] [--sync-list FOLDER ...] [--application-id GUID] [--azure-tenant-id TENANT] [--use-intune-sso] [--no-auth] [--enable-service] [--force]`. See `--help`.
 
@@ -79,7 +85,7 @@ The default profile `onedrive-ondemand` runs as `onedrive-ondemand.service`; eve
 
 ## Resync
 
-When the client asks for a `--resync` (the service stops with exit status 78), or after changing `sync_dir`/`sync_list`:
+When the client asks for a `--resync` (the service stops with exit status 78), or after changing `sync_list` (or a `sync_dir` change that could not be moved):
 
 ```sh
 onedrive-ondemand-resync                              # default profile onedrive-ondemand
@@ -106,7 +112,16 @@ The service restarts on failure, except when the client exits because a `--resyn
 
 Resync logs: `journalctl --user -u onedrive-ondemand-resync@<profile>`.
 
-When the client stops, the units run `onedrive-ondemand-unmount --confdir=...`, which lazily unmounts (`fusermount3 -u -z`) the profile's `sync_dir` if a stale mount was left behind ("Transport endpoint is not connected"). It can also be run by hand.
+When the client stops, the units run `onedrive-ondemand-unmount --confdir=...`, which lazily unmounts (`fusermount3 -u -z`) the profile's `sync_dir` if a stale mount was left behind ("Transport endpoint is not connected"). After a clean stop it does nothing. The client also unmounts a stale mount itself when it starts, and the files in `sync_dir` underneath are never touched. It can also be run by hand.
+
+The client refuses to start in these cases. The messages are in the journal:
+
+| Message contains | Meaning | What to do |
+|---|---|---|
+| `already mounted by a running on-demand client` | another client (a second unit, or a foreground run) has `sync_dir` mounted | stop that client, or if none is running, `fusermount3 -u -z <sync_dir>` |
+| `does not respond` | the mount on `sync_dir` belongs to a hung client | stop or kill that client, or `fusermount3 -u -z <sync_dir>` |
+| `already contains files` | the old backing directory or the previous `sync_dir` should be moved into `sync_dir`, but `sync_dir` is not empty | move the files yourself (never overwrite), or run a resync |
+| `same filesystem` | that move failed, typically because the source and `sync_dir` are on different filesystems | move the files yourself, or run a resync |
 
 The units deliberately have no sandboxing options: a mount namespace (`ProtectSystem=`, `PrivateTmp=`, ...) would hide the mount from the desktop session, and `NoNewPrivileges=` (implied by `RestrictRealtime=`, `SystemCallFilter=`, ...) breaks the setuid `fusermount3`.
 
@@ -125,4 +140,4 @@ systemctl --user disable --now onedrive-ondemand.service   # and any onedrive-on
 sudo apt remove onedrive-ondemand
 ```
 
-The package has no maintainer scripts. Removing or purging it never touches user configuration or data: `~/.config/<profile>` (config, tokens, database, backing directory with the downloaded files) and the mount folders stay. Stop the services before removing the package; a running client keeps its mount until it exits. To remove a profile completely, delete `~/.config/<profile>` and its (unmounted, empty) mount folder yourself. Hydrated files and changes that were not uploaded yet live in the backing directory, `~/.config/<profile>/ondemand/backing` by default.
+The package has no maintainer scripts. Removing or purging it never touches user configuration or data: `~/.config/<profile>` (config, tokens, database) and the `sync_dir` folders with the downloaded files stay. Stop the services before removing the package; a running client keeps its mount until it exits. Afterwards each `sync_dir` is an ordinary folder with the hydrated files, including changes that were not uploaded yet. To remove a profile completely, delete `~/.config/<profile>` and its `sync_dir` yourself, after checking that nothing in it still needs uploading.

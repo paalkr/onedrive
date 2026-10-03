@@ -14,7 +14,8 @@ Type=oneshot
 # marker exists) and stops the profile's normal unit.
 ExecStartPre=/usr/libexec/onedrive-ondemand/resync-unit pre %i
 ExecStart=/usr/bin/onedrive --on-demand --on-demand-resync-once --confdir=%h/.config/%i
-# Lazily unmounts sync_dir if the client left a stale mount behind (crash, kill)
+# Lazily unmounts sync_dir if the client left a stale mount behind (crash, kill). No-op after a
+# clean stop; the client also recovers a stale mount itself at its next start.
 ExecStopPost=/usr/bin/onedrive-ondemand-unmount --confdir=%h/.config/%i
 # Removes the marker and, only if the resync succeeded, starts the normal unit again.
 # On failure this unit is left in the failed state and the normal unit stays stopped.

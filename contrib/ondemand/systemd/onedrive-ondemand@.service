@@ -16,7 +16,8 @@ Wants=network-online.target
 ExecCondition=/bin/sh -c 'test ! -e "%t/onedrive-ondemand/%i.resyncing"'
 ExecStartPre=/bin/sh -c 'sleep 15'
 ExecStart=/usr/bin/onedrive --monitor --on-demand --confdir=%h/.config/%i
-# Lazily unmounts sync_dir if the client left a stale mount behind (crash, kill)
+# Lazily unmounts sync_dir if the client left a stale mount behind (crash, kill). No-op after a
+# clean stop; the client also recovers a stale mount itself at its next start.
 ExecStopPost=/usr/bin/onedrive-ondemand-unmount --confdir=%h/.config/%i
 Restart=on-failure
 RestartSec=10

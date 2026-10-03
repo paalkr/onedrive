@@ -11,7 +11,10 @@ commands for the first synchronisation and for the systemd user unit. The
 first \fB\-\-resync\fR is never run automatically. The unit is enabled and
 started only when confirmed or with \fB\-\-enable\-service\fR.
 .PP
-The mount folder must be empty or absent. An existing profile with different
+The mount folder (\fBsync_dir\fR) keeps the downloaded files, with the
+mount on top. It may already contain files; they stay visible in the mount
+and take part in the first resync (interactive runs ask for confirmation).
+An existing profile with different
 settings is only overwritten with \fB\-\-force\fR. Running the command again is
 safe: steps that are done are reported and skipped.
 .PP

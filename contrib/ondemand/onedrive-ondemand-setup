@@ -148,16 +148,15 @@ def validate(opts):
         if a == b or a.startswith(b + "/"):
             raise SetupError("the mount folder (%s) and the profile directory (%s) must not contain each other" % (mount, confdir))
     already_mounted = mount in fuse_mountpoints()
+    has_files = False
     if os.path.lexists(mount):
         if not os.path.isdir(mount) or os.path.islink(mount):
             raise SetupError("%s exists and is not a directory" % mount)
         if not already_mounted:
             try:
-                entries = os.listdir(mount)
+                has_files = bool(os.listdir(mount))
             except OSError as e:
                 raise SetupError("cannot read %s: %s (a stale mount? try: onedrive-ondemand-unmount --confdir=%s)" % (mount, e.strerror, confdir))
-            if entries:
-                raise SetupError("%s is not empty. The mount would hide its content; choose an empty or new folder" % mount)
     other = other_profile_using(mount, confdir)
     if other:
         raise SetupError("%s is already the sync_dir of %s" % (mount, other))
@@ -171,7 +170,27 @@ def validate(opts):
         if "\n" in folder or folder.startswith("!") or folder.startswith("-") or ".." in folder.split("/"):
             raise SetupError("sync_list folder '%s' is not valid" % folder)
         folders.append(folder)
-    return confdir, mount, already_mounted, folders
+    # Files of this profile's own sync_dir (hydrated files are kept there) are expected
+    try:
+        with open(os.path.join(confdir, "config"), errors="replace") as f:
+            values = [m.group(1) for m in map(SYNC_DIR_RE.match, f) if m]
+        if values and expand(values[-1]) == mount:
+            has_files = False
+    except OSError:
+        pass
+    return confdir, mount, already_mounted, has_files, folders
+
+
+def confirm_existing_files(opts, mount):
+    """sync_dir holds the profile's local (hydrated) files with the mount on top, so existing files
+    are allowed: they stay visible in the mount and take part in the first --resync."""
+    say("NOTE: %s already contains files. They stay where they are and are visible in the" % mount)
+    say("      mount. The first --resync compares them with OneDrive like a normal synchronisation")
+    say("      (for example, files that are not in OneDrive are uploaded).")
+    if opts.non_interactive:
+        return
+    if not ask_yes_no("Use %s with its existing files?" % mount):
+        raise SetupError("cancelled; choose another folder with --mount")
 
 
 def render_config(opts, mount):
@@ -179,7 +198,9 @@ def render_config(opts, mount):
         "# OneDrive Files On-Demand profile '%s', written by onedrive-ondemand-setup." % opts.profile,
         "# Started by %s (systemd --user) with --monitor --on-demand." % unit_name(opts.profile),
         "# All options: /usr/share/doc/onedrive-ondemand/config and application-config-options.md",
-        "# Changing sync_dir or sync_list later requires a --resync.",
+        "# Downloaded files are kept in sync_dir, under the mount. Changing sync_dir later moves",
+        "# the folder (same filesystem, new folder empty or absent); otherwise a --resync is needed.",
+        "# Changing sync_list later requires a --resync.",
         "sync_dir = %s" % quote_value("mount folder", mount),
     ]
     if opts.application_id:
@@ -237,7 +258,8 @@ def step_profile(opts, confdir, mount, folders):
             raise SetupError("the profile %s already exists with different settings. Use --force to overwrite it (the old files are kept as .bak)" % confdir)
         os.makedirs(confdir, mode=0o700, exist_ok=True)
         if current[config_path] is not None and os.path.exists(os.path.join(confdir, "items.sqlite3")):
-            say("  NOTE: this profile has synchronised before; the next run needs --resync")
+            say("  NOTE: this profile has synchronised before. A changed sync_list needs a --resync;")
+            say("        a changed sync_dir is moved at the next start if possible, otherwise a --resync is needed")
         for path, text in wanted.items():
             if current[path] == text:
                 continue
@@ -348,7 +370,7 @@ def parse_args(argv):
                     "prints the commands for the first synchronisation. Safe to run again.",
         epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--profile", help="profile name, the directory below ~/.config (default: %s)" % DEFAULT_PROFILE)
-    p.add_argument("--mount", help="folder where OneDrive appears; must be empty or absent (default: %s)" % DEFAULT_MOUNT)
+    p.add_argument("--mount", help="folder where OneDrive appears and downloaded files are kept (default: %s)" % DEFAULT_MOUNT)
     p.add_argument("--sync-list", action="append", metavar="FOLDER",
                    help="only present this OneDrive folder (repeatable); default: everything")
     p.add_argument("--business", action="store_true", help="ask for / accept the work or school account options below")
@@ -373,7 +395,7 @@ def interview(opts):
     if opts.profile is None:
         opts.profile = ask("Profile name (directory below ~/.config)", DEFAULT_PROFILE)
     if opts.mount is None:
-        opts.mount = ask("Folder where OneDrive appears (must be empty or new)", DEFAULT_MOUNT)
+        opts.mount = ask("Folder where OneDrive appears", DEFAULT_MOUNT)
     if opts.sync_list is None:
         answer = ask("Only show some OneDrive folders? Comma-separated list, empty for everything", "")
         opts.sync_list = [f for f in answer.split(",") if f.strip()]
@@ -402,7 +424,9 @@ def main(argv):
         opts.application_id = (opts.application_id or "").strip()
         opts.azure_tenant_id = (opts.azure_tenant_id or "").strip()
 
-        confdir, mount, already_mounted, folders = validate(opts)
+        confdir, mount, already_mounted, has_files, folders = validate(opts)
+        if has_files:
+            confirm_existing_files(opts, mount)
         step_profile(opts, confdir, mount, folders)
         is_authorised = step_auth(opts, confdir)
         step_next(opts, confdir, mount, is_authorised, already_mounted)
