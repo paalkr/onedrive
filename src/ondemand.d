@@ -7,7 +7,7 @@ import core.stdc.stdio : renamePath = rename;
 import core.stdc.string : strlen;
 import core.sync.mutex;
 import core.thread : Thread;
-import core.time : MonoTime, dur;
+import core.time : Duration, MonoTime, dur;
 import core.sys.linux.sys.xattr : lgetxattr, llistxattr, lremovexattr, lsetxattr;
 import core.sys.posix.dirent;
 import core.sys.posix.fcntl;
@@ -120,7 +120,14 @@ private final class Handle
 	string servedVersion;
 	bool versionChecked;
 	bool versionBroken;
+	// Unique per handle (the FUSE file handle): the range cache keeps a block for its readers
+	ulong id;
+	bool scannerJoinLogged;
 }
+
+// A scanner reading an online-only file that a user process is opening (a recent lookup or open)
+// reads the downloaded file instead of ranges: fanotify scanners read during the user's open
+private enum Duration deliberateAccessWindow = dur!"seconds"(3);
 
 // A file manager that has read more than this from one handle (a copy or move) gets the file downloaded
 private enum ulong fileManagerRangedLimit = 1024 * 1024;
@@ -261,6 +268,8 @@ final class OnDemandFs : Operations
 	private MonoTime[string] rangedServeLogged;
 	// Paths for which a background service or scanner hit backgroundRangedLimit (logged once)
 	private bool[string] backgroundLimitLogged;
+	// When a normal process last looked up an online-only item (guarded by handleLock)
+	private MonoTime[string] deliberateAccess;
 
 	// Reporting changes made behind the mount's back (notifyBackingChange)
 	private BackgroundFuse mount;
@@ -577,6 +586,7 @@ final class OnDemandFs : Operations
 	private void addHandle(ref fuse_file_info fi, Handle h) {
 		synchronized (handleLock) {
 			fi.fh = nextHandle++;
+			h.id = fi.fh;
 			handles[fi.fh] = h;
 		}
 	}
@@ -759,6 +769,7 @@ final class OnDemandFs : Operations
 			st.st_mode = S_IFDIR | dirMode;
 			st.st_nlink = 2;
 		} else if (isOnlineOnly(item)) {
+			if (!isTouchRequest()) noteDeliberateAccess(item);
 			st.st_mode = S_IFREG | fileMode;
 			st.st_nlink = 1;
 			st.st_size = item.size.length ? item.size.to!long : 0;
@@ -921,8 +932,23 @@ final class OnDemandFs : Operations
 		string contentVersion = HydrationService.contentVersionOf(item);
 		long size = -1;
 		try size = (item.size.length == 0) ? -1 : to!long(item.size); catch (Exception e) {}
+		// A scanner reading during a user's own open: that open downloads the file anyway, so the
+		// scanner joins the download and reads the local file (and never hits the 4 MiB limit)
+		if (h.openByScanner && deliberateInterest(item)) {
+			bool first;
+			synchronized (h) {
+				first = !h.scannerJoinLogged;
+				h.scannerJoinLogged = true;
+				h.escalated = true;
+			}
+			if (first) addLogEntry("On-demand: " ~ h.callerIdentity ~ " reads " ~ dbPath(path) ~ " while a user process opens it; reading the downloaded file");
+			return false;
+		}
 		synchronized (h) {
-			if (h.servedVersion.length && (h.servedVersion != contentVersion)) {
+			// The first read fixes the handle's version (before the fetch, so concurrent first reads
+			// of one handle cannot be served from two versions)
+			if (h.servedVersion.length == 0) h.servedVersion = contentVersion;
+			if (h.servedVersion != contentVersion) {
 				h.versionBroken = true;
 				addLogEntry("On-demand: " ~ dbPath(path) ~ " changed online while " ~ h.callerIdentity ~ " was reading it; failing that read");
 				fail(EIO);
@@ -939,17 +965,41 @@ final class OnDemandFs : Operations
 		}
 		ubyte[] data;
 		try {
-			data = hydration.readRange(item.driveId, item.id, contentVersion, size, offset, buf.length);
+			data = hydration.readRange(item.driveId, item.id, contentVersion, size, offset, buf.length, h.id);
 		} catch (HydrationError e) {
 			fail(e.errnoCode == ENOENT ? ENOENT : EIO);
 		}
 		buf[0 .. data.length] = data[];
-		synchronized (h) {
-			h.servedVersion = contentVersion;
-			h.rangedBytes += data.length;
-		}
+		synchronized (h) h.rangedBytes += data.length;
 		served = data.length;
 		return true;
+	}
+
+	// Does a user process want this item now: a handle of a normal process is open on it, its
+	// download is in flight, or a normal process looked it up within deliberateAccessWindow?
+	private bool deliberateInterest(const ref Item item) {
+		synchronized (handleLock) {
+			foreach (other; handles)
+				if (!other.background && !other.touch && (other.openId == item.id) && (other.openDriveId == item.driveId)) return true;
+		}
+		try {
+			if (hydration.isHydrating(item.driveId, item.id)) return true;
+		} catch (HydrationError e) {}
+		synchronized (handleLock) {
+			if (auto at = itemKey(item) in deliberateAccess) return MonoTime.currTime - *at <= deliberateAccessWindow;
+		}
+		return false;
+	}
+
+	// getattr/lookup of an online-only file by a normal process (not a background reader, scanner,
+	// thumbnailer or the touch thread): remembered for deliberateInterest
+	private void noteDeliberateAccess(const ref Item item) {
+		Caller caller = currentCaller();
+		if ((caller.pid <= 0) || (readerClassOf(caller) != ReaderClass.normal) || (callerName(caller, thumbnailerNames) !is null)) return;
+		synchronized (handleLock) {
+			if (deliberateAccess.length > 10_000) deliberateAccess = null;
+			deliberateAccess[itemKey(item)] = MonoTime.currTime;
+		}
 	}
 
 	// After a handle's ranged reads the rest comes from the local file (escalation, or another

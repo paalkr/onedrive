@@ -503,6 +503,7 @@ ctl "offline~1"
 T0=$(ms); OUT="$(read_as nautilus "$M/docs/offline.bin" 4096 2>&1)"; T1=$(ms)
 ctl "offline~0"
 ok "B5 offline: a background read fails with EIO at once ($((T1 - T0)) ms), nothing downloaded" 'echo "$OUT" | grep -q "Input/output error" && [ $((T1 - T0)) -lt 3000 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(xget "$M/docs/offline.bin" user.onedrive.state)" = online-only ]'
+sleep 3.2   # no recent lookup of the file by a normal process (the tests' own xattr reads)
 N=$(read_as clamonacc "$M/docs/offline.bin" 100)
 ok "B6 an on-access scanner is a background reader too: served without a download" '[ "$N" = 14 ] && [ "$(downloads docs/offline.bin)" = 0 ] && [ "$(ranges docs/offline.bin)" = 1 ]'
 OUT="$(read_as tracker-extract "$M/docs/index.bin" 6291456 2>&1)"
@@ -537,6 +538,21 @@ open(sys.argv[6] + ".then", "wb").write(got)' "$1" "$2" "$3" "$4" "$5" "$T" > "$
 	PHASED=$!
 	for i in $(seq 1 100); do grep -q FIRST "$T/phase.out" && break; sleep 0.1; done
 }
+# Scanners during a user's own open read the downloaded file (no 4 MiB limit)
+sleep 1.2   # the kernel's attribute cache of earlier lookups expires
+OUT="$(read_as clamonacc "$M/docs/scan4.bin" 6291456 2>&1)"
+ok "B10 a scanner alone keeps the 4 MiB limit: EIO, nothing downloaded" 'echo "$OUT" | grep -q "Input/output error" && [ "$(downloads docs/scan4.bin)" = 0 ]'
+t python3 -c 'import sys, time; f = open(sys.argv[1], "rb"); print("OPEN", flush=True); time.sleep(4); f.close()' "$M/docs/scan.bin" > "$T/user.out" 2>&1 & USER=$!
+for i in $(seq 1 50); do grep -q OPEN "$T/user.out" && break; sleep 0.1; done
+N=$(read_as clamonacc "$M/docs/scan.bin" 6291456 "$T/scan.out"); wait $USER
+ok "B10 a scanner reading while a user process has the file open: full read from the downloaded file" '[ "$N" = "$(stat -c %s "$R/docs/scan.bin")" ] && cmp -s "$T/scan.out" "$R/docs/scan.bin" && [ "$(downloads docs/scan.bin)" = 1 ] && grep -q "reads ./docs/scan.bin while a user process opens it" "$LOG"'
+t stat "$M/docs/scan2.bin" >/dev/null
+N=$(read_as clamonacc "$M/docs/scan2.bin" 6291456 "$T/scan2.out")
+ok "B11 a scanner reading right after a user process looked the file up: full read, one download" '[ "$N" = "$(stat -c %s "$R/docs/scan2.bin")" ] && cmp -s "$T/scan2.out" "$R/docs/scan2.bin" && [ "$(downloads docs/scan2.bin)" = 1 ]'
+read_as reader "$M/docs/scan3.bin" 1 >/dev/null & READER=$!
+sleep 0.1
+N=$(read_as clamonacc "$M/docs/scan3.bin" 6291456 "$T/scan3.out"); wait $READER
+ok "B12 a scanner joins a download in flight: full read, one download" '[ "$N" = "$(stat -c %s "$R/docs/scan3.bin")" ] && cmp -s "$T/scan3.out" "$R/docs/scan3.bin" && [ "$(downloads docs/scan3.bin)" = 1 ]'
 cp "$R/docs/ver.bin" "$T/ver.v1"
 phased nautilus "$M/docs/ver.bin" 4096 1572864 4096
 ctl "newversion~f-ver~docs%ver.bin"

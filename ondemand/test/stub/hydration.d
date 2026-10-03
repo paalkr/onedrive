@@ -168,7 +168,14 @@ final class HydrationService
 		return "e:" ~ item.eTag;
 	}
 
-	ubyte[] readRange(string driveId, string id, string contentVersion, long expectedSize, ulong offset, size_t length)
+	bool isHydrating(string driveId, string id)
+	{
+		lock.lock();
+		scope(exit) lock.unlock();
+		return (key(driveId, id) in inFlight) !is null;
+	}
+
+	ubyte[] readRange(string driveId, string id, string contentVersion, long expectedSize, ulong offset, size_t length, ulong reader)
 	{
 		if (rangeLock is null) synchronized (this) if (rangeLock is null) rangeLock = new Mutex();
 		auto k = key(driveId, id);

@@ -120,6 +120,10 @@ void main(string[] args)
 		onlineFile("f-index", "d-docs", "docs/index.bin", make(6, "idx-"));
 		onlineFile("f-ver", "d-docs", "docs/ver.bin", make(2, "ver-"));
 		onlineFile("f-ver2", "d-docs", "docs/ver2.bin", make(2, "vr2-"));
+		onlineFile("f-scan", "d-docs", "docs/scan.bin", make(6, "sc1-"));
+		onlineFile("f-scan2", "d-docs", "docs/scan2.bin", make(6, "sc2-"));
+		onlineFile("f-scan3", "d-docs", "docs/scan3.bin", make(6, "sc3-"));
+		onlineFile("f-scan4", "d-docs", "docs/scan4.bin", make(6, "sc4-"));
 	}
 	// V3: a directory whose only child is online-only, and files to rename over
 	add("d-target", "d-docs", "target", ItemType.dir);
