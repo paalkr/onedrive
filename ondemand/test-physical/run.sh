@@ -3,11 +3,25 @@
 # start, migration from the previous layout's backing directory, a moved sync_dir, refusals, and the
 # crash-between-staging-and-rename recovery. Each client run has a fake refresh token, so it stops
 # at authentication (exit 1) after the on-demand preparation under test. Mounts only under $TMPDIR.
-# Usage: run.sh <onedrive binary> <odtest binary> <helper build dir with mkdb and stagingtest>
+# Usage, from the repository root after ./configure DC=ldc2 && make (which writes ./version):
+#   run.sh <onedrive binary> <odtest binary> [<dir with prebuilt mkdb and stagingtest>]
+# Without the third argument the helpers are built into a temporary directory with:
+#   ldc2 -w -i -J . -I src -od=<dir>/obj -of=<dir>/<helper> ondemand/test-physical/<helper>.d \
+#     $(pkg-config --libs-only-l libcurl sqlite3 dbus-1 | sed 's/-l/-L-l/g') -L-ldl
 set -u
-BIN="$(realpath "$1")"; ODT="$(realpath "$2")"; H="$(realpath "$3")"
+BIN="$(realpath "$1")"; ODT="$(realpath "$2")"
 T="$(mktemp -d "${TMPDIR:-/tmp}/odphys.XXXXXX")"
 case "$(cd "$T" && git rev-parse --is-inside-work-tree 2>/dev/null)" in true) echo "inside a git work tree, refusing"; exit 2;; esac
+if [ $# -ge 3 ]; then
+	H="$(realpath "$3")"
+else
+	[ -f version ] && [ -d src ] || { echo "run from the repository root after make (needs ./version and src/)"; exit 2; }
+	H="$T/build"; mkdir -p "$H"
+	for helper in mkdb stagingtest; do
+		ldc2 -w -i -J . -I src -od="$H/obj" -of="$H/$helper" "ondemand/test-physical/$helper.d" \
+			$(pkg-config --libs-only-l libcurl sqlite3 dbus-1 | sed 's/-l/-L-l/g') -L-ldl || { echo "building $helper failed"; exit 2; }
+	done
+fi
 PASS=0; FAIL=0
 ok() { if eval "$2"; then echo "PASS $1"; PASS=$((PASS+1)); else echo "FAIL $1"; FAIL=$((FAIL+1)); fi; }
 mounted() { grep -q " $1 fuse" /proc/mounts; }
