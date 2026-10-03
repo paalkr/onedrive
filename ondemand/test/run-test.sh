@@ -184,12 +184,24 @@ ok "I2 st_blocks of hydrated file from backing file" '[ "$(t stat -c %b "$M/docs
 
 echo "== I2 user.onedrive.action on a file"
 act() { xset "$1" user.onedrive.action "$2"; }
+# Free of a file that was just hydrated. An on-access scanner (fanotify) reads a newly written
+# physical file by its path, which goes through the mount, so the file can be open for a moment
+# and free refuses with EBUSY. Retries while it is busy, for up to 6 s.
+act_free_after_hydrate() {
+	local out
+	for i in $(seq 1 30); do
+		out="$(act "$1" free)"
+		echo "$out" | grep -q "Device or resource busy" || break
+		sleep 0.2
+	done
+	echo "$out"
+}
 ok "I2 listxattr lists only the state" '[ "$(t python3 -c "import os,sys; print(\" \".join(os.listxattr(sys.argv[1])))" "$M/one.txt")" = user.onedrive.state ]'
 ok "I2 action is write-only (ENODATA on read)" 'xget "$M/one.txt" user.onedrive.action | grep -q "No data available"'
 ok "I2 unknown action: EINVAL" 'act "$M/one.txt" bogus | grep -q "Invalid argument"'
 act "$M/one.txt" download
 ok "I2 file download: hydrated, backing present" '[ "$(xget "$M/one.txt" user.onedrive.state)" = hydrated ] && [ -f "$B/one.txt" ] && [ "$(downloads one.txt)" = 1 ]'
-act "$M/one.txt" free
+act_free_after_hydrate "$M/one.txt"
 ok "I2 file free: online-only, backing gone, size kept" '[ "$(xget "$M/one.txt" user.onedrive.state)" = online-only ] && [ ! -e "$B/one.txt" ] && [ "$(t stat -c %s "$M/one.txt")" = 19 ]'
 act "$M/one.txt" pin
 ok "I2 file pin: pinned" '[ "$(xget "$M/one.txt" user.onedrive.state)" = pinned ] && [ -f "$B/one.txt" ]'
