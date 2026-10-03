@@ -95,6 +95,7 @@ void main(string[] args)
 	onlineFile("f-deep", "d-sub", "docs/sub/deep.txt", "deep\n");
 	onlineFile("f-write", "root", "write-me.txt", "0123456789\n");
 	onlineFile("f-trunc0", "d-docs", "docs/trunc0.txt", "old content for truncate -s 0\n");
+	onlineFile("f-who", "d-docs", "docs/who.txt", "who reads me\n");
 	// V3: a directory whose only child is online-only, and files to rename over
 	add("d-target", "d-docs", "target", ItemType.dir);
 	onlineFile("f-target", "d-target", "docs/target/t.txt", "only child\n");

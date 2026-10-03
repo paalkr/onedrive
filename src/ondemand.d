@@ -103,8 +103,9 @@ private final class Handle
 	// The database item reported to HydrationService.noteOpen(), closed on release
 	string openDriveId;
 	string openId;
-	// Opened by a known on-access scanner (reported to noteOpen/noteClose)
+	// Opened by a known on-access scanner (reported to noteOpen/noteClose), and who that was
 	bool openByScanner;
+	string scannerIdentity;
 }
 
 // Thumbnailers, by full name and by the 15-character /proc/<pid>/comm truncation
@@ -126,38 +127,57 @@ private immutable string[] onAccessScannerNames = [
 	"esets_daemon", "esets_scanner",                                       // ESET
 ];
 
-// Is the process that sent the current FUSE request a thumbnailer? pid 0 (not visible in our
-// pid namespace) or an unreadable /proc entry counts as not a thumbnailer.
-private string thumbnailerCaller() {
-	return callerNamed(thumbnailerNames);
+// The process that sent the current FUSE request. The request carries a thread id; the thread's
+// comm, the comm of its process (scanners name their threads differently), the executable and the
+// parent's comm are read from /proc. Fields that cannot be read stay empty; pid 0 means the caller
+// is not visible in our pid namespace.
+private struct Caller {
+	int pid;
+	string threadComm, processComm, exe, parentComm;
+
+	// For the log: "pid=... thread=... process=... exe=... parent=..."
+	string toString() const {
+		string field(string value) { return value.length == 0 ? "?" : value; }
+		return "pid=" ~ to!string(pid) ~ " thread=" ~ field(threadComm) ~ " process=" ~ field(processComm)
+			~ " exe=" ~ field(exe) ~ " parent=" ~ field(parentComm);
+	}
 }
 
-// Is the process that sent the current FUSE request a known on-access scanner? Same rules.
-private string onAccessScannerCaller() {
-	return callerNamed(onAccessScannerNames);
-}
-
-// The name in 'known' of the process that sent the current FUSE request, or null. The request
-// carries a thread id: the thread's comm, the comm of its process (scanners name their threads
-// differently) and the executable are compared.
-private string callerNamed(const(string)[] known) {
+private Caller currentCaller() {
 	import c.fuse.fuse : fuse_get_context;
 	import std.file : readLink, readText;
 	import std.string : strip, splitLines, startsWith;
+	Caller caller;
 	auto context = fuse_get_context();
-	if (context is null || context.pid <= 0) return null;
+	if (context is null || context.pid <= 0) return caller;
+	caller.pid = context.pid;
 	string proc = "/proc/" ~ to!string(context.pid);
-	string[] names;
-	try names ~= readText(proc ~ "/comm").strip; catch (Exception e) {}
+	try caller.threadComm = readText(proc ~ "/comm").strip; catch (Exception e) {}
+	string tgid, ppid;
 	try {
-		foreach (line; readText(proc ~ "/status").splitLines())
-			if (line.startsWith("Tgid:")) names ~= readText("/proc/" ~ line[5 .. $].strip ~ "/comm").strip;
+		foreach (line; readText(proc ~ "/status").splitLines()) {
+			if (line.startsWith("Tgid:")) tgid = line[5 .. $].strip;
+			if (line.startsWith("PPid:")) ppid = line[5 .. $].strip;
+		}
 	} catch (Exception e) {}
-	// comm can be changed by the process and is truncated; the executable is the backstop
-	try names ~= baseName(readLink(proc ~ "/exe")).chompDeleted; catch (Exception e) {}
-	foreach (name; names)
+	if (tgid.length) {
+		try caller.processComm = readText("/proc/" ~ tgid ~ "/comm").strip; catch (Exception e) {}
+	}
+	if (ppid.length && ppid != "0") {
+		try caller.parentComm = readText("/proc/" ~ ppid ~ "/comm").strip; catch (Exception e) {}
+	}
+	try caller.exe = baseName(readLink(proc ~ "/exe")).chompDeleted; catch (Exception e) {}
+	return caller;
+}
+
+// The name in 'known' (thumbnailerNames, onAccessScannerNames) of the caller, or null: the thread's
+// comm, its process's comm and the executable are compared (comm can be changed by the process and
+// is truncated; the executable is the backstop). pid 0 or unreadable /proc entries match nothing.
+private string callerName(const ref Caller caller, const(string)[] known) {
+	if (caller.pid <= 0) return null;
+	foreach (name; [caller.threadComm, caller.processComm, caller.exe])
 		foreach (candidate; known)
-			if (name == candidate) return name;
+			if (name.length && (name == candidate)) return name;
 	return null;
 }
 
@@ -418,18 +438,19 @@ final class OnDemandFs : Operations
 		if (!resolveSettled(path, item)) fail(ENOENT);
 		if (existsPath(backingPath(path)) || !isOnlineOnly(item)) return;
 		// Thumbnails for online-only files come from OneDrive; never download a file to draw one
-		string thumbnailer = thumbnailerCaller();
+		Caller caller = currentCaller();
+		string thumbnailer = callerName(caller, thumbnailerNames);
 		if (thumbnailer !is null) {
 			bool first;
 			synchronized (thumbnailLogLock) {
 				first = (itemKey(item) in thumbnailRefusalLogged) is null;
 				thumbnailRefusalLogged[itemKey(item)] = true;
 			}
-			if (first) addLogEntry("On-demand: not downloading " ~ dbPath(path) ~ " for thumbnailer " ~ thumbnailer);
+			if (first) addLogEntry("On-demand: not downloading " ~ dbPath(path) ~ " for thumbnailer " ~ thumbnailer ~ " (" ~ caller.toString() ~ ")");
 			fail(EIO);
 		}
 		try {
-			hydration.hydrate(item.driveId, item.id);
+			hydration.hydrate(item.driveId, item.id, caller.toString() ~ (callerName(caller, onAccessScannerNames) !is null ? " on-access scanner" : ""));
 		} catch (HydrationError e) {
 			addLogEntry("On-demand download failed for " ~ dbPath(path) ~ ": " ~ e.msg);
 			fail(e.errnoCode ? e.errnoCode : EIO);
@@ -459,7 +480,8 @@ final class OnDemandFs : Operations
 	private void noteOpened(const(char)[] path, Handle h) {
 		Item item;
 		if (!resolve(path, item) || item.type != ItemType.file) return;
-		bool scanner = onAccessScannerCaller() !is null;
+		Caller caller = currentCaller();
+		bool scanner = callerName(caller, onAccessScannerNames) !is null;
 		try {
 			hydration.noteOpen(item.driveId, item.id, scanner);
 		} catch (HydrationError e) {
@@ -469,6 +491,18 @@ final class OnDemandFs : Operations
 		h.openDriveId = item.driveId;
 		h.openId = item.id;
 		h.openByScanner = scanner;
+		if (scanner) h.scannerIdentity = caller.toString();
+	}
+
+	// The on-access scanners that hold the item open now, for a refusal log line
+	private string scannersHolding(const ref Item item) {
+		string[] holders;
+		synchronized (handleLock) {
+			foreach (h; handles)
+				if (h.openByScanner && (h.openId == item.id) && (h.openDriveId == item.driveId)) holders ~= h.scannerIdentity;
+		}
+		import std.array : join;
+		return holders.join("; ");
 	}
 
 	private Handle handleOf(ref fuse_file_info fi) {
@@ -1085,7 +1119,8 @@ final class OnDemandFs : Operations
 		try {
 			hydration.requestAction(item.driveId, item.id, action);
 		} catch (HydrationError e) {
-			addLogEntry("On-demand " ~ to!string(action) ~ " failed for " ~ dbPath(path) ~ ": " ~ e.msg);
+			string scanners = (e.errnoCode == EBUSY) ? scannersHolding(item) : null;
+			addLogEntry("On-demand " ~ to!string(action) ~ " failed for " ~ dbPath(path) ~ ": " ~ e.msg ~ (scanners.length == 0 ? "" : " (open by on-access scanner " ~ scanners ~ ")"));
 			fail(e.errnoCode ? e.errnoCode : EIO);
 		}
 	}

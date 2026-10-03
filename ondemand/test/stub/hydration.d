@@ -276,7 +276,7 @@ final class HydrationService
 		stubLog("STUB noteLocalContent ", itemDB.computePath(driveId, id));
 	}
 
-	void hydrate(string driveId, string id)
+	void hydrate(string driveId, string id, string requestedBy = null)
 	{
 		auto k = key(driveId, id);
 		lock.lock();
@@ -305,6 +305,7 @@ final class HydrationService
 		scope(exit) if (!relocked) lock.lock();
 
 		stubLog("STUB download ", *remote, " to ", rel);
+		if (requestedBy.length) stubLog("STUB hydrating ", rel, " requested by ", requestedBy);
 		if (downloadDelayMsecs)
 			Thread.sleep(dur!"msecs"(downloadDelayMsecs));
 		if (!exists(source))
