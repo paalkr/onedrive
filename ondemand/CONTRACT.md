@@ -5,9 +5,11 @@ Working contract between the `engine` and `vfs` work streams. Local prototype, n
 ## Shape
 
 - `sync_dir` (from config) becomes the FUSE mountpoint the user sees.
-- The engine runs unchanged against a real backing directory: `runtimeSyncDirectory` is set to the backing dir when `on_demand = true`. Default backing dir: `<confdir>/ondemand/backing`, overridable with `on_demand_backing_dir`.
-- Hydrated files exist in the backing dir. Online-only files do not. Directories always exist in the backing dir.
-- The FUSE layer is the only writer of the backing dir while mounted. External writes to the backing dir are unsupported. The inotify monitor is not started on the backing dir in on-demand mode.
+- **Layout (iteration 5, see "Physical sync_dir layout" below):** the physical `sync_dir` holds the hydrated files, with the FUSE mount on top of it. "Backing dir" in this document means that physical directory under the mount. It is reached as `/proc/self/fd/<n>`, a directory descriptor opened before the mount.
+  - The engine runs unchanged against it. `runtimeSyncDirectory` is `sync_dir`, and the working directory is set to it before the mount, so all relative `./` paths stay on the physical tree.
+  - The previous layout used a separate backing directory (`<confdir>/ondemand/backing`, or the now deprecated `on_demand_backing_dir`). Its content is migrated once.
+- Hydrated files exist in the backing dir. Online-only files do not. Directories always exist in the backing dir. When the client is stopped (unmounted), hydrated files and all folders are directly visible in `sync_dir`.
+- While mounted, the FUSE layer is the only writer of the backing dir. External writes to the backing dir are unsupported. The inotify monitor is not started in on-demand mode; local changes come from the FUSE change queue.
 - `on_demand = true` requires `--monitor`.
 
 ## Database (engine owns)
@@ -197,3 +199,39 @@ Stay on the existing xattr interface (`user.onedrive.action`, `user.onedrive.sta
 - Status window per profile: current transfers with progress; an Issues view split into "Handled automatically" (info) and "Needs attention" (attention) with actions: open folder, open file, view online (via xattr weburl in on-demand mode), dismiss.
 - Profile setup: option "Files On-Demand" that writes a profile usable by `onedrive-ondemand@<profile>.service` and offers to enable that unit instead of GUI-managed process start.
 - Folder selection (sync_list) and settings use OneDriveGUI's existing editors.
+
+## Iteration 5: physical sync_dir layout (engine, with the FUSE side)
+
+Hydrated files live in the physical `sync_dir`, with the FUSE mount on top of it (upstream ADR-001 §11). There is no separate backing directory.
+
+### Startup order (main.d)
+1. **Option checks.**
+2. **`prepareOnDemandPhysicalSyncDir()`:**
+   - **Stale mount:** an on-demand mount on `sync_dir` is probed with `statfs` in a child process with a timeout. If it answers, another client is running and the start is refused. If it times out, a hung client holds it and the start is refused. If it fails (dead, ENOTCONN), it is unmounted with `fusermount3 -u -z` (refused if that fails). The client never changes into a dead mount.
+   - **Relocation:** if the database marker `<db>.ondemand` records another directory (the previous layout's backing dir, or the previous `sync_dir` after a change), that directory is moved to `sync_dir` with one `rename()`. That needs the same filesystem and an absent or empty `sync_dir`; otherwise the start is refused with a message. No copying and no overwriting, the database is not changed, and nothing is uploaded or deleted. Without a marker, a non-empty `<confdir>/ondemand/backing` is migrated the same way.
+   - **After the move:** the marker is rewritten to `sync_dir`, and the previous layout's `.<backing>.staging` is removed.
+3. **Database check** (`checkOnDemandProfileState`, unchanged): the marker must record `sync_dir`, or the database must be empty.
+4. **`chdir(sync_dir)`, then `open(".", O_DIRECTORY)`:** `appConfig.onDemandPhysicalRoot` becomes `/proc/self/fd/<n>`, before the mount.
+5. **First sync cycle, then the mount** on top of `sync_dir` (`startOnDemandMount(..., backingDir = onDemandPhysicalRoot, ...)`).
+
+### Rules
+- **Engine paths:** the engine uses paths relative to its working directory, which stays on the physical directory after the mount. An absolute path built from `sync_dir` resolves through the mount and must not be used for file access. The places that did are fixed:
+  - `pathIsProtectedByNoSync`
+  - the relative-symlink check (restores the working directory with `fchdir`)
+  - the recycle bin move
+  - `getPathOwnerMismatch`
+  - `configuredBusinessSharedFilesDirectoryName` (relative in on-demand mode)
+- **FUSE threads and HydrationService:** they use `/proc/self/fd/<n>/...`. The root is `/proc/self/fd/<n>/` with a trailing slash, because `lstat` of the bare magic link reports the link itself.
+- **Staging:** hydrations stage in `<sync_dir>/.onedrive-ondemand-staging` (`onDemandStagingDirName`), so the final rename stays on one filesystem.
+  - The FUSE layer hides it: ENOENT in getattr, not listed, and create/mkdir/rename to it give EACCES.
+  - The engine's local scan never enters it (`isOnDemandStagingPath`).
+  - A download left there by a crash is removed when HydrationService starts. The item keeps state O, because the state is only set after the rename into place.
+- **`sync_dir` change:** this moves the physical directory (same filesystem). Otherwise `--resync` is required, as before.
+- **Offline changes:** with the client stopped, hydrated files are ordinary files. The first sync cycle after the start handles them as in normal mode:
+  - a changed file is uploaded (consistency check);
+  - a new file is uploaded (local scan);
+  - a deleted hydrated file (H or P, absent) is a real delete;
+  - a rename is a delete plus a new file.
+
+  Online-only items (O, absent) stay in sync (§13 invariant).
+- **`on_demand_backing_dir`:** deprecated. It is only read as the source of the one-time migration, with a warning.

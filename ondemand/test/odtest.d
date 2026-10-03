@@ -1,7 +1,11 @@
 /*
  * Standalone test harness for src/ondemand.d against the stub hydration
- * module. Builds a temp ItemDatabase (the real src/itemdb.d), a fake remote
- * and a backing dir under <work>, mounts OnDemandFs on <mnt>, prints every
+ * module. Builds a temp ItemDatabase (the real src/itemdb.d) and a fake
+ * remote under <work>. As the client does, <mnt> is the physical sync_dir:
+ * hydrated files are created in it, a directory descriptor is opened on it
+ * before OnDemandFs is mounted on top of it, and everything reaches the
+ * physical tree through /proc/self/fd/<n>. Prints "PHYSICAL <pid> <n>"
+ * (other processes reach the shadowed tree as /proc/<pid>/fd/<n>), every
  * change event, and stops when <work>/stop appears. Driven by run-test.sh.
  *
  * Moves under ./apply are applied to the database one second after their
@@ -37,7 +41,16 @@ void main(string[] args)
 	scope(exit) shutdownLogging();
 
 	string remote = buildPath(work, "remote");
-	string backing = buildPath(work, "backing");
+	// The physical sync_dir is the mountpoint itself, reached through a descriptor opened before the mount
+	mkdirRecurse(mnt);
+	import core.sys.posix.fcntl : openFd = open, O_RDONLY, O_DIRECTORY;
+	import core.sys.posix.unistd : getpid;
+	import std.string : toStringz;
+	int physicalFd = openFd(toStringz(mnt), O_RDONLY | O_DIRECTORY);
+	if (physicalFd < 0) throw new Exception("cannot open " ~ mnt);
+	string backing = "/proc/self/fd/" ~ physicalFd.to!string;
+	writeln("PHYSICAL ", getpid(), " ", physicalFd);
+	stdout.flush();
 	foreach (d; ["docs/sub", "docs/target", "apply/d1", "hold/d1", "shared"]) {
 		mkdirRecurse(buildPath(remote, d));
 		mkdirRecurse(buildPath(backing, d));

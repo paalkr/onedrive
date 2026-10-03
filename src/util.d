@@ -2916,8 +2916,10 @@ private bool getPathOwnerMismatch(string path, out uint fileUid, out uint effect
 		effectiveUid = cast(uint) geteuid();
 
 		try {
-			// absolutePath can throw; keep this helper non-throwing
-			auto fullPath = absolutePath(path);
+			// The path is used as given (relative to the working directory, like absolutePath() would
+			// resolve it): in on-demand mode the absolute 'sync_dir' path would resolve through the FUSE
+			// mount instead of the physical directory, which is the working directory
+			auto fullPath = path;
 
 			// Ensure we pass a NUL-terminated string to the C API
 			auto cpath = toStringz(fullPath);

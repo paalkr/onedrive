@@ -1,7 +1,7 @@
 #!/bin/bash
 # Which FUSE kernel notification makes an inotify watcher on a mounted
 # directory see a change made to the backing dir behind the mount's back?
-# Mounts odtest under $TMPDIR, watches <mnt>/notify, changes <backing>/notify
+# Mounts odtest under $TMPDIR, watches <mnt>/notify, changes the physical <mnt>/notify under the mount
 # directly, sends one notification and prints the events that arrived.
 # Usage: notify-matrix.sh <odtest binary>
 set -u
@@ -23,7 +23,7 @@ trap cleanup EXIT
 timeout 300 "$BIN" "$W" "$M" 0 > "$LOG" 2>&1 &
 PID=$!
 for i in $(seq 1 50); do grep -q READY "$LOG" && break; sleep 0.1; done
-B="$W/backing/notify"
+B="/proc/$(awk '/^PHYSICAL/{print $2; exit}' "$LOG")/fd/$(awk '/^PHYSICAL/{print $3; exit}' "$LOG")/notify"
 ctl() {
 	local n; n=$(grep -c "^CTL $1\$" "$LOG")
 	touch "$W/ctl/$1"

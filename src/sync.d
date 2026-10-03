@@ -7,6 +7,8 @@ import core.stdc.errno : ENOENT, ENOTDIR;
 import core.thread;
 import core.time;
 import core.sync.mutex;
+static import core.sys.posix.fcntl;
+static import core.sys.posix.unistd;
 import std.algorithm;
 import std.array;
 import std.concurrency;
@@ -6369,10 +6371,13 @@ class SyncEngine {
 
 		// Calculate all the initial paths required
 		string computedFullLocalPath = absolutePath(path);
+		// On-demand: move from the relative path (the physical 'sync_dir' is the working directory);
+		// the absolute path above is only the trash metadata's original location
+		string moveSourcePath = (onDemand && !isAbsolute(path)) ? path : computedFullLocalPath;
 		string fileNameOnly = baseName(path);
 		string computedRecycleBinFilePath = appConfig.recycleBinFilePath ~ fileNameOnly;
 		string computedRecycleBinInfoPath = appConfig.recycleBinInfoPath ~ fileNameOnly ~ ".trashinfo";
-		bool isPathFile = isFile(computedFullLocalPath);
+		bool isPathFile = isFile(moveSourcePath);
 
 		// The 'destination' needs to be unique, but if there is a 'collision' the RecycleBin paths need to be updated to be:
 		// - file1.data (1)
@@ -6406,7 +6411,7 @@ class SyncEngine {
 		//   https://forum.dlang.org/thread/kwnwrlqtjehldckyfmau@forum.dlang.org
 		// Use rename() as Linux is POSIX compliant, we have an atomic operation where at no point in time the 'to' is missing.
 		try {
-			rename(computedFullLocalPath, computedRecycleBinFilePath);
+			rename(moveSourcePath, computedRecycleBinFilePath);
 		} catch (Exception e) {
 			// The source path remains in sync_dir. Report failure to the caller so
 			// the corresponding database identity is retained and the move retried.
@@ -7440,9 +7445,20 @@ class SyncEngine {
 			return false;
 		}
 
-		string syncRoot = buildNormalizedPath(absolutePath("."));
-		string candidatePath = buildNormalizedPath(absolutePath(localPath));
-		string relativeCandidate = buildNormalizedPath(relativePath(candidatePath, syncRoot));
+		string syncRoot;
+		string candidatePath;
+		string relativeCandidate;
+		if (onDemand && !isAbsolute(localPath)) {
+			// On-demand: stay relative to the working directory, the physical 'sync_dir'. The absolute
+			// form ("sync_dir/...") would resolve through the FUSE mount on top of it.
+			syncRoot = ".";
+			candidatePath = buildNormalizedPath(localPath);
+			relativeCandidate = candidatePath;
+		} else {
+			syncRoot = buildNormalizedPath(absolutePath("."));
+			candidatePath = buildNormalizedPath(absolutePath(localPath));
+			relativeCandidate = buildNormalizedPath(relativePath(candidatePath, syncRoot));
+		}
 
 		// Never allow a .nosync marker outside the configured sync root to affect this client.
 		if ((relativeCandidate == "..") || startsWith(relativeCandidate, "../")) {
@@ -7571,12 +7587,24 @@ class SyncEngine {
 					string fullLinkPath = buildNormalizedPath(absolutePath(localFilePath));
 					string fileName = baseName(fullLinkPath);
 					string parentLinkPath = dirName(fullLinkPath);
+					// On-demand: the absolute 'sync_dir' path is the FUSE mount, and chdir(getcwd()) would
+					// move the working directory onto it. Use the relative parent and restore by descriptor.
+					int savedWorkingDirectory = -1;
+					if (onDemand && !isAbsolute(localFilePath)) {
+						savedWorkingDirectory = core.sys.posix.fcntl.open(".", core.sys.posix.fcntl.O_RDONLY | core.sys.posix.fcntl.O_DIRECTORY | core.sys.posix.fcntl.O_CLOEXEC);
+						parentLinkPath = dirName(buildNormalizedPath(localFilePath));
+					}
 					// test if this is a 'relative' symbolic link
 					chdir(parentLinkPath);
 					auto relativeLink = readLink(fileName);
 					auto relativeLinkTest = exists(readLink(fileName));
 					// reset back to our 'sync_dir'
-					chdir(currentSyncDir);
+					if (savedWorkingDirectory >= 0) {
+						core.sys.posix.unistd.fchdir(savedWorkingDirectory);
+						core.sys.posix.unistd.close(savedWorkingDirectory);
+					} else {
+						chdir(currentSyncDir);
+					}
 					// results
 					if (relativeLinkTest) {
 						if (debugLogging) {addLogEntry("Not skipping item - symbolic link is a 'relative link' to target ('" ~ relativeLink ~ "') which can be supported: " ~ localFilePath, ["debug"]);}
@@ -9947,6 +9975,12 @@ class SyncEngine {
 				if (verboseLogging) {addLogEntry("Skipping item - skip symbolic links configured: " ~ path, ["verbose"]);}
 				return;
 			}
+		}
+
+		// On-demand: the hydration staging directory in 'sync_dir' is never scanned or uploaded
+		if (onDemand && isOnDemandStagingPath(path)) {
+			if (debugLogging) {addLogEntry("Skipping the on-demand hydration staging directory: " ~ path, ["debug"]);}
+			return;
 		}
 
 		// .nosync is a subtree boundary, including for directories that already

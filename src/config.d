@@ -301,10 +301,17 @@ class ApplicationConfig {
 	string recycleBinInfoPath;
 	
 	// Runtime 'sync_dir' as initialised
-	// When 'on_demand' is enabled this is the on-demand backing directory, not the configured 'sync_dir'
+	// In on-demand mode this is also the physical directory that holds hydrated files, with the FUSE
+	// mount on top of it (the engine works on it through its working directory, see onDemandPhysicalRoot)
 	string runtimeSyncDirectory;
 	// When 'on_demand' is enabled, the configured 'sync_dir' (expanded) which is used as the on-demand mountpoint
 	string onDemandMountPoint;
+	// On-demand: "/proc/self/fd/<n>" for a directory descriptor opened on the physical 'sync_dir'
+	// before the mount; absolute access to the physical tree after the mount goes through it
+	string onDemandPhysicalRoot;
+	// On-demand: the backing directory of the previous layout (<confdir>/ondemand/backing or the
+	// deprecated 'on_demand_backing_dir'), only used to migrate its content into 'sync_dir'
+	string onDemandLegacyBackingDir;
 		
 	// Initialise the application configuration
 	bool initialise(string confdirOption, bool helpRequested) {
@@ -2852,27 +2859,36 @@ class ApplicationConfig {
 			}
 		}
 		
-		// In on-demand mode the configured 'sync_dir' becomes the mountpoint and the engine operates on the backing directory
+		// In on-demand mode the configured 'sync_dir' is both the physical directory that holds hydrated
+		// files and the FUSE mountpoint on top of it. 'on_demand_backing_dir' is deprecated: it only names
+		// a backing directory of the previous layout to migrate from.
 		if (getValueBool("on_demand")) {
+			runtimeSyncDirectory = buildNormalizedPath(absolutePath(runtimeSyncDirectory));
 			onDemandMountPoint = runtimeSyncDirectory;
 			string configuredBackingDir = strip(getValueString("on_demand_backing_dir"));
-			string backingDir;
 			if (configuredBackingDir.empty) {
-				backingDir = buildNormalizedPath(buildPath(configDirName, "ondemand", "backing"));
-			} else if (startsWith(configuredBackingDir, "~")) {
-				backingDir = buildNormalizedPath(defaultHomePath ~ configuredBackingDir[1 .. $]);
+				onDemandLegacyBackingDir = buildNormalizedPath(buildPath(configDirName, "ondemand", "backing"));
 			} else {
-				backingDir = buildNormalizedPath(absolutePath(configuredBackingDir));
+				addLogEntry("WARNING: 'on_demand_backing_dir' is deprecated and ignored: hydrated files are kept in 'sync_dir'. It is only used to move the content of that directory into 'sync_dir' once.");
+				if (startsWith(configuredBackingDir, "~")) {
+					onDemandLegacyBackingDir = buildNormalizedPath(defaultHomePath ~ configuredBackingDir[1 .. $]);
+				} else {
+					onDemandLegacyBackingDir = buildNormalizedPath(absolutePath(configuredBackingDir));
+				}
 			}
-			if (debugLogging) {addLogEntry("sync_dir: on_demand enabled, mountpoint is: " ~ onDemandMountPoint ~ ", backing directory is: " ~ backingDir, ["debug"]);}
-			runtimeSyncDirectory = backingDir;
+			if (debugLogging) {addLogEntry("sync_dir: on_demand enabled, physical directory and mountpoint: " ~ onDemandMountPoint, ["debug"]);}
 		}
 		
 		// What will runtimeSyncDirectory be actually set to?
 		if (debugLogging) {addLogEntry("sync_dir: runtimeSyncDirectory set to: " ~ runtimeSyncDirectory, ["debug"]);}
 		
 		// Configure configuredBusinessSharedFilesDirectoryName
-		configuredBusinessSharedFilesDirectoryName = buildNormalizedPath(buildPath(runtimeSyncDirectory, defaultBusinessSharedFilesDirectoryName));
+		// On-demand: relative to the working directory (the physical 'sync_dir'), never through the mount
+		if (getValueBool("on_demand")) {
+			configuredBusinessSharedFilesDirectoryName = defaultBusinessSharedFilesDirectoryName;
+		} else {
+			configuredBusinessSharedFilesDirectoryName = buildNormalizedPath(buildPath(runtimeSyncDirectory, defaultBusinessSharedFilesDirectoryName));
+		}
 		
 		return runtimeSyncDirectory;
 	}

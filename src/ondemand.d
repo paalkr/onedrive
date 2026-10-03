@@ -207,7 +207,9 @@ final class OnDemandFs : Operations
 	}
 
 	private string backingPath(const(char)[] path) {
-		return path == "/" ? backingDir : backingDir ~ path.idup;
+		// backingDir is "/proc/self/fd/<n>", a magic link to the physical sync_dir under the mount: the
+		// trailing slash makes lstat() of the root follow it instead of reporting the link itself
+		return path == "/" ? backingDir ~ "/" : backingDir ~ path.idup;
 	}
 
 	private static bool underPath(string path, string prefix) {
@@ -595,6 +597,8 @@ final class OnDemandFs : Operations
 	// Operations
 
 	override void getattr(const(char)[] path, ref stat_t st) {
+		// The hydration staging directory in the physical sync_dir is never part of the namespace
+		if (isOnDemandStagingPath(path)) fail(ENOENT);
 		if (isTouchRequest()) {
 			Pretend p;
 			bool found;
@@ -657,6 +661,7 @@ final class OnDemandFs : Operations
 			for (auto entry = core.sys.posix.dirent.readdir(dir); entry !is null; entry = core.sys.posix.dirent.readdir(dir)) {
 				string name = fromStringz(entry.d_name.ptr).idup;
 				if (name == "." || name == "..") continue;
+				if ((path == "/") && (name == onDemandStagingDirName)) continue;
 				if (name.endsWith(partialSuffix) && isEnginePartial((path == "/" ? "" : path) ~ "/" ~ name)) continue;
 				seen[name] = true;
 				names ~= name;
@@ -729,6 +734,7 @@ final class OnDemandFs : Operations
 	}
 
 	override void create(const(char)[] path, mode_t mode, ref fuse_file_info fi) {
+		if (isOnDemandStagingPath(path)) fail(EACCES);
 		auto h = new Handle();
 		h.flags = fi.flags;
 		if (isTouchRequest()) {
@@ -831,6 +837,7 @@ final class OnDemandFs : Operations
 	}
 
 	override void mkdir(const(char)[] path, uint mode) {
+		if (isOnDemandStagingPath(path)) fail(EACCES);
 		if (isTouchRequest()) {
 			endPretend(path);
 			return;
@@ -878,6 +885,7 @@ final class OnDemandFs : Operations
 	}
 
 	override void rename(const(char)[] orig, const(char)[] dest, uint flags) {
+		if (isOnDemandStagingPath(orig) || isOnDemandStagingPath(dest)) fail(EACCES);
 		if (isTouchRequest()) {
 			endPretend(orig);
 			endPretend(dest);

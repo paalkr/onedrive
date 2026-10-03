@@ -69,6 +69,17 @@ private string backingRelativeChangePath(string path) {
 	return "./" ~ normalised;
 }
 
+// Hydration downloads stage in this directory at the top of the physical sync_dir, so the final
+// rename stays on one filesystem. The FUSE layer hides it and the engine never scans or uploads it.
+enum string onDemandStagingDirName = ".onedrive-ondemand-staging";
+
+// Is this path (relative to the sync_dir, "./x" or "x", or a mount path "/x") the staging directory or below it?
+bool isOnDemandStagingPath(const(char)[] path) {
+	const(char)[] p = path;
+	while (p.length && (p[0] == '/' || (p.length >= 2 && p[0] == '.' && p[1] == '/'))) p = (p[0] == '/') ? p[1 .. $] : p[2 .. $];
+	return (p == onDemandStagingDirName) || startsWith(p, onDemandStagingDirName ~ "/");
+}
+
 // Actions requested through the mount (user.onedrive.action) or the CLI
 enum OnDemandAction { download, pin, unpin, free }
 
@@ -502,10 +513,13 @@ final class HydrationService {
 	this(ApplicationConfig appConfig, ItemDatabase itemDB, string backingDir) {
 		this.appConfig = appConfig;
 		this.itemDB = itemDB;
+		// The physical sync_dir: "/proc/self/fd/<n>", a directory descriptor opened before the mount
 		this.backingDir = buildNormalizedPath(absolutePath(backingDir));
-		// Staging lives beside the backing directory so the final rename stays on one filesystem
-		// and partial downloads never appear inside the mount
-		this.stagingDir = buildNormalizedPath(buildPath(dirName(this.backingDir), "." ~ baseName(this.backingDir) ~ ".staging"));
+		// Staging inside the physical sync_dir (same filesystem, atomic rename; hidden from the mount)
+		this.stagingDir = buildPath(this.backingDir, onDemandStagingDirName);
+		// Crash recovery: a download that was staged but never committed is discarded. Its item kept
+		// its online-only state, because the state is only set after the rename into place.
+		removeLeftoverStagingFiles();
 		// Read configuration once; appConfig is owned by the main thread
 		this.disableDownloadValidation = appConfig.getValueBool("disable_download_validation");
 		this.disablePermissionSet = appConfig.getValueBool("disable_permission_set");
@@ -1083,6 +1097,18 @@ final class HydrationService {
 					addLogEntry("On-demand: unable to free up space for " ~ child.name ~ ": " ~ e.msg);
 				}
 			}
+		}
+	}
+
+	private void removeLeftoverStagingFiles() {
+		try {
+			if (!exists(stagingDir)) return;
+			foreach (entry; dirEntries(stagingDir, SpanMode.shallow, false)) {
+				addLogEntry("On-demand: removing an interrupted hydration download: " ~ baseName(entry.name));
+				if (entry.isDir) rmdirRecurse(entry.name); else std.file.remove(entry.name);
+			}
+		} catch (Exception e) {
+			addLogEntry("On-demand: unable to clean the hydration staging directory: " ~ e.msg);
 		}
 	}
 

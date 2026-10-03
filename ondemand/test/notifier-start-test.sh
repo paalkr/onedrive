@@ -25,7 +25,7 @@ ctl() {
 	touch "$W/ctl/$1"
 	for i in $(seq 1 30); do [ "$(grep -c "^CTL $1\$" "$LOG")" -gt "$n" ] && return; sleep 0.1; done
 }
-B="$W/backing"
+B="/proc/$(awk '/^PHYSICAL/{print $2; exit}' "$LOG")/fd/$(awk '/^PHYSICAL/{print $3; exit}' "$LOG")"
 ok "N1 mounted" 'grep -q READY "$LOG"'
 # Engine downloads reported, then gone again, and a freed file reported
 ctl "burst~50"

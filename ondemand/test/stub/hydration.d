@@ -35,6 +35,18 @@ import ondemand : notifyBackingChange;
 
 enum HydrationState { onlineOnly, hydrated, pinned }
 
+/* As the real module: staging inside the physical sync_dir, hidden by the FUSE layer */
+enum string onDemandStagingDirName = ".onedrive-ondemand-staging";
+
+bool isOnDemandStagingPath(const(char)[] path)
+{
+	import std.algorithm.searching : startsWith;
+	const(char)[] p = path;
+	while (p.length && (p[0] == '/' || (p.length >= 2 && p[0] == '.' && p[1] == '/')))
+		p = (p[0] == '/') ? p[1 .. $] : p[2 .. $];
+	return (p == onDemandStagingDirName) || startsWith(p, onDemandStagingDirName ~ "/");
+}
+
 enum OnDemandAction { download, pin, unpin, free }
 
 enum TransientState { none, syncing, pending, error }
@@ -257,8 +269,9 @@ final class HydrationService
 			Thread.sleep(dur!"msecs"(downloadDelayMsecs));
 		if (!exists(source))
 			throw new HydrationError(errno.ENOENT, "gone online: " ~ *remote);
-		/* Download next to the backing dir, not inside it, then rename */
-		string tmp = buildPath(dirName(backingDir), "hydrate-tmp-" ~ id);
+		/* Download into the hidden staging dir of the physical sync_dir, then rename */
+		mkdirRecurse(buildPath(backingDir, onDemandStagingDirName));
+		string tmp = buildPath(backingDir, onDemandStagingDirName, "hydrate-tmp-" ~ id);
 		copy(source, tmp);
 		Item item;
 		if (itemDB.selectById(driveId, id, item))

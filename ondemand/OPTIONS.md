@@ -3,9 +3,9 @@
 Every option the config file accepts: the keys with defaults in `ApplicationConfig.initialise()` (src/config.d:317-614); the config file parser (src/config.d:1004-1110) accepts exactly those keys. Line numbers are against `ondemand/main` at 8f3c350.
 
 On-demand facts used below:
-- The engine works on the backing directory (`runtimeSyncDirectory`). `sync_dir` is the FUSE mountpoint.
+- `sync_dir` is both the physical directory that holds hydrated files and the FUSE mountpoint on top of it. The engine reaches the physical tree through a directory fd opened before the mount (`runtimeSyncDirectory` is `sync_dir`; the working directory stays the physical directory).
 - inotify is not started (main.d `!download_only && !on_demand` around the monitor initialisation). Local changes come from the FUSE layer.
-- The mount reports an online-only file as `S_IFREG|0600` and a directory known only to the database as `S_IFDIR|0700`. Anything present in the backing dir gets the `lstat` of the backing file (src/ondemand.d:90-91, 503-506, 628-636). It mounts with `default_permissions` (src/ondemand.d:761).
+- The mount reports an online-only file as `S_IFREG|0600` and a directory known only to the database as `S_IFDIR|0700`. Anything present in the physical sync_dir gets the `lstat` of the physical file (src/ondemand.d:90-91, 503-506, 628-636). It mounts with `default_permissions` (src/ondemand.d:761).
 - The FUSE layer implements no `symlink`/`readlink` override (src/ondemand.d), so no symlinks can be created through the mount.
 
 Status values:
@@ -22,25 +22,25 @@ Status values:
 |---|---|---|---|
 | application_id | relevant | Authentication only | config.d:317 |
 | log_dir | relevant | Logging only | config.d:318 |
-| skip_dir (R) | relevant | Client-side filtering. Excluded online items are not recorded, so they do not appear in the mount. A matching folder created through the mount stays local only (in the backing dir). | config.d:319, 1081 |
+| skip_dir (R) | relevant | Client-side filtering. Excluded online items are not recorded, so they do not appear in the mount. A matching folder created through the mount stays local only (in the physical sync_dir). | config.d:319, 1081 |
 | skip_file (R) | relevant | As skip_dir, for files | config.d:320, 1074 |
-| sync_dir (R in normal mode only) | relevant-ondemand | It is the mountpoint; data lives in the backing dir. In on-demand mode a changed sync_dir needs no --resync when the backing dir recorded in the database marker is unchanged (config.d onDemandSyncDirChangeIsMountOnly). The new mountpoint must be an empty directory, not inside the backing dir; the old one is left alone. | config.d:321, 1064; config.d initialiseRuntimeSyncDirectory |
+| sync_dir (R in normal mode only) | relevant-ondemand | The physical directory that holds hydrated files, with the FUSE mount on top. Changing it in on-demand mode moves the physical directory to the new path with rename() (same filesystem, new path absent or empty), so no --resync is needed; otherwise the start is refused and --resync is required. A stale on-demand mount on it is unmounted at start. | config.d:321, 1064; main.d prepareOnDemandPhysicalSyncDir |
 | user_agent | relevant | HTTP | config.d:322; onedrive.d:280 |
 | drive_id (R) | relevant | SharePoint library selection | config.d:324 |
 | azure_ad_endpoint | relevant | National cloud endpoints | config.d:340 |
 | azure_tenant_id | relevant | Authentication | config.d:342 |
 | transfer_order | relevant | Order of engine download/upload batches. Hydrations are on demand and not ordered. | config.d:350 |
 | monitor_authoritative_sync | ignored | Only consulted with download_only + cleanup_local_files, which on-demand refuses | config.d:354; main.d:1572; sync.d:1181 |
-| use_recycle_bin | risky | Online deletions move backing-dir files to the recycle bin (online-only files have no local file, so nothing moves). A recycle_bin_path inside the backing dir or inside the mountpoint is refused at startup (config.d checkRecycleBinPathAsChildOfSyncDir, main.d recycle bin check). A rename cannot reach a recycle bin inside the mount (different filesystem). | config.d:358 |
-| recycle_bin_path | risky | Refused inside the backing dir or the mountpoint; otherwise see use_recycle_bin | config.d:360 |
+| use_recycle_bin | risky | Online deletions move hydrated files from the physical sync_dir to the recycle bin (online-only files have no local file, so nothing moves). A recycle_bin_path inside sync_dir is refused at startup (config.d checkRecycleBinPathAsChildOfSyncDir, main.d recycle bin check). A rename cannot reach a recycle bin inside the mount (different filesystem). | config.d:358 |
+| recycle_bin_path | risky | Refused inside sync_dir; otherwise see use_recycle_bin | config.d:360 |
 | verbose | relevant | Logging | config.d:363 |
 | monitor_interval | relevant | Sync cycle interval. Also the long interval of locked-online retries. | config.d:365 |
 | skip_size (R) | relevant | Filtering. Larger online files are not recorded, so they are not visible in the mount. | config.d:367 |
 | monitor_log_frequency | relevant | Log suppression | config.d:369 |
 | monitor_fullscan_frequency | relevant | Online full-scan true-up | config.d:373 |
 | classify_as_big_delete | relevant | Applies in uploadDeletedItem (sync.d:12768). `rm -r` through the mount emits one delete per file (like inotify), so it rarely triggers, as in normal monitor mode. Absent hydrated files found by the consistency check are counted as usual. Online-only files are never counted as deleted. | config.d:375 |
-| sync_dir_permissions | relevant | Applied to backing-dir folders created by the engine. Visible through the mount for folders present in the backing dir. Database-only folders show 0700. | config.d:377; ondemand.d:503-506, 628-630 |
-| sync_file_permissions | relevant | Applied to downloaded/hydrated backing files and visible through the mount (lstat). Online-only files always show 0600. | config.d:379; hydration.d (filePermissions); ondemand.d:631-632 |
+| sync_dir_permissions | relevant | Applied to folders the engine creates in the physical sync_dir. Visible through the mount for folders present there. Database-only folders show 0700. | config.d:377; ondemand.d:503-506, 628-630 |
+| sync_file_permissions | relevant | Applied to downloaded/hydrated files and visible through the mount (lstat). Online-only files always show 0600. | config.d:379; hydration.d (filePermissions); ondemand.d:631-632 |
 | rate_limit | relevant | Applies to engine transfers and hydrations (same CurlEngine) | config.d:381; onedrive.d:280 |
 | space_reservation | relevant | Download and hydration free-space check | config.d:383; hydration.d (spaceReservation) |
 | file_fragment_size | relevant | Session uploads | config.d:385 |
@@ -52,11 +52,11 @@ Status values:
 | max_curl_idle | relevant | CurlEngine pool | config.d:403 |
 | threads | relevant | Engine transfer pool. Hydrations run on FUSE threads and are not limited by it. | config.d:406 |
 | upload_only | refused | "--on-demand cannot be used with --upload-only or --download-only" | config.d:409; config.d checkForBasicOptionConflicts |
-| check_nomount | ignored | Checks for `.nosync` in the working directory, which is the backing dir under the confdir. It no longer detects an unmounted sync_dir disk. | config.d:411; main.d:2820 |
-| check_nosync (R) | relevant | `.nosync` in a folder of the backing dir (created through the mount) protects it as in normal mode | config.d:413; sync.d:2612, 2948, 7439 |
+| check_nomount | ignored | Checks for `.nosync` in the working directory, which is the physical sync_dir (checked before the mount and through the directory opened before it), so it detects an unmounted sync_dir disk as in normal mode. | config.d:411; main.d:2820 |
+| check_nosync (R) | relevant | `.nosync` in a folder of sync_dir (created through the mount) protects it as in normal mode | config.d:413; sync.d:2612, 2948, 7439 |
 | download_only | refused | See upload_only | config.d:415 |
 | on_demand | relevant-ondemand | Requires --monitor. Database marker checks (main.d checkOnDemandProfileState). | config.d:417 |
-| on_demand_backing_dir | relevant-ondemand | Backing dir. A change requires --resync (the database marker records it). | config.d:419 |
+| on_demand_backing_dir | ignored | Deprecated since the physical sync_dir layout: hydrated files are kept in sync_dir under the mount. Only used once, with a warning, as the source of moving an old backing directory into sync_dir (main.d prepareOnDemandPhysicalSyncDir). | config.d:419 |
 | dbus_status | relevant-ondemand | D-Bus status interface, both modes | config.d:421 |
 | on_demand_thumbnails | relevant-ondemand | Thumbnails for online-only files | config.d:423 |
 | on_demand_cli_download, _pin, _unpin, _free, _status | refused (in the config file) | CLI only. Ignored with a warning in the config file. | config.d:425-429, 1024-1031 |
@@ -67,7 +67,7 @@ Status values:
 | force_http_11 | relevant | HTTP | config.d:442 |
 | local_first | relevant | Local-first ordering of the standard sync (main.d:2125). The consistency check treats an absent online-only file as in sync, so a local-first pass deletes nothing extra. Dangerous only together with mirror_local_state (below). | config.d:444 |
 | no_remote_delete | ignored | Only valid with upload_only, which on-demand refuses (config.d "--no-remote-delete can only be used with --upload-only") | config.d:446 |
-| skip_symlinks (R) | ignored | Symlinks cannot be created through the mount (no symlink operation). Only external writes into the backing dir could create one, and those are unsupported. | config.d:448; sync.d:7557, 9946 |
+| skip_symlinks (R) | ignored | Symlinks cannot be created through the mount (no symlink operation). Only writes into the physical sync_dir while the client is stopped could create one, and those are unsupported. | config.d:448; sync.d:7557, 9946 |
 | debug_https | relevant | Diagnostics. Pre-signed thumbnail URLs are redacted (curlEngine.d redactUrlValues). | config.d:450 |
 | skip_dotfiles (R) | relevant | Filtering | config.d:452 |
 | dry_run | refused | "--on-demand cannot be used with --dry-run" (config.d checkForBasicOptionConflicts). A dry run fakes engine transfers on a database copy while the mount and HydrationService would change real local data. | config.d:454; main.d:510 |
@@ -75,7 +75,7 @@ Status values:
 | remove_source_files | ignored | Only valid with upload_only (refused) | config.d:458 |
 | remove_source_folders | ignored | Only valid with upload_only (refused) | config.d:460 |
 | skip_dir_strict_match | relevant | Filtering | config.d:462 |
-| resync | relevant | Rebuilds the database. Required after switching modes or the backing dir (main.d checkOnDemandProfileState). | config.d:464 |
+| resync | relevant | Rebuilds the database. Required after switching modes, or after a sync_dir change that cannot be done by rename() (main.d checkOnDemandProfileState, prepareOnDemandPhysicalSyncDir). | config.d:464 |
 | resync_auth | relevant | Authentication | config.d:466 |
 | bypass_data_preservation | risky | No safeBackup conflict copies. The on-demand conflict path (local save while the file was open plus a newer online version) then replaces the local version without a copy. That is upstream semantics for this option, but on-demand defers more often (any open file). | config.d:469; sync.d:640 |
 | sync_business_shared_items (R) | risky | Shared (remote) items are out of scope for on-demand. HydrationService refuses them (EIO), and the engine downloads shared files as in normal mode (applyPotentiallyNewLocalItem queues remote files). Actions and free do not apply to them. | config.d:471 |
@@ -94,7 +94,7 @@ Status values:
 | notify_file_actions | relevant | Notifications | config.d:522 |
 | notify_monitor_start | relevant | Notification (status text shows "on-demand mount") | config.d:525 |
 | display_transfer_metrics | relevant | Engine transfers (not hydrations) | config.d:529 |
-| write_xattr_data | relevant | Writes `user.onedrive.createdBy` / `user.onedrive.lastModifiedBy` on backing files after download (sync.d:5388-5389). No clash with the mount's own `user.onedrive.state/pin/action/weburl`. Online-only files have no backing file, so no xattrs. | config.d:534 |
+| write_xattr_data | relevant | Writes `user.onedrive.createdBy` / `user.onedrive.lastModifiedBy` on hydrated files after download (sync.d:5388-5389). No clash with the mount's own `user.onedrive.state/pin/action/weburl`. Online-only files have no physical file, so no xattrs. | config.d:534 |
 | disable_permission_set | relevant | Backing dir permissions (engine and hydration) | config.d:537 |
 | use_intune_sso | relevant | Authentication | config.d:540 |
 | use_device_auth | relevant | Authentication | config.d:543 |
@@ -119,23 +119,23 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `log_dir` | relevant | no | Logging only. |
 | `skip_dir` | relevant | yes | Client-side filtering. |
 | `skip_file` | relevant | yes | As skip_dir, for files. |
-| `sync_dir` | relevant-ondemand | no | The mountpoint; changing it needs no --resync in on-demand mode (it does in normal mode) as long as on_demand_backing_dir is unchanged. |
+| `sync_dir` | relevant-ondemand | no | Holds the hydrated files with the mount on top; changing it moves the folder (same filesystem), otherwise --resync is required. |
 | `user_agent` | relevant | no | HTTP. |
 | `drive_id` | relevant | yes | SharePoint library selection. |
 | `azure_ad_endpoint` | relevant | no | National cloud endpoints. |
 | `azure_tenant_id` | relevant | no | Authentication. |
 | `transfer_order` | relevant | no | Order of engine download/upload batches. |
 | `monitor_authoritative_sync` | ignored | no | Only consulted with download_only + cleanup_local_files, which on-demand refuses. |
-| `use_recycle_bin` | risky | no | Online deletions move local files to the recycle bin; a recycle bin inside sync_dir (the mount) or the backing dir is refused. |
-| `recycle_bin_path` | risky | no | Refused inside sync_dir (the mount) or the backing dir. |
+| `use_recycle_bin` | risky | no | Online deletions move local files to the recycle bin; a recycle bin inside sync_dir is refused. |
+| `recycle_bin_path` | risky | no | Refused inside sync_dir. |
 | `verbose` | relevant | no | Logging. |
 | `monitor_interval` | relevant | no | Sync cycle interval. |
 | `skip_size` | relevant | yes | Filtering. |
 | `monitor_log_frequency` | relevant | no | Log suppression. |
 | `monitor_fullscan_frequency` | relevant | no | Online full-scan true-up. |
 | `classify_as_big_delete` | relevant | no | Applies in uploadDeletedItem (sync.d:12768). |
-| `sync_dir_permissions` | relevant | no | Applied to backing-dir folders created by the engine. |
-| `sync_file_permissions` | relevant | no | Applied to downloaded/hydrated backing files and visible through the mount (lstat). |
+| `sync_dir_permissions` | relevant | no | Applied to folders the engine creates in sync_dir. |
+| `sync_file_permissions` | relevant | no | Applied to downloaded/hydrated files and visible through the mount (lstat). |
 | `rate_limit` | relevant | no | Applies to engine transfers and hydrations (same CurlEngine). |
 | `space_reservation` | relevant | no | Download and hydration free-space check. |
 | `file_fragment_size` | relevant | no | Session uploads. |
@@ -147,11 +147,11 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `max_curl_idle` | relevant | no | CurlEngine pool. |
 | `threads` | relevant | no | Engine transfer pool. |
 | `upload_only` | refused | no | "--on-demand cannot be used with --upload-only or --download-only". |
-| `check_nomount` | ignored | no | Checks for `.nosync` in the working directory, which is the backing dir under the confdir. |
-| `check_nosync` | relevant | yes | `.nosync` in a folder of the backing dir (created through the mount) protects it as in normal mode. |
+| `check_nomount` | ignored | no | Checks for `.nosync` in the physical sync_dir, as in normal mode. |
+| `check_nosync` | relevant | yes | `.nosync` in a folder of sync_dir (created through the mount) protects it as in normal mode. |
 | `download_only` | refused | no | See upload_only. |
 | `on_demand` | relevant-ondemand | no | Requires --monitor. |
-| `on_demand_backing_dir` | relevant-ondemand | yes | The local folder that holds downloaded files; changing it requires --resync. |
+| `on_demand_backing_dir` | ignored | no | Deprecated: hydrated files are kept in sync_dir; only used once to move an old backing directory into sync_dir. |
 | `dbus_status` | relevant-ondemand | no | D-Bus status interface, both modes. |
 | `on_demand_thumbnails` | relevant-ondemand | no | Thumbnails for online-only files. |
 | `on_demand_cli_download` | refused | no | CLI only. |
@@ -198,7 +198,7 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `notify_file_actions` | relevant | no | Notifications. |
 | `notify_monitor_start` | relevant | no | Notification (status text shows "on-demand mount"). |
 | `display_transfer_metrics` | relevant | no | Engine transfers (not hydrations). |
-| `write_xattr_data` | relevant | no | Writes `user.onedrive.createdBy` / `user.onedrive.lastModifiedBy` on backing files after download (sync.d:5388-5389). |
+| `write_xattr_data` | relevant | no | Writes `user.onedrive.createdBy` / `user.onedrive.lastModifiedBy` on hydrated files after download (sync.d:5388-5389). |
 | `disable_permission_set` | relevant | no | Backing dir permissions (engine and hydration). |
 | `use_intune_sso` | relevant | no | Authentication. |
 | `use_device_auth` | relevant | no | Authentication. |
@@ -217,8 +217,8 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 
 Set in `updateFromArgs()` (config.d:1308-1337 and getopt); not accepted in the config file:
 - `--monitor`: required by on-demand.
-- `--on-demand`, `--on-demand-backing-dir`: CLI forms of the config options.
-- `--resync` (with `--resync-auth`): required after a mode or backing-dir change.
+- `--on-demand`, `--on-demand-backing-dir`: CLI forms of the config options (`--on-demand-backing-dir` is deprecated like the option).
+- `--resync` (with `--resync-auth`): required after a mode change, or a sync_dir change that cannot be done by rename().
 - `--on-demand-resync-once` (with `--on-demand --confdir X`): one-shot rebuild for helpers and GUIs. It implies `--monitor --resync --resync-auth` (no confirmation prompt) and starts like the monitor (mount, D-Bus State `syncing`, StateDetail "Rebuilding the local index"). It runs the first full sync cycle, re-applies pins and waits up to 10 minutes for the pin actions, then shuts down cleanly. Exit 0 when that completed (item-level sync failures do not count). Exit 1 when:
   - `--on-demand` is missing;
   - no stored authentication (it never prompts);
