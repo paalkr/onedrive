@@ -71,7 +71,8 @@ private string backingRelativeChangePath(string path) {
 
 // Hydration downloads stage in this directory at the top of the physical sync_dir, so the final
 // rename stays on one filesystem. The FUSE layer hides it and the engine never scans or uploads it.
-enum string onDemandStagingDirName = ".onedrive-ondemand-staging";
+// The ':' is not allowed in OneDrive and SharePoint names, so no online item can have this name.
+enum string onDemandStagingDirName = ".onedrive-ondemand:staging";
 
 // Is this path (relative to the sync_dir, "./x" or "x", or a mount path "/x") the staging directory or below it?
 bool isOnDemandStagingPath(const(char)[] path) {

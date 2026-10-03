@@ -207,12 +207,15 @@ Hydrated files live in the physical `sync_dir`, with the FUSE mount on top of it
 ### Startup order (main.d)
 1. **Option checks.**
 2. **`prepareOnDemandPhysicalSyncDir()`:**
-   - **Stale mount:** an on-demand mount on `sync_dir` is probed with `statfs` in a child process with a timeout. If it answers, another client is running and the start is refused. If it times out, a hung client holds it and the start is refused. If it fails (dead, ENOTCONN), it is unmounted with `fusermount3 -u -z` (refused if that fails). The client never changes into a dead mount.
+   - **Stale mount:** `sync_dir` is resolved with `realpath()` (the parent only, when the last component is a dead mount) and compared with the `fuse.onedrive` entries of `/proc/self/mounts`. An on-demand mount on it is probed with `statfs` in a child process with a timeout. If it answers, another client is running and the start is refused. If it times out, a hung client holds it and the start is refused. If it fails (dead, ENOTCONN), it is unmounted with `fusermount3 -u -z` (refused if that fails). If `timeout` or `fusermount3` cannot be run, the start is refused. The client never changes into a dead mount.
    - **Relocation:** if the database marker `<db>.ondemand` records another directory (the previous layout's backing dir, or the previous `sync_dir` after a change), that directory is moved to `sync_dir` with one `rename()`. That needs the same filesystem and an absent or empty `sync_dir`; otherwise the start is refused with a message. No copying and no overwriting, the database is not changed, and nothing is uploaded or deleted. Without a marker, a non-empty `<confdir>/ondemand/backing` is migrated the same way.
    - **After the move:** the marker is rewritten to `sync_dir`, and the previous layout's `.<backing>.staging` is removed.
+   - **Interrupted move:** if the marker still names the old directory, the old directory is gone and `sync_dir` has content, the rename happened and the marker write did not. The marker is rewritten; no `--resync` is needed.
+   - **`--dry-run`:** nothing is moved or unmounted; when a move, a completion or an unmount would be needed, the start is refused with a message.
 3. **Database check** (`checkOnDemandProfileState`, unchanged): the marker must record `sync_dir`, or the database must be empty.
 4. **`chdir(sync_dir)`, then `open(".", O_DIRECTORY)`:** `appConfig.onDemandPhysicalRoot` becomes `/proc/self/fd/<n>`, before the mount.
-5. **First sync cycle, then the mount** on top of `sync_dir` (`startOnDemandMount(..., backingDir = onDemandPhysicalRoot, ...)`).
+5. **Missing content check** (`onDemandRecordedLocalFilesAllMissing`, next to `check_nomount`): when the database records more than 5 hydrated or pinned files and not one of them is present, the start is refused (an unmounted disk, or `sync_dir` emptied while stopped). `--resync` makes them online-only without deleting anything online.
+6. **The mount** on top of `sync_dir` (`startOnDemandMount(..., backingDir = onDemandPhysicalRoot, ...)`), **then the first sync cycle** in the monitor loop. The first consistency check and local scan therefore run with the mount in place, on the physical tree through the working directory.
 
 ### Rules
 - **Engine paths:** the engine uses paths relative to its working directory, which stays on the physical directory after the mount. An absolute path built from `sync_dir` resolves through the mount and must not be used for file access. The places that did are fixed:
@@ -222,7 +225,7 @@ Hydrated files live in the physical `sync_dir`, with the FUSE mount on top of it
   - `getPathOwnerMismatch`
   - `configuredBusinessSharedFilesDirectoryName` (relative in on-demand mode)
 - **FUSE threads and HydrationService:** they use `/proc/self/fd/<n>/...`. The root is `/proc/self/fd/<n>/` with a trailing slash, because `lstat` of the bare magic link reports the link itself.
-- **Staging:** hydrations stage in `<sync_dir>/.onedrive-ondemand-staging` (`onDemandStagingDirName`), so the final rename stays on one filesystem.
+- **Staging:** hydrations stage in `<sync_dir>/.onedrive-ondemand:staging` (`onDemandStagingDirName`), so the final rename stays on one filesystem. OneDrive and SharePoint do not allow `:` in names, so no online item can collide with it.
   - The FUSE layer hides it: ENOENT in getattr, not listed, and create/mkdir/rename to it give EACCES.
   - The engine's local scan never enters it (`isOnDemandStagingPath`).
   - A download left there by a crash is removed when HydrationService starts. The item keeps state O, because the state is only set after the rename into place.
@@ -234,4 +237,7 @@ Hydrated files live in the physical `sync_dir`, with the FUSE mount on top of it
   - a rename is a delete plus a new file.
 
   Online-only items (O, absent) stay in sync (§13 invariant).
+- **Big deletes:** the online deletes one consistency pass queues are totalled (a folder counts with its database children). When the total reaches `classify_as_big_delete`, none of them is sent and the client exits, as for a big delete in normal mode (`--force` overrides). The per-item check alone never trips, because an emptied `sync_dir` deletes its files one by one.
+- **A file put over an online-only item while stopped** (its inode changed before the engine started) never overwrites the online version. With the online content (hash) it becomes H. Otherwise it is renamed to a conflict copy (`safeBackup`), which is uploaded as a new file. A pending write through the mount that the client could not upload before it stopped is handled the same way after a restart.
+- **Open handles:** the open-handle count (`noteOpen`/`noteClose`, free refused while open, deferred online changes) only sees opens through the mount. A handle on the physical file opened before the mount, or while the client was stopped, is not counted: the engine can replace or free such a file while that handle is open.
 - **`on_demand_backing_dir`:** deprecated. It is only read as the source of the one-time migration, with a warning.

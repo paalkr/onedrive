@@ -36,7 +36,7 @@ import ondemand : notifyBackingChange;
 enum HydrationState { onlineOnly, hydrated, pinned }
 
 /* As the real module: staging inside the physical sync_dir, hidden by the FUSE layer */
-enum string onDemandStagingDirName = ".onedrive-ondemand-staging";
+enum string onDemandStagingDirName = ".onedrive-ondemand:staging";
 
 bool isOnDemandStagingPath(const(char)[] path)
 {

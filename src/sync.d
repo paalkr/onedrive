@@ -236,6 +236,8 @@ class SyncEngine {
 	bool dryRun = false;
 	// Is Files On-Demand (on_demand) enabled? The sync directory is then the on-demand backing directory
 	bool onDemand = false;
+	// On-demand: when this engine started; a file whose inode changed before it was placed while the client was stopped
+	SysTime onDemandEngineStartTime;
 	// Was --upload-only used?
 	bool uploadOnly = false;
 	// Was --remove-source-files used?
@@ -551,6 +553,7 @@ class SyncEngine {
 
 		// Configure the onDemand flag to capture if 'on_demand' is enabled
 		this.onDemand = appConfig.getValueBool("on_demand");
+		this.onDemandEngineStartTime = Clock.currTime();
 
 		// Configure file size limit
 		if (appConfig.getValueLong("skip_size") != 0) {
@@ -5798,6 +5801,97 @@ class SyncEngine {
 	// On-demand: is this database item an online-only file that is absent from the backing directory?
 	// Presence is tested before the state is re-read: HydrationService records 'O' before it removes
 	// a file, so an absent file is never paired with a stale hydrated state.
+	// On-demand: while the client is stopped the physical 'sync_dir' holds ordinary files, and emptying it
+	// queues their online deletes one by one, so the per-item classify_as_big_delete check never trips.
+	// Total the online deletes this consistency pass queued (a folder with its database children) and
+	// refuse all of them when the total reaches classify_as_big_delete, unless --force is used.
+	bool onDemandQueuedOnlineDeletesAllowed() {
+		long total = 0;
+		foreach (queued; databaseItemsToDeleteOnline) {
+			if (!onDemandLocalDeletionStillValid(queued.dbItem, queued.localFilePath)) continue;
+			if (queued.dbItem.type == ItemType.dir) {
+				total += count(getChildren(queued.dbItem.driveId, queued.dbItem.id)) + 1;
+			} else {
+				total += 1;
+			}
+		}
+		long limit = appConfig.getValueLong("classify_as_big_delete");
+		if (total < limit) return true;
+		if (appConfig.getValueBool("force")) {
+			addLogEntry("WARNING: On-demand: " ~ to!string(total) ~ " items are missing from 'sync_dir' and are deleted online (--force is used)");
+			return true;
+		}
+		// Send this message to the GUI
+		addLogEntry("ERROR: An attempt to remove a large volume of data from OneDrive has been detected. Exiting client to preserve your data on Microsoft OneDrive", ["info", "notify"]);
+		// Additional application logging
+		addLogEntry("ERROR: The total number of items being deleted is: " ~ to!string(total));
+		addLogEntry("ERROR: On-demand: these items are missing from 'sync_dir' since the client last checked it. None of them has been deleted online.");
+		addLogEntry("ERROR: To delete a large volume of data use --force or increase the config value 'classify_as_big_delete' to a larger value");
+		return false;
+	}
+
+	// On-demand, at start before the mount: hydrated and pinned files are ordinary files of the physical
+	// 'sync_dir'. When the database records more than onDemandMissingFilesLimit of them and not one is
+	// present, 'sync_dir' is most likely a disk that is not mounted, or it was emptied while the client was
+	// stopped. Returns how many are recorded in that case, so the start can be refused; 0 otherwise.
+	enum long onDemandMissingFilesLimit = 5;
+	long onDemandRecordedLocalFilesAllMissing() {
+		long recorded = 0;
+		foreach (driveId; itemDB.selectDistinctDriveIds()) {
+			// Walk each drive from its top items; stop at the first file that is present
+			Item[] pending = itemDB.selectByDriveId(driveId);
+			while (pending.length > 0) {
+				Item item = pending[$ - 1];
+				pending = pending[0 .. $ - 1];
+				if ((item.type == ItemType.dir) || (item.type == ItemType.root)) {
+					pending ~= itemDB.selectChildren(item.driveId, item.id);
+					continue;
+				}
+				if ((item.type != ItemType.file) || (item.hydration == hydrationOnlineOnly)) continue;
+				if (exists(buildNormalizedPath(computeItemPath(item.driveId, item.id)))) return 0;
+				recorded++;
+			}
+		}
+		return (recorded > onDemandMissingFilesLimit) ? recorded : 0;
+	}
+
+	// On-demand: was the regular file at localPath put there before this engine started (while the
+	// client was stopped)? Writes through the mount after the start change its inode later than that.
+	bool onDemandFilePlacedBeforeStart(string localPath) {
+		import core.sys.posix.sys.stat : stat_t, lstat, S_IFMT, S_IFREG;
+		stat_t st;
+		if (lstat(toStringz(localPath), &st) != 0) return false;
+		if ((st.st_mode & S_IFMT) != S_IFREG) return false;
+		return SysTime(unixTimeToStdTime(st.st_ctime)) < onDemandEngineStartTime;
+	}
+
+	// On-demand: a file was put at the path of an online-only item while the client was stopped (for
+	// example an older copy). It never overwrites the online version: with the online content it is
+	// simply hydrated, otherwise it is kept under a conflict-copy name (safeBackup), which is then
+	// uploaded as a new file.
+	void onDemandKeepFilePlacedOverOnlineOnly(Item dbItem, string localFilePath) {
+		if (testFileHash(localFilePath, dbItem)) {
+			auto stateLock = onDemandStateLock();
+			stateLock.lock();
+			itemDB.setHydration(dbItem.driveId, dbItem.id, hydrationHydrated);
+			stateLock.unlock();
+			try {
+				setTimes(localFilePath, dbItem.mtime, dbItem.mtime);
+			} catch (FileException e) {
+				if (debugLogging) {addLogEntry("On-demand: unable to set the modified time of " ~ localFilePath ~ ": " ~ e.msg, ["debug"]);}
+			}
+			addLogEntry("On-demand: the file at the path of online-only item " ~ localFilePath ~ " has the online content; it is now hydrated");
+			return;
+		}
+		string renamedPath;
+		safeBackupAndNotifyExpectedLocalMove(localFilePath, dryRun, bypassDataPreservation, renamedPath);
+		if (renamedPath.empty) {
+			addLogEntry("On-demand: a file was put at the path of online-only item " ~ localFilePath ~ " while the client was stopped. It is not uploaded over the online version and was left in place.", ["info", "notify"]);
+		} else {
+			addLogEntry("On-demand: a file was put at the path of online-only item " ~ localFilePath ~ " while the client was stopped. It was kept as " ~ renamedPath ~ "; the online version is not changed.", ["info", "notify"]);
+		}
+	}
+
 	bool onDemandAbsentOnlineOnly(string driveId, string id, string localPath) {
 		if (!onDemand) return false;
 		if (exists(localPath)) return false;
@@ -6866,6 +6960,12 @@ class SyncEngine {
 			if (databaseItemsToDeleteOnline.length > 0) {
 				// There are items to delete online
 				addLogEntry("Deleted local items to delete on Microsoft OneDrive: " ~ to!string(databaseItemsToDeleteOnline.length));
+				// On-demand: the total of this pass must stay below classify_as_big_delete; nothing is deleted otherwise
+				if (onDemand && !onDemandQueuedOnlineDeletesAllowed()) {
+					databaseItemsToDeleteOnline = [];
+					// Must exit here to preserve data online, allow logging to be done
+					forceExit();
+				}
 				foreach(localItemToDeleteOnline; databaseItemsToDeleteOnline) {
 					// On-demand: never delete online what is only absent because it is online-only
 					if (!onDemandLocalDeletionStillValid(localItemToDeleteOnline.dbItem, localItemToDeleteOnline.localFilePath)) {
@@ -7054,6 +7154,17 @@ class SyncEngine {
 				// The file at this path is the local copy of another item that has not moved away yet;
 				// it must not be uploaded as a change of this online-only item
 				if (verboseLogging) {addLogEntry("On-demand: the local file belongs to another item, not treating it as a change of the online-only item: " ~ localFilePath, ["verbose"]);}
+
+				// Display function processing time if configured to do so
+				if (appConfig.getValueBool("display_processing_time") && debugLogging) {
+					// Combine module name & running Function
+					displayFunctionProcessingTime(thisFunctionName, functionStartTime, Clock.currTime(), logKey);
+				}
+				return;
+			}
+			if (currentItemFound && presentInBackingDir && (dbItem.hydration == hydrationOnlineOnly) && onDemandFilePlacedBeforeStart(localFilePath)) {
+				// A file put at the path of an online-only item while the client was stopped never replaces the online version
+				onDemandKeepFilePlacedOverOnlineOnly(dbItem, localFilePath);
 
 				// Display function processing time if configured to do so
 				if (appConfig.getValueBool("display_processing_time") && debugLogging) {
@@ -7583,28 +7694,10 @@ class SyncEngine {
 					//   lrwxrwxrwx. 1 alex alex 13 May 30 09:16 relative.txt -> ../prueba.txt
 					//
 					// absolute links will be able to be read, but 'relative' links will fail, because they cannot be read based on the current working directory 'sync_dir'
-					string currentSyncDir = getcwd();
-					string fullLinkPath = buildNormalizedPath(absolutePath(localFilePath));
-					string fileName = baseName(fullLinkPath);
-					string parentLinkPath = dirName(fullLinkPath);
-					// On-demand: the absolute 'sync_dir' path is the FUSE mount, and chdir(getcwd()) would
-					// move the working directory onto it. Use the relative parent and restore by descriptor.
-					int savedWorkingDirectory = -1;
-					if (onDemand && !isAbsolute(localFilePath)) {
-						savedWorkingDirectory = core.sys.posix.fcntl.open(".", core.sys.posix.fcntl.O_RDONLY | core.sys.posix.fcntl.O_DIRECTORY | core.sys.posix.fcntl.O_CLOEXEC);
-						parentLinkPath = dirName(buildNormalizedPath(localFilePath));
-					}
-					// test if this is a 'relative' symbolic link
-					chdir(parentLinkPath);
-					auto relativeLink = readLink(fileName);
-					auto relativeLinkTest = exists(readLink(fileName));
-					// reset back to our 'sync_dir'
-					if (savedWorkingDirectory >= 0) {
-						core.sys.posix.unistd.fchdir(savedWorkingDirectory);
-						core.sys.posix.unistd.close(savedWorkingDirectory);
-					} else {
-						chdir(currentSyncDir);
-					}
+					// A relative link is resolved against the directory that holds it. No chdir: in on-demand
+					// mode the absolute 'sync_dir' path is the FUSE mount, not the physical directory.
+					auto relativeLink = readLink(localFilePath);
+					auto relativeLinkTest = !isAbsolute(relativeLink) && exists(buildPath(dirName(localFilePath), relativeLink));
 					// results
 					if (relativeLinkTest) {
 						if (debugLogging) {addLogEntry("Not skipping item - symbolic link is a 'relative link' to target ('" ~ relativeLink ~ "') which can be supported: " ~ localFilePath, ["debug"]);}

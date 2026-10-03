@@ -26,7 +26,7 @@ for i in $(seq 1 50); do grep -q READY "$LOG" && break; sleep 0.1; done
 grep -q READY "$LOG" || { echo "not ready"; cat "$LOG"; exit 1; }
 
 PASS=0; FAIL=0
-ok() { if eval "$2"; then echo "PASS $1"; PASS=$((PASS+1)); else echo "FAIL $1"; FAIL=$((FAIL+1)); fi; }
+ok() { if eval "$2"; then echo "PASS $1"; PASS=$((PASS+1)); else echo "FAIL $1"; FAIL=$((FAIL+1)); return 1; fi; }
 t() { timeout 10 "$@"; }
 downloads() { grep -c "^STUB download $1 to " "$LOG"; }
 # rename via renameat2 with flags; prints OK or the errno name
@@ -280,10 +280,14 @@ ok "RO destination eTag changed: pending replace cleared, dst2 item (pinned) sho
 echo "== RO rename over a DB file that the engine never processes"
 ok "RO rename src3 over pinned dst3" '[ "$(ren "$M/src3.txt" "$M/dst3.txt")" = OK ]'
 ok "RO while pending: shows the moved item (hydrated)" '[ "$(xget "$M/dst3.txt" user.onedrive.state)" = hydrated ]'
-sleep 16   # onDemandPendingExpirySeconds is 15 in odtest
+# onDemandPendingExpirySeconds is 15 in odtest. The expiry runs on the next lookup after it, so poll
+# (each xget is such a lookup) instead of relying on one fixed sleep; give up after 30 s.
+sleep 15
+for i in $(seq 1 150); do [ "$(xget "$M/dst3.txt" user.onedrive.state)" = pinned ] && break; sleep 0.1; done
 ok "RO replace expires: dst3 item (pinned) shown, source path stays hidden" '[ "$(xget "$M/dst3.txt" user.onedrive.state)" = pinned ] && ! t ls "$M" | grep -qx src3.txt'
-for i in $(seq 1 30); do grep -q "rename over ./dst3.txt not processed" "$LOG" && break; sleep 0.1; done
-ok "RO expiry logged" 'grep -q "rename over ./dst3.txt not processed by the engine in time" "$LOG"'
+for i in $(seq 1 100); do grep -q "rename over ./dst3.txt not processed" "$LOG" && break; sleep 0.1; done
+ok "RO expiry logged" 'grep -q "rename over ./dst3.txt not processed by the engine in time" "$LOG"' || {
+	echo "   dst3 state: $(xget "$M/dst3.txt" user.onedrive.state)"; grep -nE "dst3|src3" "$LOG" | sed 's/^/   /'; }
 
 ctl() {
 	local n; n=$(grep -cx "CTL $1" "$LOG")
@@ -427,12 +431,13 @@ ctl "touchdelay~20"
 ctl "burst~300"
 
 echo "== P staging directory of the physical sync_dir is hidden"
-mkdir -p "$B/.onedrive-ondemand-staging"; echo "half a download" > "$B/.onedrive-ondemand-staging/drive1_f-x"
-ok "P2 staging dir not listed in the mount" '! t ls -A "$M" | grep -qx .onedrive-ondemand-staging'
-ok "P2 staging dir not reachable through the mount" '! t stat "$M/.onedrive-ondemand-staging" >/dev/null 2>&1 && ! t cat "$M/.onedrive-ondemand-staging/drive1_f-x" >/dev/null 2>&1'
-ok "P2 staging names cannot be created through the mount" '! t mkdir "$M/.onedrive-ondemand-staging" 2>/dev/null && ! t sh -c "echo x > \"$M/.onedrive-ondemand-staging\"" 2>/dev/null'
-ok "P2 no change event for the staging dir" '! grep -q "onedrive-ondemand-staging" "$LOG"'
-rm -rf "$B/.onedrive-ondemand-staging/drive1_f-x"
+mkdir -p "$B/.onedrive-ondemand:staging"; echo "half a download" > "$B/.onedrive-ondemand:staging/drive1_f-x"
+ok "P2 staging dir not listed in the mount" '! t ls -A "$M" | grep -qx .onedrive-ondemand:staging'
+ok "P2 staging dir not reachable through the mount" '! t stat "$M/.onedrive-ondemand:staging" >/dev/null 2>&1 && ! t cat "$M/.onedrive-ondemand:staging/drive1_f-x" >/dev/null 2>&1'
+ok "P2 staging names cannot be created through the mount" '! t mkdir "$M/.onedrive-ondemand:staging" 2>/dev/null && ! t sh -c "echo x > \"$M/.onedrive-ondemand:staging\"" 2>/dev/null'
+ok "P2 no change event for the staging dir" '! grep -q "onedrive-ondemand:staging" "$LOG"'
+rm -rf "$B/.onedrive-ondemand:staging/drive1_f-x"
+ok "P2 a similar name without the colon is an ordinary folder" 't mkdir "$M/.onedrive-ondemand-staging" && t ls -A "$M" | grep -qx .onedrive-ondemand-staging && t rmdir "$M/.onedrive-ondemand-staging"'
 touch "$W/stop"
 for i in $(seq 1 100); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
 ok "process exited" '! kill -0 "$PID" 2>/dev/null'
@@ -445,7 +450,7 @@ B="$M"
 ok "F5 R1 stop with pending replays left no new backing files" '[ -d "$B/notify/burst" ] && [ -z "$(ls -A "$B/notify/burst")" ]'
 ok "P1 hydrated files visible in the physical sync_dir after unmount" '[ "$(cat "$M/local.txt")" = "hydrated content" ] && [ -f "$M/docs/big.txt" ] && [ "$(cat "$M/new.txt")" = hello ]'
 ok "P1 online-only files absent after unmount, folders present" '[ ! -e "$M/docs/move-me.txt" ] && [ ! -e "$M/offline.txt" ] && [ -d "$M/docs/target" ] && [ -d "$M/lib/sub" ]'
-ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand-staging" 2>/dev/null)" ]'
+ok "P1 no staging leftovers visible" '[ -z "$(ls -A "$M/.onedrive-ondemand:staging" 2>/dev/null)" ]'
 echo "   (burst files left: $(ls -A "$B/notify/burst" 2>/dev/null | wc -l))"
 grep -E '^(DOWNLOADS|STOPPED)' "$LOG"
 echo "== unexpected log lines"

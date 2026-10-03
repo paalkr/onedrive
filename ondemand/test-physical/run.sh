@@ -8,6 +8,7 @@
 # Without the third argument the helpers are built into a temporary directory with:
 #   ldc2 -w -i -J . -I src -od=<dir>/obj -of=<dir>/<helper> ondemand/test-physical/<helper>.d \
 #     $(pkg-config --libs-only-l libcurl sqlite3 dbus-1 | sed 's/-l/-L-l/g') -L-ldl
+# guardtest also needs src/sync.d on the command line (its module name, syncEngine, differs from the file name).
 set -u
 BIN="$(realpath "$1")"; ODT="$(realpath "$2")"
 T="$(mktemp -d "${TMPDIR:-/tmp}/odphys.XXXXXX")"
@@ -17,8 +18,9 @@ if [ $# -ge 3 ]; then
 else
 	[ -f version ] && [ -d src ] || { echo "run from the repository root after make (needs ./version and src/)"; exit 2; }
 	H="$T/build"; mkdir -p "$H"
-	for helper in mkdb stagingtest; do
-		ldc2 -w -i -J . -I src -od="$H/obj" -of="$H/$helper" "ondemand/test-physical/$helper.d" \
+	for helper in mkdb stagingtest guardtest; do
+		extra=; [ "$helper" = guardtest ] && extra=src/sync.d
+		ldc2 -w -i -J . -I src -od="$H/obj-$helper" -of="$H/$helper" "ondemand/test-physical/$helper.d" $extra \
 			$(pkg-config --libs-only-l libcurl sqlite3 dbus-1 | sed 's/-l/-L-l/g') -L-ldl || { echo "building $helper failed"; exit 2; }
 	done
 fi
@@ -32,9 +34,10 @@ profile() {   # profile <confdir> <sync_dir>: config and a fake refresh token
 	printf 'sync_dir = "%s"\n' "$2" > "$1/config"
 	echo "invalid-token" > "$1/refresh_token"; chmod 600 "$1/refresh_token"
 }
-client() {    # client <confdir>: runs until authentication fails; log in <confdir>.log, exit code in <confdir>.rc
-	BROWSER=/bin/true timeout 60 "$BIN" --confdir "$1" --monitor --on-demand </dev/null > "$1.log" 2>&1
-	echo $? > "$1.rc"
+client() {    # client <confdir> [options]: runs until authentication fails; log in <confdir>.log, exit code in <confdir>.rc; $CLIENT_PATH replaces its PATH
+	local c="$1"; shift
+	BROWSER=/bin/true timeout 60 env PATH="${CLIENT_PATH:-$PATH}" "$BIN" --confdir "$c" --monitor --on-demand "$@" </dev/null > "$c.log" 2>&1
+	echo $? > "$c.rc"
 }
 rows() { python3 -c 'import sqlite3,sys; print(sorted(sqlite3.connect(sys.argv[1]).execute("select driveId,id,name,hydration from item").fetchall()))' "$1"; }
 odtest() {    # odtest <work> <mnt>: FUSE harness mounted on <mnt>
@@ -100,6 +103,44 @@ if [ -d /dev/shm ] && [ "$(stat -c %d /dev/shm)" != "$(stat -c %d "$T")" ]; then
 else
 	echo "SKIP T6 (no second filesystem at /dev/shm)"
 fi
+
+echo "== stale mount found through a symbolic link in the sync_dir path"
+C="$T/linked"; S="$T/linked-real/sync"; mkdir -p "$T/linked-real"; ln -s "$T/linked-real" "$T/linked-alias"
+profile "$C" "$T/linked-alias/sync"
+odtest "$T/linked-w" "$S"; kill -9 $ODPID; wait $ODPID 2>/dev/null
+client "$C"
+ok "T7 realpath of sync_dir matches the mount entry: stale mount unmounted" 'grep -q "stale mount" "$C.log" && ! mounted "$S"'
+
+echo "== helper program missing"
+C="$T/notimeout"; S="$T/notimeout-sync"; profile "$C" "$S"
+odtest "$T/notimeout-w" "$S"; kill -9 $ODPID; wait $ODPID 2>/dev/null
+mkdir -p "$T/emptybin"
+CLIENT_PATH="$T/emptybin" client "$C"
+ok "T8 timeout cannot be run: refused, mount left alone" '[ "$(cat "$C.rc")" = 1 ] && grep -q "Unable to run .timeout." "$C.log" && mounted "$S"'
+fusermount3 -u -z "$S"
+
+echo "== --dry-run"
+C="$T/dry"; S="$T/dry-sync"; profile "$C" "$S"
+OLD="$C/ondemand/backing"; mkdir -p "$OLD"; echo "kept" > "$OLD/a.txt"
+"$H/mkdb" "$C/items.sqlite3"; printf '%s' "$OLD" > "$C/items.sqlite3.ondemand"
+client "$C" --dry-run
+# --on-demand with --dry-run is refused by the option checks before the preparation runs; the
+# preparation also refuses the move itself under --dry-run
+ok "T9 a needed move is not done under --dry-run (start refused), nothing moved" '[ "$(cat "$C.rc")" = 1 ] && grep -qE "cannot be used with --dry-run|not moved under --dry-run" "$C.log" && [ -f "$OLD/a.txt" ] && [ ! -e "$S/a.txt" ] && [ "$(cat "$C/items.sqlite3.ondemand")" = "$OLD" ]'
+
+echo "== crash between the rename and the marker write"
+C="$T/half"; S="$T/half-sync"; profile "$C" "$S"
+mkdir -p "$S/docs"; echo "moved" > "$S/docs/a.txt"
+"$H/mkdb" "$C/items.sqlite3"; printf '%s' "$T/half-gone" > "$C/items.sqlite3.ondemand"
+client "$C"
+ok "T10 interrupted move completed: marker rewritten, files in place" 'grep -q "completed the interrupted move" "$C.log" && [ "$(cat "$C/items.sqlite3.ondemand")" = "$S" ] && [ "$(cat "$S/docs/a.txt")" = moved ]'
+ok "T10 not steered to --resync, the client continued to authentication" '! grep -qiE "ERROR.*resync" "$C.log" && grep -q "auth token" "$C.log"'
+
+echo "== offline deletes and copies (SyncEngine consistency check, no network)"
+"$H/guardtest" "$T/guard" > "$T/guard.out" 2>&1
+grep -oE "(PASS|FAIL) .*" "$T/guard.out" > "$T/guard.res"
+grep -q "guardtest done" "$T/guard.out" || echo "FAIL guardtest did not finish" >> "$T/guard.res"
+while read -r line; do echo "$line"; case "$line" in PASS*) PASS=$((PASS+1));; FAIL*) FAIL=$((FAIL+1));; esac; done < "$T/guard.res"
 
 echo "== crash between staging and rename"
 "$H/stagingtest" "$T/staging" | grep -E "^(PASS|FAIL)" > "$T/staging.out"

@@ -1183,6 +1183,21 @@ int main(string[] cliArgs) {
 	// Do we need to validate the runtimeSyncDirectory to check for the presence of a '.nosync' file
 	checkForNoMountScenario();
 	
+	// On-demand: refuse to start when not one of the hydrated or pinned files is present (an unmounted
+	// disk, or 'sync_dir' emptied while the client was stopped), rather than deleting them all online
+	if (appConfig.getValueBool("on_demand") && appConfig.getValueBool("monitor") && appConfig.syncEngineWasInitialised) {
+		long missingFiles = syncEngineInstance.onDemandRecordedLocalFilesAllMissing();
+		if (missingFiles > 0) {
+			addLogEntry("ERROR: None of the " ~ to!string(missingFiles) ~ " hydrated or pinned files recorded for 'sync_dir' (" ~ runtimeSyncDirectory ~ ") is present. Aborting application startup process to safeguard data on Microsoft OneDrive.", ["info", "notify"]);
+			addLogEntry("       'sync_dir' may be on a disk that is not mounted, or its files were removed while the client was stopped.");
+			addLogEntry("       Mount the disk or restore the files. To keep them online only, re-run with '--resync': nothing is deleted online then.");
+			// Perform the shutdown process
+			performSynchronisedExitProcess("onDemandMissingFiles");
+			// Exit
+			return EXIT_FAILURE;
+		}
+	}
+	
 	// Is the sync engine initialised correctly?
 	if (appConfig.syncEngineWasInitialised) {
 		// Configure some initial variables
@@ -2528,7 +2543,7 @@ bool checkOnDemandProfileState() {
 			return false;
 		}
 		if (recordedBackingDir != backingDir) {
-			addLogEntry("ERROR: 'on_demand_backing_dir' has changed from '" ~ recordedBackingDir ~ "' to '" ~ backingDir ~ "'. Re-run the client with '--resync' to use the new backing directory.", ["info", "notify"]);
+			addLogEntry("ERROR: The item database describes the on-demand files in '" ~ recordedBackingDir ~ "', not in 'sync_dir' ('" ~ backingDir ~ "'). Move them there, or re-run the client with '--resync'.", ["info", "notify"]);
 			return false;
 		}
 		return true;
@@ -2565,7 +2580,32 @@ bool checkOnDemandProfileState() {
 	return true;
 }
 
+// On-demand: the canonical path of 'path', as /proc/self/mounts lists a mountpoint. The last
+// component is not resolved when that fails (a dead FUSE mount answers ENOTCONN), so a stale mount
+// is still found: only its parent is resolved then, following a symbolic link at 'path' itself.
+string onDemandCanonicalPath(string path) {
+	import core.sys.posix.stdlib : realpath;
+	import core.stdc.stdlib : free;
+	string resolve(string p) {
+		char* resolved = realpath(toStringz(p), null);
+		if (resolved is null) return null;
+		scope(exit) free(resolved);
+		return fromStringz(resolved).idup;
+	}
+	string absolute = buildNormalizedPath(absolutePath(path));
+	string full = resolve(absolute);
+	if (!full.empty) return full;
+	try {
+		if (isSymlink(absolute)) absolute = buildNormalizedPath(dirName(absolute), readLink(absolute));
+	} catch (Exception e) {
+		// Not reachable: use the path as given
+	}
+	string parent = resolve(dirName(absolute));
+	return parent.empty ? absolute : buildPath(parent, baseName(absolute));
+}
+
 // On-demand: is 'path' the mountpoint of an on-demand FUSE mount (fstype fuse.onedrive)?
+// 'path' must be canonical (onDemandCanonicalPath).
 bool isOnDemandMountPoint(string path) {
 	string mounts;
 	try {
@@ -2580,33 +2620,55 @@ bool isOnDemandMountPoint(string path) {
 	return false;
 }
 
+// Runs a helper program for the on-demand preparation. A missing program (ProcessException) fails closed.
+bool runOnDemandHelper(string[] command, out int status, out string output) {
+	try {
+		auto result = execute(command);
+		status = result.status;
+		output = result.output;
+		return true;
+	} catch (ProcessException e) {
+		addLogEntry("ERROR: Unable to run '" ~ command[0] ~ "' to check the on-demand 'sync_dir': " ~ e.msg ~ ". Install it, or unmount 'sync_dir' yourself.", ["info", "notify"]);
+		return false;
+	}
+}
+
 // On-demand: prepare the physical 'sync_dir' before it is used.
 // 1. A stale on-demand mount on it (a client that crashed) is unmounted lazily; a live one (another
 //    running client) refuses the start. The client never changes into a dead mount.
 // 2. Hydrated files recorded for another location (the backing directory of the previous layout, or
 //    the previous 'sync_dir' after it was changed) are moved into 'sync_dir' with rename(). That needs
 //    the same filesystem and an absent or empty 'sync_dir'; otherwise the start is refused. Nothing is
-//    copied, overwritten, uploaded or deleted, and the database is not changed.
+//    copied, overwritten, uploaded or deleted, and the database is not changed. A move interrupted
+//    before the marker was rewritten (the recorded directory is gone, 'sync_dir' has the files) is
+//    completed. Under --dry-run nothing is moved: the start is refused instead.
 bool prepareOnDemandPhysicalSyncDir() {
 	string syncDir = appConfig.onDemandMountPoint;
+	string mountPath = onDemandCanonicalPath(syncDir);
 
-	if (isOnDemandMountPoint(syncDir)) {
+	if (isOnDemandMountPoint(mountPath)) {
 		// statfs always reaches the FUSE daemon (no cached attributes). Run it in a child with a
 		// timeout, so a hung daemon cannot block this start: answered = a running client, failed
 		// (ENOTCONN) = dead mount, timed out = hung client
-		auto probe = execute(["timeout", "5", "stat", "-f", "-c", "%t", syncDir]);
-		if (probe.status == 0) {
-			addLogEntry("ERROR: 'sync_dir' (" ~ syncDir ~ ") is already mounted by a running on-demand client. Stop that client first, or if none is running, unmount it with: fusermount3 -u -z " ~ syncDir, ["info", "notify"]);
+		int status;
+		string output;
+		if (!runOnDemandHelper(["timeout", "5", "stat", "-f", "-c", "%t", mountPath], status, output)) return false;
+		if (status == 0) {
+			addLogEntry("ERROR: 'sync_dir' (" ~ syncDir ~ ") is already mounted by a running on-demand client. Stop that client first, or if none is running, unmount it with: fusermount3 -u -z " ~ mountPath, ["info", "notify"]);
 			return false;
 		}
-		if (probe.status == 124) {
-			addLogEntry("ERROR: 'sync_dir' (" ~ syncDir ~ ") is mounted by an on-demand client that does not respond. Stop that client, or unmount it with: fusermount3 -u -z " ~ syncDir, ["info", "notify"]);
+		if (status == 124) {
+			addLogEntry("ERROR: 'sync_dir' (" ~ syncDir ~ ") is mounted by an on-demand client that does not respond. Stop that client, or unmount it with: fusermount3 -u -z " ~ mountPath, ["info", "notify"]);
 			return false;
 		}
-		addLogEntry("On-demand: 'sync_dir' has a stale mount from a client that did not stop cleanly; unmounting it: " ~ syncDir);
-		auto result = execute(["fusermount3", "-u", "-z", syncDir]);
-		if ((result.status != 0) || isOnDemandMountPoint(syncDir)) {
-			addLogEntry("ERROR: Unable to unmount the stale on-demand mount on " ~ syncDir ~ ": " ~ strip(result.output) ~ ". Unmount it with: fusermount3 -u -z " ~ syncDir, ["info", "notify"]);
+		if (dryRun) {
+			addLogEntry("ERROR: 'sync_dir' (" ~ syncDir ~ ") has a stale on-demand mount. It is not unmounted under --dry-run; unmount it with: fusermount3 -u -z " ~ mountPath, ["info", "notify"]);
+			return false;
+		}
+		addLogEntry("On-demand: 'sync_dir' has a stale mount from a client that did not stop cleanly; unmounting it: " ~ mountPath);
+		if (!runOnDemandHelper(["fusermount3", "-u", "-z", mountPath], status, output)) return false;
+		if ((status != 0) || isOnDemandMountPoint(mountPath)) {
+			addLogEntry("ERROR: Unable to unmount the stale on-demand mount on " ~ mountPath ~ ": " ~ strip(output) ~ ". Unmount it with: fusermount3 -u -z " ~ mountPath, ["info", "notify"]);
 			return false;
 		}
 	}
@@ -2627,12 +2689,28 @@ bool prepareOnDemandPhysicalSyncDir() {
 		source = appConfig.onDemandLegacyBackingDir;
 	}
 	if (source.empty) return true;
-	if (!exists(source) || !isDir(source)) {
-		// Nothing to move; the database check refuses a database that does not describe 'sync_dir'
-		return true;
-	}
 
 	try {
+		if (!exists(source) || !isDir(source)) {
+			// A move interrupted after the rename and before the marker was rewritten: the recorded
+			// directory is gone and 'sync_dir' holds the files. Complete it by rewriting the marker.
+			if (!recorded.empty && (source == recorded) && exists(syncDir) && isDir(syncDir) &&
+					!dirEntries(syncDir, SpanMode.shallow, false).empty) {
+				if (dryRun) {
+					addLogEntry("ERROR: An interrupted move of the on-demand files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ ") is not completed under --dry-run. Run without --dry-run first.", ["info", "notify"]);
+					return false;
+				}
+				std.file.write(marker, syncDir);
+				addLogEntry("On-demand: completed the interrupted move of the hydrated files from " ~ source ~ " to 'sync_dir' (" ~ syncDir ~ "); no files were uploaded, downloaded or deleted");
+			}
+			// Otherwise there is nothing to move; the database check refuses a database that does not describe 'sync_dir'
+			return true;
+		}
+		if (dryRun) {
+			addLogEntry("ERROR: The on-demand files are in " ~ source ~ " and must be moved to 'sync_dir' (" ~ syncDir ~ "). They are not moved under --dry-run. Run without --dry-run first.", ["info", "notify"]);
+			return false;
+		}
+
 		bool syncDirRemoved = false;
 		if (exists(syncDir)) {
 			if (!isDir(syncDir)) {

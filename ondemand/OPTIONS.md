@@ -38,7 +38,7 @@ Status values:
 | skip_size (R) | relevant | Filtering. Larger online files are not recorded, so they are not visible in the mount. | config.d:367 |
 | monitor_log_frequency | relevant | Log suppression | config.d:369 |
 | monitor_fullscan_frequency | relevant | Online full-scan true-up | config.d:373 |
-| classify_as_big_delete | relevant | Applies in uploadDeletedItem (sync.d:12768). `rm -r` through the mount emits one delete per file (like inotify), so it rarely triggers, as in normal monitor mode. Absent hydrated files found by the consistency check are counted as usual. Online-only files are never counted as deleted. | config.d:375 |
+| classify_as_big_delete | relevant | Applies in uploadDeletedItem (sync.d:12768). `rm -r` through the mount emits one delete per file (like inotify), so it rarely triggers, as in normal monitor mode. In on-demand mode the online deletes queued by one consistency pass (absent hydrated or pinned files, folders with their database children) are also totalled, and none is sent when the total reaches the limit (sync.d onDemandQueuedOnlineDeletesAllowed), because an emptied sync_dir deletes file by file. Online-only files are never counted as deleted. | config.d:375 |
 | sync_dir_permissions | relevant | Applied to folders the engine creates in the physical sync_dir. Visible through the mount for folders present there. Database-only folders show 0700. | config.d:377; ondemand.d:503-506, 628-630 |
 | sync_file_permissions | relevant | Applied to downloaded/hydrated files and visible through the mount (lstat). Online-only files always show 0600. | config.d:379; hydration.d (filePermissions); ondemand.d:631-632 |
 | rate_limit | relevant | Applies to engine transfers and hydrations (same CurlEngine) | config.d:381; onedrive.d:280 |
@@ -77,7 +77,7 @@ Status values:
 | skip_dir_strict_match | relevant | Filtering | config.d:462 |
 | resync | relevant | Rebuilds the database. Required after switching modes, or after a sync_dir change that cannot be done by rename() (main.d checkOnDemandProfileState, prepareOnDemandPhysicalSyncDir). | config.d:464 |
 | resync_auth | relevant | Authentication | config.d:466 |
-| bypass_data_preservation | risky | No safeBackup conflict copies. The on-demand conflict path (local save while the file was open plus a newer online version) then replaces the local version without a copy. That is upstream semantics for this option, but on-demand defers more often (any open file). | config.d:469; sync.d:640 |
+| bypass_data_preservation | risky | No safeBackup conflict copies. The on-demand conflict path (local save while the file was open plus a newer online version) then replaces the local version without a copy. That is upstream semantics for this option, but on-demand defers more often (any open file). A file put over an online-only item while the client was stopped is then left in place, not uploaded. | config.d:469; sync.d:640 |
 | sync_business_shared_items (R) | risky | Shared (remote) items are out of scope for on-demand. HydrationService refuses them (EIO), and the engine downloads shared files as in normal mode (applyPotentiallyNewLocalItem queues remote files). Actions and free do not apply to them. | config.d:471 |
 | display_running_config | relevant | Display | config.d:473 |
 | read_only_auth_scope | relevant | Uploads fail; local edits through the mount stay local. Free is refused for files that differ from the database. | config.d:475 |
@@ -133,7 +133,7 @@ One row per config key, for tools (OneDriveGUI's settings editor parses this tab
 | `skip_size` | relevant | yes | Filtering. |
 | `monitor_log_frequency` | relevant | no | Log suppression. |
 | `monitor_fullscan_frequency` | relevant | no | Online full-scan true-up. |
-| `classify_as_big_delete` | relevant | no | Applies in uploadDeletedItem (sync.d:12768). |
+| `classify_as_big_delete` | relevant | no | Applies in uploadDeletedItem, and to the total of the online deletes of one consistency pass. |
 | `sync_dir_permissions` | relevant | no | Applied to folders the engine creates in sync_dir. |
 | `sync_file_permissions` | relevant | no | Applied to downloaded/hydrated files and visible through the mount (lstat). |
 | `rate_limit` | relevant | no | Applies to engine transfers and hydrations (same CurlEngine). |
